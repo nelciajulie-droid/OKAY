@@ -232,16 +232,20 @@ function RelaySettingsForm({ onOpenChange }: { onOpenChange: (open: boolean) => 
             id="settings-fireprox"
             value={fireproxUrl}
             onChange={(e) => setEdits((prev) => ({ ...prev, fireprox: e.target.value }))}
-            placeholder="https://abc.execute-api.eu-west-1.amazonaws.com/fireprox"
+            placeholder="AWS: https://abc.execute-api.eu-west-1.amazonaws.com/fireprox  |  ScraperAPI: https://api.scraperapi.com?api_key=KEY"
             autoComplete="off"
             spellCheck={false}
             className="border-zinc-800 bg-zinc-950 text-zinc-100 placeholder:text-zinc-600"
           />
           <p className="text-xs text-zinc-500">
-            AWS API Gateway endpoint created by FireProx
-            (github.com/ustayready/fireprox). Every request rotates the source
-            IP through the AWS egress pool and spoofs <code>X-Forwarded-For</code>{" "}
-            with a fresh random IPv4. Takes precedence over the relay when set.
+            Per-request IP rotation endpoint. Auto-detects two formats:<br />
+            • <strong>AWS FireProx</strong>: <code>...amazonaws.com/fireprox</code> — path-prefix rewrite, ~12k IPs/region.<br />
+            • <strong>ScraperAPI</strong>: <code>api.scraperapi.com?api_key=...</code> — query-param rewrite, residential IPs (5000 req/mo free tier, no AWS account needed). Sign up at{" "}
+            <a href="https://www.scraperapi.com/" target="_blank" rel="noreferrer" className="underline hover:text-zinc-300">
+              scraperapi.com
+            </a>
+            .<br />
+            Both spoof <code>X-Forwarded-For</code> per request. Takes precedence over the relay when set.
           </p>
         </div>
       </div>

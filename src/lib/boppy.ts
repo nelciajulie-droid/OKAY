@@ -49,21 +49,35 @@ export async function getBoppyBase(): Promise<string> {
 /**
  * Effective FireProx endpoint URL (no trailing path): AppSettings.fireproxUrl
  * (DB) > BOPPY_FIREPROX_URL env > null. When set, every boppy request is
- * rewritten through it: `${fireproxUrl}${boppyPath}` (e.g.
- * `https://abc.execute-api.eu-west-1.amazonaws.com/fireprox/api/generate`).
- * AWS API Gateway rotates its egress IP per request, so each call appears
- * to come from a different source. Takes precedence over the relay.
+ * rewritten through it. Two formats are auto-detected:
+ *
+ *  1. AWS API Gateway (real FireProx) — `https://abc.execute-api....amazonaws.com/fireprox`
+ *     Path-prefix rewriting: `${fireproxUrl}${boppyPath}`. AWS rotates its
+ *     egress IP per request (~12k IPs/region).
+ *  2. ScraperAPI (commercial scraping proxy with free tier) —
+ *     `https://api.scraperapi.com?api_key=KEY` (or with `&` for more params).
+ *     Query-param rewriting: `${fireproxUrl}&url=${encodeURIComponent(target)}&method=...`.
+ *     Per-request residential IP rotation, harder to fingerprint than AWS.
+ *
+ * Both formats take precedence over the relay when set, and both spoof
+ * X-Forwarded-For via X-My-X-Forwarded-For (FireProx AWS) or directly
+ * (ScraperAPI passes client headers through).
  */
 export async function getFireproxUrl(): Promise<string | null> {
   try {
     const settings = await db.appSettings.findUnique({ where: { id: "singleton" } });
     const fromDb = settings?.fireproxUrl?.trim();
-    if (fromDb) return fromDb.replace(/\/+$/, "");
+    if (fromDb) return fromDb;
   } catch {
     // DB unavailable — fall through to env.
   }
   const fromEnv = process.env.BOPPY_FIREPROX_URL?.trim();
-  return fromEnv ? fromEnv.replace(/\/+$/, "") : null;
+  return fromEnv || null;
+}
+
+/** Detect ScraperAPI URLs (api.scraperapi.com). Used to switch rewrite mode. */
+function isScraperApi(url: string): boolean {
+  return /\/\/api\.scraperapi\.com\//i.test(url);
 }
 
 /**
@@ -78,6 +92,18 @@ function randomForwardedIp(): string {
   // plausible public client address.
   const octet = () => Math.floor(Math.random() * 223) + 1; // 1..223 (skip 224+ multicast/reserved)
   return `${octet()}.${octet()}.${octet()}.${octet()}`;
+}
+
+/** Build a ScraperAPI URL with the target encoded as a query param. */
+function buildScraperApiUrl(
+  scraperApiBase: string,
+  targetUrl: string,
+  method: string,
+): string {
+  // ScraperAPI base typically already contains "?api_key=KEY". We append with
+  // "&" if there's a "?" in the base, otherwise add "?" ourselves.
+  const sep = scraperApiBase.includes("?") ? "&" : "?";
+  return `${scraperApiBase}${sep}url=${encodeURIComponent(targetUrl)}&method=${method}`;
 }
 
 const BROWSER_UA =
@@ -128,10 +154,24 @@ async function boppyFetch(
   // rotates per request, while the relay is self-hosted on a single trusted IP.
   const fireproxUrl = await getFireproxUrl();
   if (fireproxUrl) {
-    // Spoof X-Forwarded-For via FireProx's X-My-X-Forwarded-For convention so
-    // boppy sees a fresh client IP per request (not the AWS egress IP).
+    // Spoof X-Forwarded-For via the X-My-X-Forwarded-For convention. For real
+    // FireProx (AWS), the AWS config copies it into upstream XFF. For
+    // ScraperAPI, they pass through client headers including XFF directly.
     headers["X-My-X-Forwarded-For"] = randomForwardedIp();
-    return fetch(`${fireproxUrl}${path}`, {
+
+    // Auto-detect proxy format and rewrite URL accordingly.
+    if (isScraperApi(fireproxUrl)) {
+      // ScraperAPI: query-param rewriting (target URL encoded as ?url=).
+      const scraperUrl = buildScraperApiUrl(fireproxUrl, target, options.method);
+      return fetch(scraperUrl, {
+        method: "POST", // ScraperAPI always uses POST (method passed in body/query)
+        headers,
+        body: options.body,
+        signal: AbortSignal.timeout(options.timeoutMs ?? 60_000),
+      });
+    }
+    // AWS FireProx (default): path-prefix rewriting.
+    return fetch(`${fireproxUrl.replace(/\/+$/, "")}${path}`, {
       method: options.method,
       headers,
       body: options.body,
@@ -343,6 +383,17 @@ export async function fetchAudio(audioUrl: string, range: string | null): Promis
   if (fireproxUrl) {
     // Same spoof as boppyFetch — keeps audio Range requests rotating too.
     headers["X-My-X-Forwarded-For"] = randomForwardedIp();
+    if (isScraperApi(fireproxUrl)) {
+      // ScraperAPI does NOT reliably support Range/206 — do a full GET and let
+      // the local mirror handle replays/seeks (one upstream per track, ever).
+      const scraperUrl = buildScraperApiUrl(fireproxUrl, target, "GET");
+      return fetch(scraperUrl, {
+        method: "POST",
+        headers,
+        body: null,
+        signal: AbortSignal.timeout(120_000),
+      });
+    }
     return fetch(target, {
       headers: range ? { ...headers, Range: range } : headers,
       signal: AbortSignal.timeout(120_000),
