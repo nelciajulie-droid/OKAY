@@ -1,0 +1,202 @@
+=== test direct (mock should respond 404) ===
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#11232d" />
+    <meta name="apple-itunes-app" content="app-id=6778658290" />
+    <title>Boppy — Free AI Music Generator | Create Songs with AI</title>
+    <meta name="description" content="Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card." />
+    <meta name="keywords" content="ai music generator, free ai music generator, ai song maker, text to music, generate music with ai, ai lyrics generator, ai song generator" />
+    <meta name="robots" content="index, follow" />
+    <meta name="author" content="Boppy" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Boppy" />
+    <meta property="og:title" content="Boppy — Free AI Music Generator | Create Songs with AI" />
+    <meta property="og:description" content="Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card." />
+    <meta property="og:image" content="https://boppy.me/og-image.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Boppy — AI music generator with cartoon disco-robot mascot" />
+    <meta property="og:url" content="https://boppy.me/" />
+    <meta property="og:locale" content="en_US" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Boppy — Free AI Music Generator | Create Songs with AI" />
+    <meta name="twitter:description" content="Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card." />
+    <meta name="twitter:image" content="https://boppy.me/og-image.jpg" />
+    <meta name="twitter:image:alt" content="Boppy — AI music generator with cartoon disco-robot mascot" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- Browsers and iOS probe these paths with no markup at all; without the files that
+         was 2,134 404s a day (53% of all 404s on the zone). -->
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- Fonts load without blocking first paint: preload, then promote to a stylesheet.
+         This was a synchronous cross-origin stylesheet on every page - a render-blocking
+         round trip before any text could paint. display=swap in the URL already accepts
+         the fallback-then-swap the async load implies. -->
+    <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,600;9..144,700;9..144,800&display=swap" onload="this.onload=null;this.rel='stylesheet'" />
+    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,600;9..144,700;9..144,800&display=swap" /></noscript>
+    <link rel="canonical" href="https://boppy.me/" />
+    <script type="module" crossorigin src="/assets/index-kv3RyQSd.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-D3CVhcdp.css">
+    <meta property="og:locale:alternate" content="pl_PL" />
+  <meta property="og:locale:alternate" content="es_ES" />
+  <meta property="og:locale:alternate" content="pt_BR" />
+  <meta property="og:locale:alternate" content="de_DE" />
+  <meta property="og:locale:alternate" content="fr_FR" />
+  <meta property="og:locale:alternate" content="ja_JP" />
+  <meta property="og:locale:alternate" content="ko_KR" />
+  <meta property="og:locale:alternate" content="it_IT" />
+  <meta property="og:locale:alternate" content="id_ID" />
+  <meta property="og:locale:alternate" content="zh_CN" />
+  <meta property="og:locale:alternate" content="ru_RU" />
+  <meta property="og:locale:alternate" content="uk_UA" />
+  <meta property="og:locale:alternate" content="hi_IN" />
+  <meta property="og:locale:alternate" content="vi_VN" />
+  <link rel="alternate" hreflang="en" href="https://boppy.me/" />
+  <link rel="alternate" hreflang="pl" href="https://boppy.me/pl" />
+  <link rel="alternate" hreflang="es" href="https://boppy.me/es" />
+  <link rel="alternate" hreflang="pt" href="https://boppy.me/pt" />
+  <link rel="alternate" hreflang="de" href="https://boppy.me/de" />
+  <link rel="alternate" hreflang="fr" href="https://boppy.me/fr" />
+  <link rel="alternate" hreflang="ja" href="https://boppy.me/ja" />
+  <link rel="alternate" hreflang="ko" href="https://boppy.me/ko" />
+  <link rel="alternate" hreflang="it" href="https://boppy.me/it" />
+  <link rel="alternate" hreflang="id" href="https://boppy.me/id" />
+  <link rel="alternate" hreflang="zh" href="https://boppy.me/zh" />
+  <link rel="alternate" hreflang="ru" href="https://boppy.me/ru" />
+  <link rel="alternate" hreflang="uk" href="https://boppy.me/uk" />
+  <link rel="alternate" hreflang="hi" href="https://boppy.me/hi" />
+  <link rel="alternate" hreflang="vi" href="https://boppy.me/vi" />
+  <link rel="alternate" hreflang="x-default" href="https://boppy.me/" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebApplication","name":"Boppy — Free AI Music Generator | Create Songs with AI","description":"Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card.","url":"https://boppy.me/","applicationCategory":"MultimediaApplication","operatingSystem":"Web","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Is Boppy really free?","acceptedAnswer":{"@type":"Answer","text":"Yes, Boppy is free to use. There's no signup, no credit card, and nothing to pay to generate full AI songs from text descriptions. Premium features may be added in the future as the platform grows, but creating music with Boppy is free today."}},{"@type":"Question","name":"Do I need to create an account?","acceptedAnswer":{"@type":"Answer","text":"No signup or account needed. Just open Boppy, describe your song idea, and start generating music instantly."}},{"@type":"Question","name":"How does AI music generation work?","acceptedAnswer":{"@type":"Answer","text":"Describe your song in plain words — mood, genre, topic. AI writes lyrics and a music description, then ACE-Step 1.5 XL Turbo (powered by deAPI.ai) generates a full audio track from that blueprint."}},{"@type":"Question","name":"Can AI write song lyrics for me?","acceptedAnswer":{"@type":"Answer","text":"Absolutely. Boppy uses an AI language model to compose original lyrics tailored to your description. You can review and edit them before generating."}},{"@type":"Question","name":"What genres can Boppy generate?","acceptedAnswer":{"@type":"Answer","text":"Virtually any — pop, rock, hip-hop, jazz, electronic, classical, metal, lo-fi, and more. Just mention the style in your description."}},{"@type":"Question","name":"How long are the generated tracks?","acceptedAnswer":{"@type":"Answer","text":"Up to 3 minutes. You choose the duration — from 30-second quick drafts to full-length songs."}},{"@type":"Question","name":"Can I share my generated songs?","acceptedAnswer":{"@type":"Answer","text":"Every track gets a unique shareable link. Anyone can listen — no account required."}},{"@type":"Question","name":"Is AI-generated music copyrighted?","acceptedAnswer":{"@type":"Answer","text":"AI music copyright varies by jurisdiction. Boppy doesn't claim ownership of what you generate — what you create is yours to use. That said, it's your responsibility to make sure your lyrics and descriptions don't infringe on anyone else's work."}},{"@type":"Question","name":"Is Boppy open source?","acceptedAnswer":{"@type":"Answer","text":"No. Boppy is a hosted product, not an open-source project — there is nothing to download or self-host. It is built on ACE-Step, an open-weight music model, so the model is open and the service is not. On the web there is nothing to install either: it runs free in your browser with no account."}}]}</script>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"Boppy","url":"https://boppy.me","logo":"https://boppy.me/favicon.svg","sameAs":["https://apps.apple.com/app/id6778658290","https://play.google.com/store/apps/details?id=app.boppy.android"]}</script><!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-18QQ1LWEX6"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-18QQ1LWEX6');
+</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4471318037548075" crossorigin="anonymous"></script>
+</head>
+  <body>
+    <div id="root"><h1>Make a song about anything</h1><p>Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card.</p><p><a href="https://boppy.me/create">Make a song</a> · <a href="https://boppy.me/browse">Browse songs</a> · <a href="https://boppy.me/blog">Guides</a></p><h2>Generators</h2><ul><li><a href="https://boppy.me/ai-lofi-music-generator">Free AI Lo-Fi Music Generator</a></li><li><a href="https://boppy.me/ai-rap-generator">Free AI Rap Generator - Beats &amp; Lyrics</a></li><li><a href="https://boppy.me/ai-rock-music-generator">Free AI Rock Music Generator</a></li><li><a href="https://boppy.me/ai-pop-song-generator">Free AI Pop Song Generator</a></li><li><a href="https://boppy.me/ai-edm-generator">Free AI EDM Generator - Dance Music</a></li><li><a href="https://boppy.me/ai-jazz-generator">Free AI Jazz Generator - Smooth Jazz</a></li><li><a href="https://boppy.me/ai-metal-music-generator">Free AI Metal Music Generator</a></li><li><a href="https://boppy.me/ai-ambient-music-generator">Free AI Ambient Music Generator</a></li><li><a href="https://boppy.me/ai-lyrics-generator">Free AI Lyrics Generator - Songwriter</a></li><li><a href="https://boppy.me/ai-beat-maker">Free AI Beat Maker - Instrumentals</a></li><li><a href="https://boppy.me/ai-country-music-generator">Free AI Country Music Generator</a></li><li><a href="https://boppy.me/ai-rnb-generator">Free AI R&amp;B Generator - Song Maker</a></li><li><a href="https://boppy.me/ai-kpop-generator">Free AI K-Pop Generator - Song Maker</a></li><li><a href="https://boppy.me/ai-classical-music-generator">Free AI Classical Music Generator</a></li><li><a href="https://boppy.me/ai-folk-music-generator">Free AI Folk Music Generator - Song Maker</a></li><li><a href="https://boppy.me/ai-reggaeton-generator">Free AI Reggaeton Generator - Beat Maker</a></li><li><a href="https://boppy.me/ai-phonk-generator">Free AI Phonk Generator - Beat Maker</a></li><li><a href="https://boppy.me/ai-synthwave-generator">Free AI Synthwave Generator - 80s Music</a></li><li><a href="https://boppy.me/ai-birthday-song-generator">Free AI Birthday Song Generator</a></li><li><a href="https://boppy.me/ai-text-to-song-generator">Free AI Text to Song Generator</a></li><li><a href="https://boppy.me/free-ai-music-generator-no-sign-up">Free AI Music Generator - No Sign Up</a></li><li><a href="https://boppy.me/ai-love-song-generator">Free AI Love Song Generator</a></li><li><a href="https://boppy.me/ai-diss-track-generator">Free AI Diss Track Generator</a></li><li><a href="https://boppy.me/ai-corrido-generator">Free AI Corrido Generator</a></li><li><a href="https://boppy.me/ai-christmas-song-generator">Free AI Christmas Song Generator</a></li><li><a href="https://boppy.me/ai-instrumental-music-generator">Free AI Instrumental Generator - No Vocals</a></li><li><a href="https://boppy.me/ai-wedding-song-generator">Free AI Wedding Song Generator</a></li><li><a href="https://boppy.me/ai-lullaby-generator">Free AI Lullaby Generator - With Baby's Name</a></li><li><a href="https://boppy.me/ai-pet-song-generator">Free AI Pet Song Generator</a></li><li><a href="https://boppy.me/sad-song-generator">Free AI Sad Song Generator</a></li><li><a href="https://boppy.me/ai-trap-beat-maker">Free AI Trap Beat Maker - No Signup</a></li><li><a href="https://boppy.me/ai-afrobeats-generator">Free AI Afrobeats Generator</a></li><li><a href="https://boppy.me/free-suno-alternative">Free Suno Alternative - No Sign Up</a></li><li><a href="https://boppy.me/ai-music-api">AI Music API - Free $5 Credit</a></li><li><a href="https://boppy.me/ai-korean-song-generator">Free AI Korean Song Generator - No Signup</a></li><li><a href="https://boppy.me/ai-kpop-instrumental-generator">Free AI K-Pop Instrumental Generator</a></li><li><a href="https://boppy.me/ai-kdrama-ost-generator">Free AI K-Drama OST Generator</a></li><li><a href="https://boppy.me/ai-music-generator-no-watermark">Free AI Music Generator - No Watermark</a></li><li><a href="https://boppy.me/free-ai-music-generator-with-vocals">Free AI Music Generator With Vocals</a></li><li><a href="https://boppy.me/ai-music-generator-free-download">Free AI Music Generator - MP3 Download</a></li><li><a href="https://boppy.me/minimax-music-alternative">Free MiniMax Music Alternative - No Signup</a></li><li><a href="https://boppy.me/free-ai-music-generator-app-iphone">Free AI Music Generator App for iPhone</a></li><li><a href="https://boppy.me/free-ai-music-generator-app-android">Free AI Music Generator App for Android</a></li><li><a href="https://boppy.me/ai-worship-song-generator">Free AI Worship Song Generator</a></li></ul><h2>FAQ</h2><h3>Is Boppy really free?</h3><p>Yes, Boppy is free to use. There's no signup, no credit card, and nothing to pay to generate full AI songs from text descriptions. Premium features may be added in the future as the platform grows, but creating music with Boppy is free today.</p><h3>Do I need to create an account?</h3><p>No signup or account needed. Just open Boppy, describe your song idea, and start generating music instantly.</p><h3>How does AI music generation work?</h3><p>Describe your song in plain words — mood, genre, topic. AI writes lyrics and a music description, then ACE-Step 1.5 XL Turbo (powered by deAPI.ai) generates a full audio track from that blueprint.</p><h3>Can AI write song lyrics for me?</h3><p>Absolutely. Boppy uses an AI language model to compose original lyrics tailored to your description. You can review and edit them before generating.</p><h3>What genres can Boppy generate?</h3><p>Virtually any — pop, rock, hip-hop, jazz, electronic, classical, metal, lo-fi, and more. Just mention the style in your description.</p><h3>How long are the generated tracks?</h3><p>Up to 3 minutes. You choose the duration — from 30-second quick drafts to full-length songs.</p><h3>Can I share my generated songs?</h3><p>Every track gets a unique shareable link. Anyone can listen — no account required.</p><h3>Is AI-generated music copyrighted?</h3><p>AI music copyright varies by jurisdiction. Boppy doesn't claim ownership of what you generate — what you create is yours to use. That said, it's your responsibility to make sure your lyrics and descriptions don't infringe on anyone else's work.</p><h3>Is Boppy open source?</h3><p>No. Boppy is a hosted product, not an open-source project — there is nothing to download or self-host. It is built on ACE-Step, an open-weight music model, so the model is open and the service is not. On the web there is nothing to install either: it runs free in your browser with no account.</p></div>
+  </body>
+</html>
+
+=== test via proxy with HTTP target (no CONNECT needed) ===
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#11232d" />
+    <meta name="apple-itunes-app" content="app-id=6778658290" />
+    <title>Boppy — Free AI Music Generator | Create Songs with AI</title>
+    <meta name="description" content="Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card." />
+    <meta name="keywords" content="ai music generator, free ai music generator, ai song maker, text to music, generate music with ai, ai lyrics generator, ai song generator" />
+    <meta name="robots" content="index, follow" />
+    <meta name="author" content="Boppy" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Boppy" />
+    <meta property="og:title" content="Boppy — Free AI Music Generator | Create Songs with AI" />
+    <meta property="og:description" content="Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card." />
+    <meta property="og:image" content="https://boppy.me/og-image.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Boppy — AI music generator with cartoon disco-robot mascot" />
+    <meta property="og:url" content="https://boppy.me/" />
+    <meta property="og:locale" content="en_US" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Boppy — Free AI Music Generator | Create Songs with AI" />
+    <meta name="twitter:description" content="Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card." />
+    <meta name="twitter:image" content="https://boppy.me/og-image.jpg" />
+    <meta name="twitter:image:alt" content="Boppy — AI music generator with cartoon disco-robot mascot" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- Browsers and iOS probe these paths with no markup at all; without the files that
+         was 2,134 404s a day (53% of all 404s on the zone). -->
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- Fonts load without blocking first paint: preload, then promote to a stylesheet.
+         This was a synchronous cross-origin stylesheet on every page - a render-blocking
+         round trip before any text could paint. display=swap in the URL already accepts
+         the fallback-then-swap the async load implies. -->
+    <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,600;9..144,700;9..144,800&display=swap" onload="this.onload=null;this.rel='stylesheet'" />
+    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,600;9..144,700;9..144,800&display=swap" /></noscript>
+    <link rel="canonical" href="https://boppy.me/" />
+    <script type="module" crossorigin src="/assets/index-kv3RyQSd.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-D3CVhcdp.css">
+    <meta property="og:locale:alternate" content="pl_PL" />
+  <meta property="og:locale:alternate" content="es_ES" />
+  <meta property="og:locale:alternate" content="pt_BR" />
+  <meta property="og:locale:alternate" content="de_DE" />
+  <meta property="og:locale:alternate" content="fr_FR" />
+  <meta property="og:locale:alternate" content="ja_JP" />
+  <meta property="og:locale:alternate" content="ko_KR" />
+  <meta property="og:locale:alternate" content="it_IT" />
+  <meta property="og:locale:alternate" content="id_ID" />
+  <meta property="og:locale:alternate" content="zh_CN" />
+  <meta property="og:locale:alternate" content="ru_RU" />
+  <meta property="og:locale:alternate" content="uk_UA" />
+  <meta property="og:locale:alternate" content="hi_IN" />
+  <meta property="og:locale:alternate" content="vi_VN" />
+  <link rel="alternate" hreflang="en" href="https://boppy.me/" />
+  <link rel="alternate" hreflang="pl" href="https://boppy.me/pl" />
+  <link rel="alternate" hreflang="es" href="https://boppy.me/es" />
+  <link rel="alternate" hreflang="pt" href="https://boppy.me/pt" />
+  <link rel="alternate" hreflang="de" href="https://boppy.me/de" />
+  <link rel="alternate" hreflang="fr" href="https://boppy.me/fr" />
+  <link rel="alternate" hreflang="ja" href="https://boppy.me/ja" />
+  <link rel="alternate" hreflang="ko" href="https://boppy.me/ko" />
+  <link rel="alternate" hreflang="it" href="https://boppy.me/it" />
+  <link rel="alternate" hreflang="id" href="https://boppy.me/id" />
+  <link rel="alternate" hreflang="zh" href="https://boppy.me/zh" />
+  <link rel="alternate" hreflang="ru" href="https://boppy.me/ru" />
+  <link rel="alternate" hreflang="uk" href="https://boppy.me/uk" />
+  <link rel="alternate" hreflang="hi" href="https://boppy.me/hi" />
+  <link rel="alternate" hreflang="vi" href="https://boppy.me/vi" />
+  <link rel="alternate" hreflang="x-default" href="https://boppy.me/" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebApplication","name":"Boppy — Free AI Music Generator | Create Songs with AI","description":"Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card.","url":"https://boppy.me/","applicationCategory":"MultimediaApplication","operatingSystem":"Web","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Is Boppy really free?","acceptedAnswer":{"@type":"Answer","text":"Yes, Boppy is free to use. There's no signup, no credit card, and nothing to pay to generate full AI songs from text descriptions. Premium features may be added in the future as the platform grows, but creating music with Boppy is free today."}},{"@type":"Question","name":"Do I need to create an account?","acceptedAnswer":{"@type":"Answer","text":"No signup or account needed. Just open Boppy, describe your song idea, and start generating music instantly."}},{"@type":"Question","name":"How does AI music generation work?","acceptedAnswer":{"@type":"Answer","text":"Describe your song in plain words — mood, genre, topic. AI writes lyrics and a music description, then ACE-Step 1.5 XL Turbo (powered by deAPI.ai) generates a full audio track from that blueprint."}},{"@type":"Question","name":"Can AI write song lyrics for me?","acceptedAnswer":{"@type":"Answer","text":"Absolutely. Boppy uses an AI language model to compose original lyrics tailored to your description. You can review and edit them before generating."}},{"@type":"Question","name":"What genres can Boppy generate?","acceptedAnswer":{"@type":"Answer","text":"Virtually any — pop, rock, hip-hop, jazz, electronic, classical, metal, lo-fi, and more. Just mention the style in your description."}},{"@type":"Question","name":"How long are the generated tracks?","acceptedAnswer":{"@type":"Answer","text":"Up to 3 minutes. You choose the duration — from 30-second quick drafts to full-length songs."}},{"@type":"Question","name":"Can I share my generated songs?","acceptedAnswer":{"@type":"Answer","text":"Every track gets a unique shareable link. Anyone can listen — no account required."}},{"@type":"Question","name":"Is AI-generated music copyrighted?","acceptedAnswer":{"@type":"Answer","text":"AI music copyright varies by jurisdiction. Boppy doesn't claim ownership of what you generate — what you create is yours to use. That said, it's your responsibility to make sure your lyrics and descriptions don't infringe on anyone else's work."}},{"@type":"Question","name":"Is Boppy open source?","acceptedAnswer":{"@type":"Answer","text":"No. Boppy is a hosted product, not an open-source project — there is nothing to download or self-host. It is built on ACE-Step, an open-weight music model, so the model is open and the service is not. On the web there is nothing to install either: it runs free in your browser with no account."}}]}</script>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"Boppy","url":"https://boppy.me","logo":"https://boppy.me/favicon.svg","sameAs":["https://apps.apple.com/app/id6778658290","https://play.google.com/store/apps/details?id=app.boppy.android"]}</script><!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-18QQ1LWEX6"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-18QQ1LWEX6');
+</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4471318037548075" crossorigin="anonymous"></script>
+</head>
+  <body>
+    <div id="root"><h1>Make a song about anything</h1><p>Generate full songs with AI for free. Describe your idea — Boppy writes lyrics and creates a complete track in minutes. No signup, no credit card.</p><p><a href="https://boppy.me/create">Make a song</a> · <a href="https://boppy.me/browse">Browse songs</a> · <a href="https://boppy.me/blog">Guides</a></p><h2>Generators</h2><ul><li><a href="https://boppy.me/ai-lofi-music-generator">Free AI Lo-Fi Music Generator</a></li><li><a href="https://boppy.me/ai-rap-generator">Free AI Rap Generator - Beats &amp; Lyrics</a></li><li><a href="https://boppy.me/ai-rock-music-generator">Free AI Rock Music Generator</a></li><li><a href="https://boppy.me/ai-pop-song-generator">Free AI Pop Song Generator</a></li><li><a href="https://boppy.me/ai-edm-generator">Free AI EDM Generator - Dance Music</a></li><li><a href="https://boppy.me/ai-jazz-generator">Free AI Jazz Generator - Smooth Jazz</a></li><li><a href="https://boppy.me/ai-metal-music-generator">Free AI Metal Music Generator</a></li><li><a href="https://boppy.me/ai-ambient-music-generator">Free AI Ambient Music Generator</a></li><li><a href="https://boppy.me/ai-lyrics-generator">Free AI Lyrics Generator - Songwriter</a></li><li><a href="https://boppy.me/ai-beat-maker">Free AI Beat Maker - Instrumentals</a></li><li><a href="https://boppy.me/ai-country-music-generator">Free AI Country Music Generator</a></li><li><a href="https://boppy.me/ai-rnb-generator">Free AI R&amp;B Generator - Song Maker</a></li><li><a href="https://boppy.me/ai-kpop-generator">Free AI K-Pop Generator - Song Maker</a></li><li><a href="https://boppy.me/ai-classical-music-generator">Free AI Classical Music Generator</a></li><li><a href="https://boppy.me/ai-folk-music-generator">Free AI Folk Music Generator - Song Maker</a></li><li><a href="https://boppy.me/ai-reggaeton-generator">Free AI Reggaeton Generator - Beat Maker</a></li><li><a href="https://boppy.me/ai-phonk-generator">Free AI Phonk Generator - Beat Maker</a></li><li><a href="https://boppy.me/ai-synthwave-generator">Free AI Synthwave Generator - 80s Music</a></li><li><a href="https://boppy.me/ai-birthday-song-generator">Free AI Birthday Song Generator</a></li><li><a href="https://boppy.me/ai-text-to-song-generator">Free AI Text to Song Generator</a></li><li><a href="https://boppy.me/free-ai-music-generator-no-sign-up">Free AI Music Generator - No Sign Up</a></li><li><a href="https://boppy.me/ai-love-song-generator">Free AI Love Song Generator</a></li><li><a href="https://boppy.me/ai-diss-track-generator">Free AI Diss Track Generator</a></li><li><a href="https://boppy.me/ai-corrido-generator">Free AI Corrido Generator</a></li><li><a href="https://boppy.me/ai-christmas-song-generator">Free AI Christmas Song Generator</a></li><li><a href="https://boppy.me/ai-instrumental-music-generator">Free AI Instrumental Generator - No Vocals</a></li><li><a href="https://boppy.me/ai-wedding-song-generator">Free AI Wedding Song Generator</a></li><li><a href="https://boppy.me/ai-lullaby-generator">Free AI Lullaby Generator - With Baby's Name</a></li><li><a href="https://boppy.me/ai-pet-song-generator">Free AI Pet Song Generator</a></li><li><a href="https://boppy.me/sad-song-generator">Free AI Sad Song Generator</a></li><li><a href="https://boppy.me/ai-trap-beat-maker">Free AI Trap Beat Maker - No Signup</a></li><li><a href="https://boppy.me/ai-afrobeats-generator">Free AI Afrobeats Generator</a></li><li><a href="https://boppy.me/free-suno-alternative">Free Suno Alternative - No Sign Up</a></li><li><a href="https://boppy.me/ai-music-api">AI Music API - Free $5 Credit</a></li><li><a href="https://boppy.me/ai-korean-song-generator">Free AI Korean Song Generator - No Signup</a></li><li><a href="https://boppy.me/ai-kpop-instrumental-generator">Free AI K-Pop Instrumental Generator</a></li><li><a href="https://boppy.me/ai-kdrama-ost-generator">Free AI K-Drama OST Generator</a></li><li><a href="https://boppy.me/ai-music-generator-no-watermark">Free AI Music Generator - No Watermark</a></li><li><a href="https://boppy.me/free-ai-music-generator-with-vocals">Free AI Music Generator With Vocals</a></li><li><a href="https://boppy.me/ai-music-generator-free-download">Free AI Music Generator - MP3 Download</a></li><li><a href="https://boppy.me/minimax-music-alternative">Free MiniMax Music Alternative - No Signup</a></li><li><a href="https://boppy.me/free-ai-music-generator-app-iphone">Free AI Music Generator App for iPhone</a></li><li><a href="https://boppy.me/free-ai-music-generator-app-android">Free AI Music Generator App for Android</a></li><li><a href="https://boppy.me/ai-worship-song-generator">Free AI Worship Song Generator</a></li></ul><h2>FAQ</h2><h3>Is Boppy really free?</h3><p>Yes, Boppy is free to use. There's no signup, no credit card, and nothing to pay to generate full AI songs from text descriptions. Premium features may be added in the future as the platform grows, but creating music with Boppy is free today.</p><h3>Do I need to create an account?</h3><p>No signup or account needed. Just open Boppy, describe your song idea, and start generating music instantly.</p><h3>How does AI music generation work?</h3><p>Describe your song in plain words — mood, genre, topic. AI writes lyrics and a music description, then ACE-Step 1.5 XL Turbo (powered by deAPI.ai) generates a full audio track from that blueprint.</p><h3>Can AI write song lyrics for me?</h3><p>Absolutely. Boppy uses an AI language model to compose original lyrics tailored to your description. You can review and edit them before generating.</p><h3>What genres can Boppy generate?</h3><p>Virtually any — pop, rock, hip-hop, jazz, electronic, classical, metal, lo-fi, and more. Just mention the style in your description.</p><h3>How long are the generated tracks?</h3><p>Up to 3 minutes. You choose the duration — from 30-second quick drafts to full-length songs.</p><h3>Can I share my generated songs?</h3><p>Every track gets a unique shareable link. Anyone can listen — no account required.</p><h3>Is AI-generated music copyrighted?</h3><p>AI music copyright varies by jurisdiction. Boppy doesn't claim ownership of what you generate — what you create is yours to use. That said, it's your responsibility to make sure your lyrics and descriptions don't infringe on anyone else's work.</p><h3>Is Boppy open source?</h3><p>No. Boppy is a hosted product, not an open-source project — there is nothing to download or self-host. It is built on ACE-Step, an open-weight music model, so the model is open and the service is not. On the web there is nothing to install either: it runs free in your browser with no account.</p></div>
+  </body>
+</html>
+
+=== test via proxy with HTTPS (CONNECT needed) ===
+* Establish HTTP proxy tunnel to api.ipify.org:443
+> CONNECT api.ipify.org:443 HTTP/1.1
+> Host: api.ipify.org:443
+> Proxy-Authorization: Basic Y3VzdG9tZXItbW9ja3VzZXI6bW9ja3Bhc3M=
+> User-Agent: curl/8.14.1
+> Proxy-Connection: Keep-Alive
+> 
+< HTTP/1.1 502 Bad Gateway
+< Content-Type: application/json;charset=utf-8
+< X-Mock-Oxylabs: error
+< Date: Tue, 29 Sep 2026 21:47:52 GMT
+< Content-Length: 71
+< 
+* CONNECT tunnel failed, response 502
+* closing connection #0

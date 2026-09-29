@@ -64,16 +64,19 @@ export async function getBoppyBase(): Promise<string> {
  *     `https://api.scraperapi.com?api_key=KEY` (or with `&` for more params).
  *     Query-param rewriting: `${fireproxUrl}&url=${encodeURIComponent(target)}&method=...`.
  *     Per-request residential IP rotation, harder to fingerprint than AWS.
- *  3. HTTP/HTTPS proxy (TorProxy, Squid, node-rotating-proxy-manager, ...) —
- *     `http://host:port` or `http://user:pass@host:port`. Uses undici
- *     ProxyAgent. Each request uses a new connection → with TorProxy each
- *     request exits through a different Tor circuit (~1.1k unique exit IPs,
- *     free, anonymous). Example: `http://127.0.0.1:8790` (TorProxy in
- *     --no-auth mode) or `http://user:pass@host:8790` (with auth).
+ *  3. Plain HTTP/HTTPS proxy (Oxylabs residential, TorProxy, Squid,
+ *     node-rotating-proxy-manager, ...) — `http://host:port` or
+ *     `http://user:pass@host:port`. Uses undici ProxyAgent. Each request
+ *     uses a new connection → with TorProxy each request exits through a
+ *     different Tor circuit (~1.1k unique exit IPs, free, anonymous). With
+ *     Oxylabs residential, each request exits through a different real ISP
+ *     IP (millions of IPs, very high trust score, paid ~$6/GB but free trial
+ *     available — see https://oxylabs.io). Example:
+ *     `http://customer-USER:PASS@pr.oxylabs.io:7777`.
  *
  * All formats take precedence over the relay when set, and all spoof
  * X-Forwarded-For via X-My-X-Forwarded-For (FireProx AWS) or directly
- * (ScraperAPI / TorProxy pass through client headers).
+ * (ScraperAPI / Oxylabs / TorProxy pass through client headers).
  */
 export async function getFireproxUrl(): Promise<string | null> {
   try {
@@ -92,16 +95,24 @@ function isScraperApi(url: string): boolean {
   return /\/\/api\.scraperapi\.com\//i.test(url);
 }
 
+/** Detect AWS API Gateway URLs (amazonaws.com) — real FireProx endpoint. */
+function isFireProxAws(url: string): boolean {
+  return /amazonaws\.com\//i.test(url);
+}
+
 /**
- * Detect plain HTTP/HTTPS proxy URLs (TorProxy, Squid, etc.). A plain proxy
- * is one that doesn't have a known host signature (amazonaws.com, api.scraperapi.com)
- * — we use undici ProxyAgent to route through it. Examples:
- *   http://127.0.0.1:8790
- *   http://user:pass@127.0.0.1:8080
- *   http://your-vps.example.com:3128
+ * Detect plain HTTP/HTTPS proxy URLs (Oxylabs, TorProxy, Squid, etc.). A plain
+ * proxy is one that doesn't have a known host signature (amazonaws.com for
+ * AWS FireProx, api.scraperapi.com for ScraperAPI) — we use undici ProxyAgent
+ * to route through it. Examples:
+ *   http://127.0.0.1:8790                                     (TorProxy)
+ *   http://user:pass@127.0.0.1:8080                           (any HTTP proxy with auth)
+ *   http://customer-USER:PASS@pr.oxylabs.io:7777              (Oxylabs residential)
+ *   http://your-vps.example.com:3128                          (Squid)
  */
 function isPlainProxy(url: string): boolean {
   if (isScraperApi(url)) return false;
+  if (isFireProxAws(url)) return false;
   return /^https?:\/\//i.test(url);
 }
 

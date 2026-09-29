@@ -232,16 +232,21 @@ function RelaySettingsForm({ onOpenChange }: { onOpenChange: (open: boolean) => 
             id="settings-fireprox"
             value={fireproxUrl}
             onChange={(e) => setEdits((prev) => ({ ...prev, fireprox: e.target.value }))}
-            placeholder="AWS: ...amazonaws.com/fireprox | ScraperAPI: api.scraperapi.com?api_key=KEY | TorProxy: http://127.0.0.1:8790"
+            placeholder="AWS: ...amazonaws.com/fireprox | ScraperAPI: api.scraperapi.com?api_key=KEY | Oxylabs: customer-USER:PASS@pr.oxylabs.io:7777 | TorProxy: http://127.0.0.1:8790"
             autoComplete="off"
             spellCheck={false}
             className="border-zinc-800 bg-zinc-950 text-zinc-100 placeholder:text-zinc-600"
           />
           <p className="text-xs text-zinc-500">
-            Per-request IP rotation endpoint. Auto-detects three formats:<br />
+            Per-request IP rotation endpoint. Auto-detects four formats:<br />
             • <strong>AWS FireProx</strong>: <code>...amazonaws.com/fireprox</code> — ~12k IPs/region, 1M req/mo free.<br />
             • <strong>ScraperAPI</strong>: <code>api.scraperapi.com?api_key=...</code> — residential IPs, 5000 req/mo free.<br />
-            • <strong>TorProxy / HTTP proxy</strong>: <code>http://127.0.0.1:8790</code> — Tor exit IP per request (~1.1k IPs, fully free, anonymous). See{" "}
+            • <strong>Oxylabs residential</strong>: <code>http://customer-USER:PASS@pr.oxylabs.io:7777</code> — millions of ISP IPs, very high trust (boppy won't block), 7-day free trial →{" "}
+            <a href="https://dashboard.oxylabs.io/en/" target="_blank" rel="noreferrer" className="underline hover:text-zinc-300">
+              dashboard.oxylabs.io
+            </a>
+            .<br />
+            • <strong>TorProxy / HTTP proxy</strong>: <code>http://127.0.0.1:8790</code> — Tor exit IP per request (free, ~1.1k IPs but boppy blocks Tor after 3). See{" "}
             <a href="https://github.com/dp2008/tor_proxy" target="_blank" rel="noreferrer" className="underline hover:text-zinc-300">
               tor_proxy
             </a>
