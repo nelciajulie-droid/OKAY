@@ -23,6 +23,12 @@
 
 import { db } from "@/lib/db";
 import { getRelay, viaRelay } from "@/lib/relay";
+// IMPORTANT: import BOTH ProxyAgent and fetch from the local undici package
+// (not the global). Node's built-in undici (used by the global fetch) is a
+// different version and rejects an externally-created ProxyAgent dispatcher
+// with "invalid onRequestStart method". Using undici.fetch with undici's
+// own ProxyAgent keeps the dispatcher contract consistent.
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 const DEFAULT_BASE = "https://boppy.me";
 export const BOPPY_MODEL = "AceStep_1_5_XL_Turbo_INT8";
@@ -49,7 +55,7 @@ export async function getBoppyBase(): Promise<string> {
 /**
  * Effective FireProx endpoint URL (no trailing path): AppSettings.fireproxUrl
  * (DB) > BOPPY_FIREPROX_URL env > null. When set, every boppy request is
- * rewritten through it. Two formats are auto-detected:
+ * rewritten through it. Three formats are auto-detected:
  *
  *  1. AWS API Gateway (real FireProx) — `https://abc.execute-api....amazonaws.com/fireprox`
  *     Path-prefix rewriting: `${fireproxUrl}${boppyPath}`. AWS rotates its
@@ -58,10 +64,16 @@ export async function getBoppyBase(): Promise<string> {
  *     `https://api.scraperapi.com?api_key=KEY` (or with `&` for more params).
  *     Query-param rewriting: `${fireproxUrl}&url=${encodeURIComponent(target)}&method=...`.
  *     Per-request residential IP rotation, harder to fingerprint than AWS.
+ *  3. HTTP/HTTPS proxy (TorProxy, Squid, node-rotating-proxy-manager, ...) —
+ *     `http://host:port` or `http://user:pass@host:port`. Uses undici
+ *     ProxyAgent. Each request uses a new connection → with TorProxy each
+ *     request exits through a different Tor circuit (~1.1k unique exit IPs,
+ *     free, anonymous). Example: `http://127.0.0.1:8790` (TorProxy in
+ *     --no-auth mode) or `http://user:pass@host:8790` (with auth).
  *
- * Both formats take precedence over the relay when set, and both spoof
+ * All formats take precedence over the relay when set, and all spoof
  * X-Forwarded-For via X-My-X-Forwarded-For (FireProx AWS) or directly
- * (ScraperAPI passes client headers through).
+ * (ScraperAPI / TorProxy pass through client headers).
  */
 export async function getFireproxUrl(): Promise<string | null> {
   try {
@@ -78,6 +90,33 @@ export async function getFireproxUrl(): Promise<string | null> {
 /** Detect ScraperAPI URLs (api.scraperapi.com). Used to switch rewrite mode. */
 function isScraperApi(url: string): boolean {
   return /\/\/api\.scraperapi\.com\//i.test(url);
+}
+
+/**
+ * Detect plain HTTP/HTTPS proxy URLs (TorProxy, Squid, etc.). A plain proxy
+ * is one that doesn't have a known host signature (amazonaws.com, api.scraperapi.com)
+ * — we use undici ProxyAgent to route through it. Examples:
+ *   http://127.0.0.1:8790
+ *   http://user:pass@127.0.0.1:8080
+ *   http://your-vps.example.com:3128
+ */
+function isPlainProxy(url: string): boolean {
+  if (isScraperApi(url)) return false;
+  return /^https?:\/\//i.test(url);
+}
+
+// undici ProxyAgent is created lazily per-URL (different proxies need different
+// agents). Cached by URL to avoid creating one per request (the agent manages
+// a connection pool — we want it to persist).
+const proxyAgentCache = new Map<string, ProxyAgent>();
+
+function getProxyAgent(proxyUrl: string): ProxyAgent {
+  let agent = proxyAgentCache.get(proxyUrl);
+  if (!agent) {
+    agent = new ProxyAgent({ uri: proxyUrl });
+    proxyAgentCache.set(proxyUrl, agent);
+  }
+  return agent;
 }
 
 /**
@@ -167,6 +206,18 @@ async function boppyFetch(
         method: "POST", // ScraperAPI always uses POST (method passed in body/query)
         headers,
         body: options.body,
+        signal: AbortSignal.timeout(options.timeoutMs ?? 60_000),
+      });
+    }
+    if (isPlainProxy(fireproxUrl)) {
+      // Plain HTTP proxy (TorProxy, Squid, ...) — tunnel via undici ProxyAgent.
+      // Use undici's own fetch (not the global) so the ProxyAgent dispatcher
+      // is from the same package version (see top-of-file import comment).
+      return undiciFetch(target, {
+        method: options.method,
+        headers,
+        body: options.body,
+        dispatcher: getProxyAgent(fireproxUrl),
         signal: AbortSignal.timeout(options.timeoutMs ?? 60_000),
       });
     }
@@ -338,9 +389,12 @@ export async function fetchJob(jobId: string): Promise<BoppyJob> {
 
 /**
  * Resolve a possibly-relative boppy audio URL to an absolute URL the
- * backend can fetch. Honors the FireProx proxy: when set, the absolute
- * boppy origin is rewritten to the FireProx endpoint so audio streaming
- * (Range, mirroring) also rotates through AWS API Gateway.
+ * backend can fetch. Honors the FireProx proxy: when set AND the proxy is a
+ * URL-rewriting proxy (AWS FireProx or ScraperAPI), the absolute boppy
+ * origin is rewritten to the proxy endpoint so audio streaming also
+ * rotates. Plain HTTP proxies (TorProxy, Squid, ...) are NOT applied here
+ * — they're connection-level tunnels handled by undici ProxyAgent in
+ * fetchAudio (no URL rewriting needed).
  */
 export async function resolveAudioUrl(urlOrPath: string, base?: string): Promise<string> {
   const boppyBase = base ?? DEFAULT_BASE;
@@ -348,13 +402,19 @@ export async function resolveAudioUrl(urlOrPath: string, base?: string): Promise
     ? urlOrPath
     : `${boppyBase}${urlOrPath.startsWith("/") ? "" : "/"}${urlOrPath}`;
   const fireproxUrl = await getFireproxUrl();
-  if (fireproxUrl) {
+  if (fireproxUrl && !isPlainProxy(fireproxUrl)) {
     try {
       const u = new URL(absolute);
       // Only rewrite boppy-origin URLs — never touch absolute URLs pointing
       // elsewhere (e.g. a self-hosted apiBaseUrl's /uploads).
       if (u.origin === boppyBase) {
-        return `${fireproxUrl}${u.pathname}${u.search}`;
+        if (isScraperApi(fireproxUrl)) {
+          // ScraperAPI: encode the whole target URL as a query param.
+          const sep = fireproxUrl.includes("?") ? "&" : "?";
+          return `${fireproxUrl}${sep}url=${encodeURIComponent(absolute)}&method=GET`;
+        }
+        // AWS FireProx: path-prefix rewrite.
+        return `${fireproxUrl.replace(/\/+$/, "")}${u.pathname}${u.search}`;
       }
     } catch {
       // Malformed absolute URL — return as-is, fetch will fail loudly.
@@ -391,6 +451,14 @@ export async function fetchAudio(audioUrl: string, range: string | null): Promis
         method: "POST",
         headers,
         body: null,
+        signal: AbortSignal.timeout(120_000),
+      });
+    }
+    if (isPlainProxy(fireproxUrl)) {
+      // Plain HTTP proxy (TorProxy, Squid, ...) — tunnel via undici ProxyAgent.
+      return undiciFetch(target, {
+        headers: range ? { ...headers, Range: range } : headers,
+        dispatcher: getProxyAgent(fireproxUrl),
         signal: AbortSignal.timeout(120_000),
       });
     }

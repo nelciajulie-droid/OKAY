@@ -232,20 +232,21 @@ function RelaySettingsForm({ onOpenChange }: { onOpenChange: (open: boolean) => 
             id="settings-fireprox"
             value={fireproxUrl}
             onChange={(e) => setEdits((prev) => ({ ...prev, fireprox: e.target.value }))}
-            placeholder="AWS: https://abc.execute-api.eu-west-1.amazonaws.com/fireprox  |  ScraperAPI: https://api.scraperapi.com?api_key=KEY"
+            placeholder="AWS: ...amazonaws.com/fireprox | ScraperAPI: api.scraperapi.com?api_key=KEY | TorProxy: http://127.0.0.1:8790"
             autoComplete="off"
             spellCheck={false}
             className="border-zinc-800 bg-zinc-950 text-zinc-100 placeholder:text-zinc-600"
           />
           <p className="text-xs text-zinc-500">
-            Per-request IP rotation endpoint. Auto-detects two formats:<br />
-            • <strong>AWS FireProx</strong>: <code>...amazonaws.com/fireprox</code> — path-prefix rewrite, ~12k IPs/region.<br />
-            • <strong>ScraperAPI</strong>: <code>api.scraperapi.com?api_key=...</code> — query-param rewrite, residential IPs (5000 req/mo free tier, no AWS account needed). Sign up at{" "}
-            <a href="https://www.scraperapi.com/" target="_blank" rel="noreferrer" className="underline hover:text-zinc-300">
-              scraperapi.com
+            Per-request IP rotation endpoint. Auto-detects three formats:<br />
+            • <strong>AWS FireProx</strong>: <code>...amazonaws.com/fireprox</code> — ~12k IPs/region, 1M req/mo free.<br />
+            • <strong>ScraperAPI</strong>: <code>api.scraperapi.com?api_key=...</code> — residential IPs, 5000 req/mo free.<br />
+            • <strong>TorProxy / HTTP proxy</strong>: <code>http://127.0.0.1:8790</code> — Tor exit IP per request (~1.1k IPs, fully free, anonymous). See{" "}
+            <a href="https://github.com/dp2008/tor_proxy" target="_blank" rel="noreferrer" className="underline hover:text-zinc-300">
+              tor_proxy
             </a>
             .<br />
-            Both spoof <code>X-Forwarded-For</code> per request. Takes precedence over the relay when set.
+            All spoof <code>X-Forwarded-For</code> per request. Takes precedence over the relay when set.
           </p>
         </div>
       </div>

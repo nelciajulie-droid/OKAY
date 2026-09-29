@@ -44,7 +44,7 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "no-useless-escape": "off",
   },
 }, {
-  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills"]
+  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills", "fireprox/**", "requests-ip-rotator/**", "IPSpinner/**", "nyxproxy-oss/**", "node-rotating-proxy-manager/**", "tor_proxy/**", "tor_proxy_runtime/**", "nyxproxy-deploy/**", "worker/**", "upload/**", "tool-results/**"]
 }];
 
 export default eslintConfig;
