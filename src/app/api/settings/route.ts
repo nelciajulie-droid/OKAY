@@ -3,7 +3,8 @@ import { db } from "@/lib/db";
 
 /**
  * GET /api/settings — relay status (never returns the raw secret) + the
- * optional custom API endpoint. boppy.me needs no credentials.
+ * optional custom API endpoint + the optional FireProx endpoint.
+ * boppy.me needs no credentials.
  */
 export async function GET() {
   const settings = await db.appSettings.findUnique({ where: { id: "singleton" } });
@@ -17,12 +18,13 @@ export async function GET() {
     relayUrl: relayUrl || null,
     hasRelaySecret,
     apiBaseUrl: settings?.apiBaseUrl?.trim() || null,
+    fireproxUrl: settings?.fireproxUrl?.trim() || process.env.BOPPY_FIREPROX_URL?.trim() || null,
   });
 }
 
 /**
- * PUT /api/settings — update the relay config.
- * Body: { relayUrl?, relaySecret? }
+ * PUT /api/settings — update the relay / API endpoint / FireProx config.
+ * Body: { relayUrl?, relaySecret?, apiBaseUrl?, fireproxUrl? }
  *   - undefined  → keep existing value
  *   - null       → clear value
  *   - string     → set value
@@ -37,6 +39,7 @@ export async function PUT(req: Request) {
     relayUrl?: string | null;
     relaySecret?: string | null;
     apiBaseUrl?: string | null;
+    fireproxUrl?: string | null;
   } = {};
 
   if ("relayUrl" in body) {
@@ -55,6 +58,16 @@ export async function PUT(req: Request) {
       );
     }
     data.apiBaseUrl = raw || null;
+  }
+  if ("fireproxUrl" in body) {
+    const raw = typeof body.fireproxUrl === "string" ? body.fireproxUrl.trim() : "";
+    if (raw && !/^https?:\/\//i.test(raw)) {
+      return NextResponse.json(
+        { error: "FireProx URL must start with http:// or https://." },
+        { status: 400 },
+      );
+    }
+    data.fireproxUrl = raw || null;
   }
 
   if (Object.keys(data).length === 0) {

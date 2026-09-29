@@ -90,7 +90,7 @@ export async function GET() {
                     : null,
               songPath:
                 finalStatus === "SUCCESS" && job.audioUrl
-                  ? resolveAudioUrl(job.audioUrl)
+                  ? await resolveAudioUrl(job.audioUrl)
                   : undefined,
               lastCheckedAt: new Date(),
             },
@@ -99,7 +99,7 @@ export async function GET() {
           // Mirror the finished MP3 locally: replays/seeks/downloads then
           // never hit boppy.me again (see src/lib/mirror.ts).
           if (finalStatus === "SUCCESS" && job.audioUrl) {
-            void mirrorAudio(track.id, resolveAudioUrl(job.audioUrl, base));
+            void mirrorAudio(track.id, await resolveAudioUrl(job.audioUrl, base));
           }
         } catch {
           // Network error on this poll: keep the track pending,

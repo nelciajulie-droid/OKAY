@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, EyeOff, Loader2, Network, Server } from "lucide-react";
+import { Eye, EyeOff, Loader2, Network, Server, Zap } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -68,12 +68,13 @@ function RelaySettingsForm({ onOpenChange }: { onOpenChange: (open: boolean) => 
 
   // Local edits overlay the server values: undefined = untouched (shows /
   // keeps the server value), string = user-modified (empty string = cleared).
-  const [edits, setEdits] = useState<{ url?: string; secret?: string; baseUrl?: string }>({});
+  const [edits, setEdits] = useState<{ url?: string; secret?: string; baseUrl?: string; fireprox?: string }>({});
   const [showSecret, setShowSecret] = useState(false);
 
   const relayUrl = edits.url ?? settings?.relayUrl ?? "";
   const relaySecret = edits.secret ?? "";
   const apiBaseUrl = edits.baseUrl ?? settings?.apiBaseUrl ?? "";
+  const fireproxUrl = edits.fireprox ?? settings?.fireproxUrl ?? "";
 
   const saveMutation = useMutation<SettingsResponse, Error, void>({
     mutationFn: () => {
@@ -81,9 +82,11 @@ function RelaySettingsForm({ onOpenChange }: { onOpenChange: (open: boolean) => 
         relayUrl: string | null;
         relaySecret?: string;
         apiBaseUrl: string | null;
+        fireproxUrl: string | null;
       } = {
         relayUrl: relayUrl.trim() || null,
         apiBaseUrl: apiBaseUrl.trim() || null,
+        fireproxUrl: fireproxUrl.trim() || null,
       };
       const trimmedSecret = relaySecret.trim();
       // Empty secret field = keep the existing secret (undefined is dropped on serialize).
@@ -211,6 +214,34 @@ function RelaySettingsForm({ onOpenChange }: { onOpenChange: (open: boolean) => 
           <p className="text-xs text-zinc-500">
             Leave empty to use boppy.me. Point it at your own ACE-Step-compatible
             deployment (self-hosted = no rate limits) to lift the burst/daily caps.
+          </p>
+        </div>
+
+        {/* FireProx (advanced — AWS API Gateway IP rotation) */}
+        <div className="space-y-2 border-t border-zinc-800 pt-4">
+          <div className="flex items-center gap-2">
+            <Zap className="size-4 text-amber-500" aria-hidden />
+            <Label htmlFor="settings-fireprox" className="text-zinc-200">
+              FireProx URL <span className="text-zinc-500">(advanced)</span>
+            </Label>
+            {settings?.fireproxUrl && (
+              <span className="ml-auto text-xs text-emerald-400">active</span>
+            )}
+          </div>
+          <Input
+            id="settings-fireprox"
+            value={fireproxUrl}
+            onChange={(e) => setEdits((prev) => ({ ...prev, fireprox: e.target.value }))}
+            placeholder="https://abc.execute-api.eu-west-1.amazonaws.com/fireprox"
+            autoComplete="off"
+            spellCheck={false}
+            className="border-zinc-800 bg-zinc-950 text-zinc-100 placeholder:text-zinc-600"
+          />
+          <p className="text-xs text-zinc-500">
+            AWS API Gateway endpoint created by FireProx
+            (github.com/ustayready/fireprox). Every request rotates the source
+            IP through the AWS egress pool and spoofs <code>X-Forwarded-For</code>{" "}
+            with a fresh random IPv4. Takes precedence over the relay when set.
           </p>
         </div>
       </div>

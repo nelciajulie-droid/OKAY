@@ -46,6 +46,40 @@ export async function getBoppyBase(): Promise<string> {
   }
 }
 
+/**
+ * Effective FireProx endpoint URL (no trailing path): AppSettings.fireproxUrl
+ * (DB) > BOPPY_FIREPROX_URL env > null. When set, every boppy request is
+ * rewritten through it: `${fireproxUrl}${boppyPath}` (e.g.
+ * `https://abc.execute-api.eu-west-1.amazonaws.com/fireprox/api/generate`).
+ * AWS API Gateway rotates its egress IP per request, so each call appears
+ * to come from a different source. Takes precedence over the relay.
+ */
+export async function getFireproxUrl(): Promise<string | null> {
+  try {
+    const settings = await db.appSettings.findUnique({ where: { id: "singleton" } });
+    const fromDb = settings?.fireproxUrl?.trim();
+    if (fromDb) return fromDb.replace(/\/+$/, "");
+  } catch {
+    // DB unavailable — fall through to env.
+  }
+  const fromEnv = process.env.BOPPY_FIREPROX_URL?.trim();
+  return fromEnv ? fromEnv.replace(/\/+$/, "") : null;
+}
+
+/**
+ * Generate a random IPv4 for the X-My-X-Forwarded-For header. FireProx's AWS
+ * API Gateway config copies this into the X-Forwarded-For header sent to the
+ * upstream, so boppy sees a fresh client IP per request instead of the
+ * actual AWS egress IP. Without it, AWS would set X-Forwarded-For to the
+ * real caller (us) — defeating the rotation purpose.
+ */
+function randomForwardedIp(): string {
+  // Random IPv4. Avoid private/reserved ranges so the upstream sees a
+  // plausible public client address.
+  const octet = () => Math.floor(Math.random() * 223) + 1; // 1..223 (skip 224+ multicast/reserved)
+  return `${octet()}.${octet()}.${octet()}.${octet()}`;
+}
+
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
 
@@ -88,6 +122,23 @@ async function boppyFetch(
   if (options.range) headers.Range = options.range;
 
   const target = `${base}${path}`;
+
+  // FireProx takes precedence over the relay when set — both serve the same
+  // "rotate source IP" purpose, but FireProx is serverless (AWS-managed) and
+  // rotates per request, while the relay is self-hosted on a single trusted IP.
+  const fireproxUrl = await getFireproxUrl();
+  if (fireproxUrl) {
+    // Spoof X-Forwarded-For via FireProx's X-My-X-Forwarded-For convention so
+    // boppy sees a fresh client IP per request (not the AWS egress IP).
+    headers["X-My-X-Forwarded-For"] = randomForwardedIp();
+    return fetch(`${fireproxUrl}${path}`, {
+      method: options.method,
+      headers,
+      body: options.body,
+      signal: AbortSignal.timeout(options.timeoutMs ?? 60_000),
+    });
+  }
+
   const relay = await getRelay();
   if (relay) {
     return viaRelay(relay, target, {
@@ -245,24 +296,62 @@ export async function fetchJob(jobId: string): Promise<BoppyJob> {
 // GET /uploads/{file}.mp3 — generated audio (public, Range → 206)
 // ---------------------------------------------------------------------------
 
-/** Normalize the job's audioUrl (relative "/uploads/x.mp3") to an absolute URL. */
-export function resolveAudioUrl(urlOrPath: string, base: string = DEFAULT_BASE): string {
+/**
+ * Resolve a possibly-relative boppy audio URL to an absolute URL the
+ * backend can fetch. Honors the FireProx proxy: when set, the absolute
+ * boppy origin is rewritten to the FireProx endpoint so audio streaming
+ * (Range, mirroring) also rotates through AWS API Gateway.
+ */
+export async function resolveAudioUrl(urlOrPath: string, base?: string): Promise<string> {
+  const boppyBase = base ?? DEFAULT_BASE;
+  const absolute = /^https?:\/\//i.test(urlOrPath)
+    ? urlOrPath
+    : `${boppyBase}${urlOrPath.startsWith("/") ? "" : "/"}${urlOrPath}`;
+  const fireproxUrl = await getFireproxUrl();
+  if (fireproxUrl) {
+    try {
+      const u = new URL(absolute);
+      // Only rewrite boppy-origin URLs — never touch absolute URLs pointing
+      // elsewhere (e.g. a self-hosted apiBaseUrl's /uploads).
+      if (u.origin === boppyBase) {
+        return `${fireproxUrl}${u.pathname}${u.search}`;
+      }
+    } catch {
+      // Malformed absolute URL — return as-is, fetch will fail loudly.
+    }
+  }
+  return absolute;
+}
+
+/** Synchronous variant for callers that already know the base. Kept for
+ *  backward compatibility with non-FireProx callers. */
+export function resolveAudioUrlSync(urlOrPath: string, base: string = DEFAULT_BASE): string {
   if (/^https?:\/\//i.test(urlOrPath)) return urlOrPath;
   return `${base}${urlOrPath.startsWith("/") ? "" : "/"}${urlOrPath}`;
 }
 
 export async function fetchAudio(audioUrl: string, range: string | null): Promise<Response> {
   const base = await getBoppyBase();
+  const target = await resolveAudioUrl(audioUrl, base);
+  const fireproxUrl = await getFireproxUrl();
   const relay = await getRelay();
   const headers: Record<string, string> = {
     "User-Agent": BROWSER_UA,
     Accept: "*/*",
     Referer: `${base}/fr/create`,
   };
+  if (fireproxUrl) {
+    // Same spoof as boppyFetch — keeps audio Range requests rotating too.
+    headers["X-My-X-Forwarded-For"] = randomForwardedIp();
+    return fetch(target, {
+      headers: range ? { ...headers, Range: range } : headers,
+      signal: AbortSignal.timeout(120_000),
+    });
+  }
   if (relay) {
     return viaRelay(relay, audioUrl, { method: "GET", headers, range });
   }
-  return fetch(audioUrl, {
+  return fetch(target, {
     headers: range ? { ...headers, Range: range } : headers,
     signal: AbortSignal.timeout(120_000),
   });

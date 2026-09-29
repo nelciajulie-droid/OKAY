@@ -55,10 +55,15 @@ model Track {
 // Falls back to env vars TREBLO_RELAY_URL / TREBLO_RELAY_SECRET.
 // apiBaseUrl lets the whole app point at a self-hosted, boppy-compatible
 // deployment (e.g. self-hosted ACE-Step) instead of https://boppy.me.
+// fireproxUrl is an AWS API Gateway endpoint created by FireProx
+// (https://github.com/ustayready/fireprox) — every request through it
+// rotates the source IP (AWS egress pool). Falls back to env
+// BOPPY_FIREPROX_URL. Takes precedence over the relay when set.
 model AppSettings {
-  id          String   @id @default("singleton")
-  relayUrl    String?
-  relaySecret String?
-  apiBaseUrl  String?
-  updatedAt   DateTime @updatedAt
+  id           String   @id @default("singleton")
+  relayUrl     String?
+  relaySecret  String?
+  apiBaseUrl   String?
+  fireproxUrl  String?
+  updatedAt    DateTime @updatedAt
 }

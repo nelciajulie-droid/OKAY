@@ -49,6 +49,8 @@ export interface SettingsDTO {
   hasRelaySecret: boolean;
   /** Custom boppy-compatible API endpoint (empty/null = https://boppy.me). */
   apiBaseUrl: string | null;
+  /** FireProx AWS API Gateway endpoint (empty/null = direct to boppy.me). */
+  fireproxUrl: string | null;
 }
 
 /** Full generation row returned by POST /api/generate (201). */
