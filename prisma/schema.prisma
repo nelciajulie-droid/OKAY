@@ -1,0 +1,64 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A generation job created on boppy.me (POST /api/generate → { jobId }).
+// API flow reverse-engineered from the public boppy.me frontend bundle:
+//   POST /api/llm/compose        {prompt, style?, language?, boost?} → {prompt_id, title, lyrics, caption}
+//   POST /api/generate           {caption, lyrics?, model, duration, bpm, format, keyscale?, timesignature?, prompt_id?} → {jobId}
+//   GET  /api/generate/jobs/:id  → {status, progress, audioUrl?}  (status: done|processing|failed|error)
+//   GET  /uploads/:file.mp3      → public audio (Range 206)
+model Generation {
+  id            String   @id @default(cuid())
+  jobId         String?  @unique
+  prompt        String
+  styleTags     String?
+  lyrics        String?
+  title         String?
+  model         String   @default("AceStep_1_5_XL_Turbo_INT8")
+  duration      Int      @default(120) // 30 | 60 | 120 | 180 (seconds)
+  bpm           Int      @default(120)
+  keyscale      String?
+  timesignature String?
+  promptId      String?
+  format        String   @default("mp3")
+  createdAt     DateTime @default(now())
+  tracks        Track[]
+}
+
+// One generated audio track (boppy jobs produce a single mp3 each).
+model Track {
+  id            String   @id @default(cuid())
+  generationId  String
+  generation    Generation @relation(fields: [generationId], references: [id], onDelete: Cascade)
+  // Local status: PENDING | SUCCESS | FAILED | ERROR | TIMEOUT
+  status        String   @default("PENDING")
+  progress      Int?
+  title         String?
+  duration      Int?
+  songPath      String?
+  lyrics        String?
+  prompt        String?
+  version       String?
+  lastCheckedAt DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// Optional relay (see mini-services/treblo-relay): forwards requests through
+// a trusted IP if the provider ever challenges the hosting server's IP.
+// Falls back to env vars TREBLO_RELAY_URL / TREBLO_RELAY_SECRET.
+// apiBaseUrl lets the whole app point at a self-hosted, boppy-compatible
+// deployment (e.g. self-hosted ACE-Step) instead of https://boppy.me.
+model AppSettings {
+  id          String   @id @default("singleton")
+  relayUrl    String?
+  relaySecret String?
+  apiBaseUrl  String?
+  updatedAt   DateTime @updatedAt
+}

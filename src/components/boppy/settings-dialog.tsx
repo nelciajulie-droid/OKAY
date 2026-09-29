@@ -1,0 +1,250 @@
+"use client";
+
+import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Eye, EyeOff, Loader2, Network, Server } from "lucide-react";
+import { toast } from "sonner";
+
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { type SettingsDTO } from "./types";
+
+interface SettingsResponse {
+  ok: boolean;
+}
+
+interface SettingsDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}
+
+async function fetchSettings(): Promise<SettingsDTO> {
+  const res = await fetch("/api/settings");
+  if (!res.ok) throw new Error("Could not load settings.");
+  return (await res.json()) as SettingsDTO;
+}
+
+async function putSettings(
+  body: Record<string, string | null | undefined>,
+): Promise<SettingsResponse> {
+  const res = await fetch("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = (await res.json().catch(() => null)) as
+    | SettingsResponse
+    | { error?: string }
+    | null;
+  if (!res.ok) {
+    throw new Error(
+      data && "error" in data && data.error ? data.error : "Could not save settings.",
+    );
+  }
+  return data as SettingsResponse;
+}
+
+/**
+ * Relay-only settings form. Lives inside the DialogContent, so Radix unmounts
+ * it (resetting all local edits) whenever the dialog closes.
+ */
+function RelaySettingsForm({ onOpenChange }: { onOpenChange: (open: boolean) => void }) {
+  const queryClient = useQueryClient();
+
+  const { data: settings } = useQuery<SettingsDTO>({
+    queryKey: ["settings"],
+    queryFn: fetchSettings,
+    staleTime: 15_000,
+  });
+
+  // Local edits overlay the server values: undefined = untouched (shows /
+  // keeps the server value), string = user-modified (empty string = cleared).
+  const [edits, setEdits] = useState<{ url?: string; secret?: string; baseUrl?: string }>({});
+  const [showSecret, setShowSecret] = useState(false);
+
+  const relayUrl = edits.url ?? settings?.relayUrl ?? "";
+  const relaySecret = edits.secret ?? "";
+  const apiBaseUrl = edits.baseUrl ?? settings?.apiBaseUrl ?? "";
+
+  const saveMutation = useMutation<SettingsResponse, Error, void>({
+    mutationFn: () => {
+      const body: {
+        relayUrl: string | null;
+        relaySecret?: string;
+        apiBaseUrl: string | null;
+      } = {
+        relayUrl: relayUrl.trim() || null,
+        apiBaseUrl: apiBaseUrl.trim() || null,
+      };
+      const trimmedSecret = relaySecret.trim();
+      // Empty secret field = keep the existing secret (undefined is dropped on serialize).
+      if (trimmedSecret) body.relaySecret = trimmedSecret;
+      return putSettings(body);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["settings"] });
+      toast.success("Settings saved");
+      onOpenChange(false);
+    },
+    onError: (err) => toast.error(err.message),
+  });
+
+  const clearRelayMutation = useMutation<SettingsResponse, Error, void>({
+    mutationFn: () => putSettings({ relayUrl: null, relaySecret: null }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["settings"] });
+      setEdits({});
+      toast.success("Relay cleared");
+    },
+    onError: (err) => toast.error(err.message),
+  });
+
+  const saving = saveMutation.isPending;
+  const clearing = clearRelayMutation.isPending;
+  const relayConfigured = Boolean(settings?.relayUrl || settings?.hasRelaySecret);
+
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>Connection</DialogTitle>
+        <DialogDescription className="text-xs text-zinc-500">
+          boppy.me needs no credentials. The relay
+          (mini-services/treblo-relay) is only needed if your hosting IP gets
+          blocked — run it on a trusted IP and point this URL at it. All API
+          calls will then be forwarded through it.
+        </DialogDescription>
+      </DialogHeader>
+
+      <div className="space-y-4">
+        {/* Relay URL */}
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Network className="size-4 text-amber-500" aria-hidden />
+            <Label htmlFor="settings-relay-url" className="text-zinc-200">
+              Relay URL
+            </Label>
+            {settings?.relayUrl && (
+              <span className="ml-auto text-xs text-emerald-400">active</span>
+            )}
+          </div>
+          <Input
+            id="settings-relay-url"
+            value={relayUrl}
+            onChange={(e) => setEdits((prev) => ({ ...prev, url: e.target.value }))}
+            placeholder="https://relay.example.com"
+            autoComplete="off"
+            spellCheck={false}
+            className="border-zinc-800 bg-zinc-950 text-zinc-100 placeholder:text-zinc-600"
+          />
+        </div>
+
+        {/* Relay secret */}
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="settings-relay-secret" className="text-zinc-200">
+              Relay secret <span className="text-zinc-500">(x-relay-secret)</span>
+            </Label>
+            {settings?.hasRelaySecret && (
+              <span className="ml-auto text-xs text-emerald-400">
+                secret set
+              </span>
+            )}
+          </div>
+          <div className="relative">
+            <Input
+              id="settings-relay-secret"
+              type={showSecret ? "text" : "password"}
+              value={relaySecret}
+              onChange={(e) =>
+                setEdits((prev) => ({ ...prev, secret: e.target.value }))
+              }
+              placeholder={
+                settings?.hasRelaySecret
+                  ? "Leave empty to keep current secret"
+                  : "Only if the relay requires one"
+              }
+              autoComplete="off"
+              spellCheck={false}
+              className="border-zinc-800 bg-zinc-950 pr-10 text-zinc-100 placeholder:text-zinc-600"
+            />
+            <button
+              type="button"
+              onClick={() => setShowSecret((v) => !v)}
+              aria-label={showSecret ? "Hide relay secret" : "Show relay secret"}
+              className="absolute top-1/2 right-2 -translate-y-1/2 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+            >
+              {showSecret ? (
+                <EyeOff className="size-4" aria-hidden />
+              ) : (
+                <Eye className="size-4" aria-hidden />
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* API endpoint (advanced — self-hosted ACE-Step) */}
+        <div className="space-y-2 border-t border-zinc-800 pt-4">
+          <div className="flex items-center gap-2">
+            <Server className="size-4 text-amber-500" aria-hidden />
+            <Label htmlFor="settings-api-base" className="text-zinc-200">
+              API endpoint <span className="text-zinc-500">(advanced)</span>
+            </Label>
+          </div>
+          <Input
+            id="settings-api-base"
+            value={apiBaseUrl}
+            onChange={(e) => setEdits((prev) => ({ ...prev, baseUrl: e.target.value }))}
+            placeholder="https://boppy.me"
+            autoComplete="off"
+            spellCheck={false}
+            className="border-zinc-800 bg-zinc-950 text-zinc-100 placeholder:text-zinc-600"
+          />
+          <p className="text-xs text-zinc-500">
+            Leave empty to use boppy.me. Point it at your own ACE-Step-compatible
+            deployment (self-hosted = no rate limits) to lift the burst/daily caps.
+          </p>
+        </div>
+      </div>
+
+      <DialogFooter className="gap-2">
+        <Button
+          variant="outline"
+          onClick={() => clearRelayMutation.mutate()}
+          disabled={clearing || saving || !relayConfigured}
+          className="border-zinc-700 bg-zinc-900 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
+        >
+          {clearing && <Loader2 className="animate-spin" aria-hidden />}
+          Clear relay
+        </Button>
+        <Button
+          onClick={() => saveMutation.mutate()}
+          disabled={saving || clearing}
+          className="bg-amber-500 font-semibold text-zinc-950 hover:bg-amber-600"
+        >
+          {saving && <Loader2 className="animate-spin" aria-hidden />}
+          Save
+        </Button>
+      </DialogFooter>
+    </>
+  );
+}
+
+export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="custom-scrollbar max-h-[85vh] overflow-y-auto border-zinc-800/80 bg-zinc-900 text-zinc-100">
+        {/* Mounted only while open — Radix unmounts it on close, resetting edits. */}
+        <RelaySettingsForm onOpenChange={onOpenChange} />
+      </DialogContent>
+    </Dialog>
+  );
+}
