@@ -4,7 +4,9 @@ import {
   BOPPY_DURATIONS,
   BOPPY_TIME_SIGNATURES,
   BoppyError,
+  aceCreateJob,
   createJob,
+  getProvider,
 } from "@/lib/boppy";
 
 const KEYSCALE_RE = /^[A-G][#b]? (major|minor)$/;
@@ -24,7 +26,11 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 /**
- * POST /api/generate — create a boppy.me generation job.
+ * POST /api/generate — create a generation job.
+ * Routes to:
+ *   • boppy.me (POST /api/generate) when provider="boppy" (default)
+ *   • acemusic.ai (POST /engine/api/engine/release_task) when provider="ace"
+ *
  * Body: { prompt, lyrics?, title?, styleTags?, duration?, bpm?,
  *         keyscale?, timesignature?, promptId? }
  * `caption` sent upstream = prompt + styleTags joined with ", " (the exact
@@ -61,7 +67,7 @@ export async function POST(req: Request) {
   const promptId = typeof body?.promptId === "string" && body.promptId.trim() ? body.promptId.trim() : null;
 
   // Quota-friendly dedup: identical parameters → reuse the existing job/track
-  // instead of burning another boppy.me request (PENDING = same job continues,
+  // instead of burning another request (PENDING = same job continues,
   // SUCCESS = same audio replayed). Failures are retried with a fresh job.
   const identical = await db.generation.findFirst({
     where: {
@@ -84,16 +90,30 @@ export async function POST(req: Request) {
     return NextResponse.json({ generation: identical, deduped: true }, { status: 200 });
   }
 
+  const provider = await getProvider();
+
   try {
-    const jobId = await createJob({
-      caption,
-      lyrics: lyrics || undefined,
-      duration,
-      bpm,
-      keyscale: keyscale ?? undefined,
-      timesignature: timesignature ?? undefined,
-      promptId: promptId ?? undefined,
-    });
+    const jobId =
+      provider === "ace"
+        ? (await aceCreateJob({
+            prompt,
+            styleTags: styleTags || undefined,
+            title: title || undefined,
+            lyrics: lyrics || undefined,
+            duration,
+            bpm,
+            keyscale: keyscale ?? undefined,
+            timesignature: timesignature ?? undefined,
+          })).taskId
+        : await createJob({
+            caption,
+            lyrics: lyrics || undefined,
+            duration,
+            bpm,
+            keyscale: keyscale ?? undefined,
+            timesignature: timesignature ?? undefined,
+            promptId: promptId ?? undefined,
+          });
 
     const generation = await db.generation.create({
       data: {

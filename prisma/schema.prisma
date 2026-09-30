@@ -59,11 +59,19 @@ model Track {
 // (https://github.com/ustayready/fireprox) — every request through it
 // rotates the source IP (AWS egress pool). Falls back to env
 // BOPPY_FIREPROX_URL. Takes precedence over the relay when set.
+// provider selects which backend to use: "boppy" (default, no auth) or
+// "ace" (acemusic.ai — requires aceToken, see aceToken below).
+// aceToken is the Bearer session token for acemusic.ai. Stored in DB only
+// (never in source). Set via Settings Dialog password field. When
+// provider="ace", boppy.ts uses aceToken to call acem-api.acemusic.ai +
+// ai-api.acemusic.ai endpoints.
 model AppSettings {
   id           String   @id @default("singleton")
   relayUrl     String?
   relaySecret  String?
   apiBaseUrl   String?
   fireproxUrl  String?
+  provider     String?  // "boppy" (default) | "ace"
+  aceToken     String?  // Bearer token for acemusic.ai (stored DB-only)
   updatedAt    DateTime @updatedAt
 }

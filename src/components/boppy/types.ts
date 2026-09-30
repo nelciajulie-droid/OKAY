@@ -51,6 +51,10 @@ export interface SettingsDTO {
   apiBaseUrl: string | null;
   /** FireProx AWS API Gateway endpoint (empty/null = direct to boppy.me). */
   fireproxUrl: string | null;
+  /** Active provider: "boppy" (default) or "ace" (acemusic.ai). */
+  provider: "boppy" | "ace";
+  /** Whether an ACE Bearer token is set (the token itself never leaves the server). */
+  hasAceToken: boolean;
 }
 
 /** Full generation row returned by POST /api/generate (201). */

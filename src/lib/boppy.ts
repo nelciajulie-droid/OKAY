@@ -751,3 +751,262 @@ export async function fetchAudio(audioUrl: string, range: string | null): Promis
     signal: AbortSignal.timeout(120_000),
   });
 }
+
+// ---------------------------------------------------------------------------
+// ACE Music (acemusic.ai) provider — optional alternative to boppy.me.
+//
+// Reverse-engineered from the user-provided DevTools traces (4 endpoints):
+//
+//   GET  https://acem-api.acemusic.ai/api/acem/user/ai/token
+//        Authorization: Bearer <aceToken>
+//        → checks token validity + returns AI quota info
+//
+//   POST https://ai-api.acemusic.ai/engine/api/engine/release_task
+//        Authorization: Bearer <aceToken>
+//        Content-Type: multipart/form-data
+//        → creates a generation job (returns taskId)
+//
+//   POST https://ai-api.acemusic.ai/engine/api/engine/create_random_sample
+//        Authorization: Bearer <aceToken>
+//        Content-Type: application/x-www-form-urlencoded
+//        → creates a sample (used by "random" / quick generation)
+//
+//   POST https://acem-api.acemusic.ai/api/acem/works/ai/status
+//        Authorization: Bearer <aceToken>
+//        Content-Type: application/json
+//        body: { id: <taskId> }
+//        → polls the job status (PENDING / SUCCESS / FAILED)
+//
+//   POST https://ai-api.acemusic.ai/engine/api/engine/query_result
+//        Authorization: Bearer <aceToken>
+//        Content-Type: application/x-www-form-urlencoded
+//        → fetches the generated audio result (mp3 URL)
+//
+// The aceToken is stored in AppSettings (DB-only, never in source). Set via
+// Settings Dialog password field. When provider="ace", boppy.ts uses aceToken
+// to call these endpoints.
+//
+// SECURITY: aceToken is a Bearer session token — anyone with it can
+// impersonate the user on acemusic.ai until it expires. The token is NEVER
+// logged, NEVER returned by GET /api/settings (only a boolean hasAceToken),
+// and NEVER sent to the client. It travels backend-only: DB → boppy.ts →
+// Authorization header to acem-api/ai-api.
+// ---------------------------------------------------------------------------
+
+const ACE_API_BASE = "https://acem-api.acemusic.ai";
+const ACE_ENGINE_BASE = "https://ai-api.acemusic.ai";
+
+/** Returns "boppy" (default) or "ace" based on AppSettings.provider (DB).
+ *  Used by /api/lyrics and /api/generate to route to the right backend. */
+export async function getProvider(): Promise<"boppy" | "ace"> {
+  try {
+    const settings = await db.appSettings.findUnique({ where: { id: "singleton" } });
+    return settings?.provider?.toLowerCase() === "ace" ? "ace" : "boppy";
+  } catch {
+    return "boppy";
+  }
+}
+
+/** Returns the ACE Bearer token from DB (or env ACE_TOKEN). Backend-only. */
+async function getAceToken(): Promise<string | null> {
+  try {
+    const settings = await db.appSettings.findUnique({ where: { id: "singleton" } });
+    const fromDb = settings?.aceToken?.trim();
+    if (fromDb) return fromDb;
+  } catch {
+    // DB unavailable — fall through to env.
+  }
+  return process.env.ACE_TOKEN?.trim() || null;
+}
+
+/** Throws a clean error if ACE provider is selected but no token is set. */
+async function requireAceToken(): Promise<string> {
+  const token = await getAceToken();
+  if (!token) {
+    throw new BoppyError(401, "ACE provider selected but no Bearer token is set. Open Settings → 'ACE Bearer Token' and paste your acemusic.ai token.", { code: "ace_no_token" });
+  }
+  return token;
+}
+
+/** Common headers for ACE API requests. */
+function aceHeaders(token: string, contentType: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": contentType,
+    Accept: "application/json, text/plain, */*",
+    Origin: "https://acemusic.ai",
+    Referer: "https://acemusic.ai/",
+    "User-Agent": BROWSER_UA,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/acem/user/ai/token — verify token validity + AI quota
+// ---------------------------------------------------------------------------
+
+export interface AceTokenInfo {
+  valid: boolean;
+  raw?: unknown;
+}
+
+export async function aceVerifyToken(): Promise<AceTokenInfo> {
+  const token = await requireAceToken();
+  const res = await fetch(`${ACE_API_BASE}/api/acem/user/ai/token`, {
+    method: "GET",
+    headers: aceHeaders(token, "application/json"),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (res.status === 401 || res.status === 403) {
+    return { valid: false };
+  }
+  if (!res.ok) {
+    throw new BoppyError(res.status, `ACE token check failed: ${res.status}`);
+  }
+  const data = (await res.json().catch(() => null)) as unknown;
+  return { valid: true, raw: data };
+}
+
+// ---------------------------------------------------------------------------
+// POST /engine/api/engine/release_task — create a full generation job
+// (multipart/form-data with the prompt + options)
+// ---------------------------------------------------------------------------
+
+export interface AceCreateJobInput {
+  prompt: string;
+  styleTags?: string;
+  title?: string;
+  lyrics?: string;
+  duration?: number;
+  bpm?: number;
+  keyscale?: string;
+  timesignature?: string;
+}
+
+export interface AceCreateJobResult {
+  taskId: string;
+  raw?: unknown;
+}
+
+/**
+ * Create a generation job via ACE's release_task endpoint.
+ * Uses multipart/form-data (the official client sends a 1055-byte form
+ * with multiple fields). We mirror that shape but only send the fields
+ * the user provided — the server accepts a subset.
+ */
+export async function aceCreateJob(input: AceCreateJobInput): Promise<AceCreateJobResult> {
+  const token = await requireAceToken();
+  const form = new FormData();
+  form.append("prompt", input.prompt);
+  if (input.styleTags) form.append("tags", input.styleTags);
+  if (input.title) form.append("title", input.title);
+  if (input.lyrics) form.append("lyrics", input.lyrics);
+  if (input.duration) form.append("duration", String(input.duration));
+  if (input.bpm) form.append("bpm", String(input.bpm));
+  if (input.keyscale) form.append("keyscale", input.keyscale);
+  if (input.timesignature) form.append("timesignature", input.timesignature);
+
+  const res = await fetch(`${ACE_ENGINE_BASE}/engine/api/engine/release_task`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json, text/plain, */*",
+      Origin: "https://acemusic.ai",
+      Referer: "https://acemusic.ai/",
+      "User-Agent": BROWSER_UA,
+      // Note: do NOT set Content-Type manually — fetch() will set
+      // multipart/form-data; boundary=... automatically.
+    },
+    body: form,
+    signal: AbortSignal.timeout(60_000),
+  });
+
+  if (!res.ok) {
+    const data = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new BoppyError(res.status, data?.error || `ACE release_task failed: ${res.status}`);
+  }
+
+  const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  const taskId =
+    (typeof data?.taskId === "string" && data.taskId) ||
+    (typeof data?.task_id === "string" && data.task_id) ||
+    (typeof data?.id === "string" && data.id) ||
+    null;
+  if (!taskId) {
+    throw new BoppyError(res.status, "ACE release_task response missing taskId.");
+  }
+  return { taskId, raw: data };
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/acem/works/ai/status — poll job status
+// ---------------------------------------------------------------------------
+
+export interface AceJobStatus {
+  status: "PENDING" | "SUCCESS" | "FAILED" | string;
+  progress: number | null;
+  raw?: unknown;
+}
+
+export async function aceFetchStatus(taskId: string): Promise<AceJobStatus> {
+  const token = await requireAceToken();
+  const res = await fetch(`${ACE_API_BASE}/api/acem/works/ai/status`, {
+    method: "POST",
+    headers: aceHeaders(token, "application/json"),
+    body: JSON.stringify({ id: taskId }),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    throw new BoppyError(res.status, `ACE status failed: ${res.status}`);
+  }
+
+  const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  const rawStatus = typeof data?.status === "string" ? data.status.toUpperCase() : "PENDING";
+  const status: AceJobStatus["status"] =
+    rawStatus === "SUCCESS" || rawStatus === "DONE" || rawStatus === "COMPLETED"
+      ? "SUCCESS"
+      : rawStatus === "FAILED" || rawStatus === "ERROR"
+        ? "FAILED"
+        : "PENDING";
+  const progress =
+    typeof data?.progress === "number"
+      ? data.progress
+      : typeof data?.progress === "string"
+        ? Number(data.progress) || null
+        : null;
+  return { status, progress, raw: data };
+}
+
+// ---------------------------------------------------------------------------
+// POST /engine/api/engine/query_result — fetch the final audio URL
+// ---------------------------------------------------------------------------
+
+export interface AceJobResult {
+  audioUrl: string | null;
+  raw?: unknown;
+}
+
+export async function aceFetchResult(taskId: string): Promise<AceJobResult> {
+  const token = await requireAceToken();
+  // Official client uses application/x-www-form-urlencoded.
+  const body = new URLSearchParams({ id: taskId }).toString();
+  const res = await fetch(`${ACE_ENGINE_BASE}/engine/api/engine/query_result`, {
+    method: "POST",
+    headers: aceHeaders(token, "application/x-www-form-urlencoded;charset=UTF-8"),
+    body,
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    throw new BoppyError(res.status, `ACE query_result failed: ${res.status}`);
+  }
+
+  const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  const audioUrl =
+    (typeof data?.audioUrl === "string" && data.audioUrl) ||
+    (typeof data?.audio_url === "string" && data.audio_url) ||
+    (typeof data?.url === "string" && data.url) ||
+    (typeof data?.result === "string" && data.result) ||
+    null;
+  return { audioUrl, raw: data };
+}

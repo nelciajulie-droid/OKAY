@@ -3,8 +3,11 @@ import { db } from "@/lib/db";
 
 /**
  * GET /api/settings — relay status (never returns the raw secret) + the
- * optional custom API endpoint + the optional FireProx endpoint.
- * boppy.me needs no credentials.
+ * optional custom API endpoint + the optional FireProx endpoint + the
+ * active provider (boppy | ace) + whether an ACE Bearer token is set.
+ *
+ * SECURITY: aceToken is NEVER returned. Only the boolean hasAceToken is
+ * exposed to the client — the token itself stays backend-only.
  */
 export async function GET() {
   const settings = await db.appSettings.findUnique({ where: { id: "singleton" } });
@@ -19,15 +22,22 @@ export async function GET() {
     hasRelaySecret,
     apiBaseUrl: settings?.apiBaseUrl?.trim() || null,
     fireproxUrl: settings?.fireproxUrl?.trim() || process.env.BOPPY_FIREPROX_URL?.trim() || null,
+    provider: settings?.provider?.toLowerCase() === "ace" ? "ace" : "boppy",
+    hasAceToken: Boolean(settings?.aceToken?.trim() || process.env.ACE_TOKEN?.trim()),
   });
 }
 
 /**
- * PUT /api/settings — update the relay / API endpoint / FireProx config.
- * Body: { relayUrl?, relaySecret?, apiBaseUrl?, fireproxUrl? }
+ * PUT /api/settings — update the relay / API endpoint / FireProx config /
+ * provider / ACE Bearer token.
+ * Body: { relayUrl?, relaySecret?, apiBaseUrl?, fireproxUrl?, provider?, aceToken? }
  *   - undefined  → keep existing value
  *   - null       → clear value
  *   - string     → set value
+ *
+ * SECURITY: aceToken is set ONLY when a non-empty string is sent. Empty
+ * string = keep existing (so the password field can stay empty in the UI
+ * without clearing the token). null = clear.
  */
 export async function PUT(req: Request) {
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
@@ -40,6 +50,8 @@ export async function PUT(req: Request) {
     relaySecret?: string | null;
     apiBaseUrl?: string | null;
     fireproxUrl?: string | null;
+    provider?: string | null;
+    aceToken?: string | null;
   } = {};
 
   if ("relayUrl" in body) {
@@ -68,6 +80,25 @@ export async function PUT(req: Request) {
       );
     }
     data.fireproxUrl = raw || null;
+  }
+  if ("provider" in body) {
+    const raw = typeof body.provider === "string" ? body.provider.trim().toLowerCase() : "";
+    if (raw && raw !== "boppy" && raw !== "ace") {
+      return NextResponse.json(
+        { error: "provider must be 'boppy' or 'ace'." },
+        { status: 400 },
+      );
+    }
+    data.provider = raw || null;
+  }
+  if ("aceToken" in body) {
+    // null = clear. Empty string = keep (don't overwrite). Non-empty string = set.
+    if (body.aceToken === null) {
+      data.aceToken = null;
+    } else if (typeof body.aceToken === "string" && body.aceToken.trim()) {
+      data.aceToken = body.aceToken.trim();
+    }
+    // else: empty string → don't add to data → keep existing value
   }
 
   if (Object.keys(data).length === 0) {

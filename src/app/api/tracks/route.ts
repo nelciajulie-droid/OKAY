@@ -1,6 +1,13 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { fetchJob, getBoppyBase, resolveAudioUrl } from "@/lib/boppy";
+import {
+  aceFetchResult,
+  aceFetchStatus,
+  fetchJob,
+  getBoppyBase,
+  getProvider,
+  resolveAudioUrl,
+} from "@/lib/boppy";
 import { mirrorAudio } from "@/lib/mirror";
 
 const REFRESH_MIN_AGE_MS = 2_000; // official client polls every ~2s
@@ -52,10 +59,16 @@ async function listTracks() {
 
 /**
  * GET /api/tracks — all local tracks; non-terminal tracks are refreshed
- * from GET /api/generate/jobs/{jobId} (boppy.me) when stale (> 2s).
+ * from the provider's job status endpoint when stale (> 2s).
+ *
+ * Routing:
+ *   - provider="boppy" (default): GET /api/generate/jobs/{jobId} on boppy.me
+ *   - provider="ace": POST /api/acem/works/ai/status + POST /engine/api/engine/query_result on acemusic.ai
  */
 export async function GET() {
   let tracks = await listTracks();
+  const provider = await getProvider();
+  const base = await getBoppyBase();
 
   const now = Date.now();
   const stale = tracks.filter(
@@ -63,34 +76,45 @@ export async function GET() {
   );
 
   if (stale.length > 0) {
-    const base = await getBoppyBase();
     await Promise.all(
       stale.map(async (track) => {
         const jobId = track.generation?.jobId;
         if (!jobId) return;
         try {
-          const job = await fetchJob(jobId);
-          const status = mapJobStatus(job.status);
+          let finalStatus: string;
+          let progress: number | null;
+          let audioUrl: string | null = null;
+
+          if (provider === "ace") {
+            const status = await aceFetchStatus(jobId);
+            finalStatus = status.status;
+            progress = status.progress;
+            if (status.status === "SUCCESS") {
+              const result = await aceFetchResult(jobId);
+              audioUrl = result.audioUrl;
+            }
+          } else {
+            const job = await fetchJob(jobId);
+            finalStatus = mapJobStatus(job.status);
+            progress = finalStatus === "SUCCESS" ? 100 : job.progress;
+            audioUrl = job.audioUrl;
+          }
 
           // Guard against jobs stuck in a non-terminal state forever.
-          const finalStatus =
-            !isTerminal(status) && now - track.createdAt.getTime() > STALE_TRACK_TIMEOUT_MS
-              ? "TIMEOUT"
-              : status;
+          if (!isTerminal(finalStatus) && now - track.createdAt.getTime() > STALE_TRACK_TIMEOUT_MS) {
+            finalStatus = "TIMEOUT";
+          }
 
           await db.track.update({
             where: { id: track.id },
             data: {
               status: finalStatus,
-              progress:
-                finalStatus === "SUCCESS"
-                  ? 100
-                  : typeof job.progress === "number"
-                    ? Math.round(job.progress)
-                    : null,
+              progress: progress !== null ? Math.round(progress) : null,
               songPath:
-                finalStatus === "SUCCESS" && job.audioUrl
-                  ? await resolveAudioUrl(job.audioUrl)
+                finalStatus === "SUCCESS" && audioUrl
+                  ? (provider === "ace"
+                    ? audioUrl
+                    : await resolveAudioUrl(audioUrl))
                   : undefined,
               lastCheckedAt: new Date(),
             },
@@ -98,8 +122,10 @@ export async function GET() {
 
           // Mirror the finished MP3 locally: replays/seeks/downloads then
           // never hit boppy.me again (see src/lib/mirror.ts).
-          if (finalStatus === "SUCCESS" && job.audioUrl) {
-            void mirrorAudio(track.id, await resolveAudioUrl(job.audioUrl, base));
+          if (finalStatus === "SUCCESS" && audioUrl) {
+            const mirrorSource =
+              provider === "ace" ? audioUrl : await resolveAudioUrl(audioUrl, base);
+            void mirrorAudio(track.id, mirrorSource);
           }
         } catch {
           // Network error on this poll: keep the track pending,
