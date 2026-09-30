@@ -560,3 +560,37 @@ Stage Summary:
 - Permanent fix: production guard in boppy.ts + relay.ts — localhost proxy/relay URLs are automatically ignored when NODE_ENV=production. Next redeploy with the dev DB will no longer crash the prod app; it'll silently fall back to direct fetch to boppy.me.
 - Trade-off: in prod, the user CANNOT use a localhost proxy (js-proxy-pool or treblo-relay don't exist on the Aliyun FC server). To use a proxy in prod, the user must set a PUBLIC proxy URL (Oxylabs `pr.oxylabs.io:7777`, ScraperAPI `api.scraperapi.com`, or a self-hosted js-proxy-pool on a separate VPS with a public IP).
 - Files: src/lib/boppy.ts (getFireproxUrl + getBoppyBase production guard + isLocalhostUrl), src/lib/relay.ts (getRelay production guard + isLocalhostUrl).
+
+---
+Task ID: 23
+Agent: main (Z.ai Code)
+Task: User asked to research GitHub for free unlimited proxies compatible with a production deployment (Aliyun FC serverless).
+
+Work Log:
+- ANALYZED Aliyun FC production constraints:
+  * Serverless — no long-running processes → js-proxy-pool, TorProxy, mubeng, proxy-chain all IMPOSSIBLE in prod (they need a persistent proxy server).
+  * No localhost — 127.0.0.1:8792 URL doesn't exist in prod (no js-proxy-pool running there).
+  * Often read-only filesystem — SQLite DB may not persist between invocations; public/uploads/ mp3 mirror may not work.
+  * No IPv6 /64 subnet — NyxProxy IMPOSSIBLE.
+  * Bun runtime — undici 8.x crashes with markAsUncloneable (fixed in Task 21).
+  * Outbound HTTPS works — boppy.me reachable directly from FC.
+- CONCLUSION: the only proxy solutions compatible with Aliyun FC production are ones with PUBLIC HTTPS URLs. No localhost, no long-running processes, no IPv6 subnet. Filtered by what's both free AND functional in prod:
+  | Solution | Free | Compatible prod | Résout rate-limit |
+  |---|---|---|---|
+  | Direct to boppy.me (current default) | ✅ | ✅ | ❌ |
+  | Cloudflare Worker (already coded in worker/) | 100k/jour | ✅ | ❌ (shared egress) |
+  | ScraperAPI (api.scraperapi.com) | 5000/mo | ✅ | ✅ (residential IPs) |
+  | Oxylabs (pr.oxylabs.io:7777) | 7-day trial | ✅ | ✅ (residential) |
+  | FireProx AWS (execute-api.amazonaws.com) | 1M/mo | ✅ | ✅ (AWS pool) |
+  | ACE-Step auto-hébergé on VPS | VPS ~5€/mois | ✅ | ✅ (no rate limit, legit) |
+- VERIFIED prod guard works: NODE_ENV=production bun -e "..." confirmed that getFireproxUrl() returns null for localhost URLs (logs "fireproxUrl is localhost URL but NODE_ENV=production — ignoring") and accepts public URLs (Worker URL test → returned the URL as-is).
+- Also cleared prod fireproxUrl once more via PUT /api/settings {"fireproxUrl":null} → 200 OK (the user's prod DB keeps coming back with localhost due to dev→prod DB file copy).
+
+Stage Summary:
+- Honest answer: there is NO free proxy solution on GitHub that works IN production serverless. All the GitHub proxy tools we tested (js-proxy-pool with proxy-chain, TorProxy, mubeng, proxy_pool, requests-ip-rotator) require a long-running process — impossible in Aliyun FC. The ONLY production-compatible solutions are EXTERNAL services with public HTTPS URLs:
+  1. **Cloudflare Worker** (already coded in worker/ in this project) — free 100k/jour, 3-command setup via wrangler, URL is https://boppy-fireprox.<your-subdomain>.workers.dev. Paste in Settings → "FireProx URL" → Save. CAVEAT: doesn't rotate source IP (Cloudflare shared egress pool), but hides your FC IP and is robust to boppy's anti-abuse list.
+  2. **ScraperAPI** — free 5000/mo, residential IPs (boppy doesn't flag them like Tor), URL is https://api.scraperapi.com?api_key=KEY. Sign up at scraperapi.com → paste URL in Settings.
+  3. **Oxylabs** — 7-day free trial, millions of residential IPs, URL is http://customer-USER:PASS@pr.oxylabs.io:7777. Best for short bursts.
+  4. **ACE-Step auto-hébergé on VPS** — VPS ~5€/mois, legitimate unlimited, URL is http://VPS_IP:8000. The only truly unlimited + legit option (no rate limit, no ban risk).
+- The production guard (boppy.ts + relay.ts) automatically ignores localhost URLs in NODE_ENV=production, so the user can safely republish the dev DB without breaking prod.
+- Recommended path: tell user to either (A) use the app without proxy in prod (rate-limited but works), or (B) deploy the Cloudflare Worker (already in worker/, free, public URL, hides FC IP), or (C) sign up for ScraperAPI free tier (5000/mo, residential IPs, real rate-limit relief).
