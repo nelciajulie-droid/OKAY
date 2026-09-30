@@ -880,12 +880,18 @@ async function getAiToken(forceRefresh = false): Promise<string> {
     throw new BoppyError(res.status, `ACE token endpoint failed: ${res.status}`);
   }
   const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  // Real response shape (from user-provided DevTools trace):
+  //   { "data": { "ai_conf": { "router": "https://ai-api.acemusic.ai", "token": "<JWT>", "expire": "<ISO>" } }, "code": 200, ... }
+  const aiConf =
+    (data?.data as { ai_conf?: Record<string, unknown> } | undefined)?.ai_conf ??
+    (data?.ai_conf as Record<string, unknown> | undefined);
   const aiToken =
+    (typeof aiConf?.token === "string" && aiConf.token) ||
     (typeof data?.ai_token === "string" && data.ai_token) ||
     (typeof data?.token === "string" && data.token) ||
     null;
   if (!aiToken) {
-    throw new BoppyError(500, "ACE token endpoint returned no ai_token field.");
+    throw new BoppyError(500, "ACE token endpoint returned no ai_token field. Response: " + JSON.stringify(data).slice(0, 200));
   }
   const expMs = decodeJwtExp(aiToken) || (Date.now() + 5 * 60_000); // fallback: 5 min if exp missing
   cachedJwt = { token: aiToken, expMs };
@@ -1022,7 +1028,8 @@ export async function aceFetchStatus(taskId: string): Promise<AceJobStatus> {
   const res = await fetch(`${ACE_API_BASE}/api/acem/works/ai/status`, {
     method: "POST",
     headers: aceApiHeaders(bearer, "application/json"),
-    body: JSON.stringify({ id: taskId }),
+    // Real API expects `task_id` (not `id`) in the JSON body.
+    body: JSON.stringify({ task_id: taskId }),
     signal: AbortSignal.timeout(30_000),
   });
 
@@ -1031,7 +1038,10 @@ export async function aceFetchStatus(taskId: string): Promise<AceJobStatus> {
   }
 
   const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-  const rawStatus = typeof data?.status === "string" ? data.status.toUpperCase() : "PENDING";
+  // Real response shape: { data: { status, progress, ... }, code, error, timestamp }
+  const inner =
+    (data?.data as Record<string, unknown> | undefined) ?? data;
+  const rawStatus = typeof inner?.status === "string" ? inner.status.toUpperCase() : "PENDING";
   const status: AceJobStatus["status"] =
     rawStatus === "SUCCESS" || rawStatus === "DONE" || rawStatus === "COMPLETED"
       ? "SUCCESS"
@@ -1039,10 +1049,10 @@ export async function aceFetchStatus(taskId: string): Promise<AceJobStatus> {
         ? "FAILED"
         : "PENDING";
   const progress =
-    typeof data?.progress === "number"
-      ? data.progress
-      : typeof data?.progress === "string"
-        ? Number(data.progress) || null
+    typeof inner?.progress === "number"
+      ? inner.progress
+      : typeof inner?.progress === "string"
+        ? Number(inner.progress) || null
         : null;
   return { status, progress, raw: data };
 }
