@@ -23,12 +23,17 @@
 
 import { db } from "@/lib/db";
 import { getRelay, viaRelay } from "@/lib/relay";
-// IMPORTANT: import BOTH ProxyAgent and fetch from the local undici package
-// (not the global). Node's built-in undici (used by the global fetch) is a
-// different version and rejects an externally-created ProxyAgent dispatcher
-// with "invalid onRequestStart method". Using undici.fetch with undici's
-// own ProxyAgent keeps the dispatcher contract consistent.
-import { ProxyAgent, fetch as undiciFetch } from "undici";
+
+// IMPORTANT: undici (ProxyAgent + fetch) is imported LAZILY via dynamic
+// import() inside getProxyAgent() — not at module top-level. This is critical
+// for production deployments that may not have undici installed (or have an
+// older version): if undici is imported at the top of this file, any API
+// route that imports boppy.ts (e.g. /api/tracks, /api/lyrics, /api/generate,
+// /api/audio) would 500 at module-load time whenever undici is missing or
+// incompatible. With lazy import, the routes work fine without undici when
+// no proxy is configured — undici only loads when a plain HTTP proxy URL is
+// actually set in Settings → "FireProx URL". This makes the app resilient
+// to missing optional dependencies in production.
 
 const DEFAULT_BASE = "https://boppy.me";
 export const BOPPY_MODEL = "AceStep_1_5_XL_Turbo_INT8";
@@ -118,12 +123,33 @@ function isPlainProxy(url: string): boolean {
 
 // undici ProxyAgent is created lazily per-URL (different proxies need different
 // agents). Cached by URL to avoid creating one per request (the agent manages
-// a connection pool — we want it to persist).
-const proxyAgentCache = new Map<string, ProxyAgent>();
+// a connection pool — we want it to persist). undici itself is imported
+// dynamically (lazy) so the app works without undici installed when no
+// proxy is configured (production resilience).
+type UndiciModule = typeof import("undici");
+type ProxyAgentLike = InstanceType<UndiciModule["ProxyAgent"]>;
+const proxyAgentCache = new Map<string, ProxyAgentLike>();
+let undiciPromise: Promise<UndiciModule> | null = null;
 
-function getProxyAgent(proxyUrl: string): ProxyAgent {
+async function loadUndici(): Promise<UndiciModule> {
+  if (!undiciPromise) {
+    undiciPromise = import("undici").catch((err) => {
+      // Reset so a subsequent call (after the user installs undici) can retry.
+      undiciPromise = null;
+      throw new Error(
+        `undici is not installed but a plain HTTP proxy is configured. ` +
+          `Install it with \`bun add undici\` or \`npm install undici\`. ` +
+          `Original error: ${(err as Error).message}`,
+      );
+    });
+  }
+  return undiciPromise;
+}
+
+async function getProxyAgent(proxyUrl: string): Promise<ProxyAgentLike> {
   let agent = proxyAgentCache.get(proxyUrl);
   if (!agent) {
+    const { ProxyAgent } = await loadUndici();
     agent = new ProxyAgent({ uri: proxyUrl });
     proxyAgentCache.set(proxyUrl, agent);
   }
@@ -142,7 +168,6 @@ async function resetProxyAgent(proxyUrl: string): Promise<void> {
   if (agent) {
     proxyAgentCache.delete(proxyUrl);
     try {
-      // undici ProxyAgent exposes close() to release the connection pool.
       await (agent as unknown as { close?: () => Promise<void> }).close?.();
     } catch {
       // Ignore — agent close is best-effort.
@@ -183,6 +208,7 @@ async function fetchWithProxyRetry(
   },
   proxyUrl: string,
 ): Promise<Response> {
+  const { fetch: undiciFetch } = await loadUndici();
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= MAX_PROXY_RETRIES; attempt++) {
     try {
@@ -190,7 +216,7 @@ async function fetchWithProxyRetry(
         method: init.method,
         headers: init.headers,
         body: init.body,
-        dispatcher: getProxyAgent(proxyUrl),
+        dispatcher: await getProxyAgent(proxyUrl),
         signal: AbortSignal.timeout(init.timeoutMs),
       });
       // 502 / 503 / 504 → proxy died or upstream unavailable. Retry.
