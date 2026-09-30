@@ -533,3 +533,30 @@ Stage Summary:
   * With proxy configured (js-proxy-pool, Oxylabs, etc.): Bun.fetch(url, { proxy }) routes through the proxy — no undici crash.
 - Files: src/lib/boppy.ts (added IS_BUN detection, makeBunProxyHandler using Bun.fetch with proxy option, makeNodeProxyHandler using undici, unified getProxyHandler/resetProxyHandler/fetchWithProxyRetry).
 - Recommendation for the user: keep fireproxUrl=null in prod (no js-proxy-pool runs in Aliyun FC, so any localhost proxy URL would fail anyway). If they want a proxy in prod, they'd need to deploy js-proxy-pool separately or use a public proxy URL (Oxylabs, ScraperAPI, etc.).
+
+---
+Task ID: 22
+Agent: main (Z.ai Code)
+Task: User got "Request failed: 599" after redeploy. Diagnosed: the build republished the DB file containing `fireproxUrl: "http://127.0.0.1:8792"` (the dev js-proxy-pool URL), which doesn't exist on the Aliyun FC production server → all proxy-routed API calls (compose, generate, audio) failed with 599 connection error → 502 surfaced.
+
+Work Log:
+- Diagnosed prod via curl:
+  * /api/settings → 200, returns "fireproxUrl":"http://127.0.0.1:8792" (the dev URL got shipped to prod via the DB file in the build)
+  * /api/tracks → 200 OK (lists tracks from DB, no proxy needed)
+  * /api/lyrics POST → 502 "Request failed: 599" (boppyFetch tries to use the localhost proxy → no service on 127.0.0.1:8792 in prod → 599 network timeout → fetchWithProxyRetry tries 4 times → all fail → 502 surfaced)
+- Root cause: the user's build pipeline copies the dev DB file (db/custom.db) into the production package. That DB has `fireproxUrl: "http://127.0.0.1:8792"` (set during our earlier testing). In prod, no js-proxy-pool runs → all proxy-routed requests fail.
+- IMMEDIATE FIX: cleared prod fireproxUrl via `PUT https://nelcia-musix.space-z.ai/api/settings {"fireproxUrl":null}` → 200 OK. Verified prod DB now returns fireproxUrl:null. Tested /api/lyrics POST → 200 OK with real title "After Clear" + promptId sZM1ZQn4fdJ_. PRODUCTION WORKS NOW.
+- PERMANENT FIX: added a production guard to boppy.ts and relay.ts that AUTOMATICALLY ignores localhost proxy URLs in NODE_ENV=production — so the next time the user republishes the DB with localhost values, the app won't crash, it'll just use direct fetch to boppy.me.
+  * Added isLocalhostUrl() helper (matches localhost, 127.0.0.1, 0.0.0.0, ::1).
+  * getFireproxUrl(): if NODE_ENV=production && isLocalhostUrl(raw) → log warning + return null. boppyFetch then skips the proxy branch entirely → direct fetch to boppy.me.
+  * getBoppyBase(): same guard — localhost apiBaseUrl ignored in prod, falls back to https://boppy.me.
+  * getRelay() in relay.ts: same guard — localhost relayUrl ignored in prod.
+- Simulated production locally with `NODE_ENV=production bun -e "..."`: confirmed getFireproxUrl() returns null AND logs the warning ("fireproxUrl http://127.0.0.1:8792 is a localhost URL but NODE_ENV=production — ignoring"), getBoppyBase() returns "https://boppy.me". Production behavior is now robust to the dev→prod DB copy pitfall.
+- bun run lint: 0 errors / 0 warnings.
+- Local dev still works (NODE_ENV!=production): /api/lyrics POST → 200 OK with title "Still Works" via Bun.fetch + proxy option through js-proxy-pool.
+
+Stage Summary:
+- Production is now FUNCTIONAL (verified: POST /api/lyrics on nelcia-musix.space-z.ai → 200 OK "After Clear" with real promptId). The immediate fix (clearing fireproxUrl) unblocks the user right now.
+- Permanent fix: production guard in boppy.ts + relay.ts — localhost proxy/relay URLs are automatically ignored when NODE_ENV=production. Next redeploy with the dev DB will no longer crash the prod app; it'll silently fall back to direct fetch to boppy.me.
+- Trade-off: in prod, the user CANNOT use a localhost proxy (js-proxy-pool or treblo-relay don't exist on the Aliyun FC server). To use a proxy in prod, the user must set a PUBLIC proxy URL (Oxylabs `pr.oxylabs.io:7777`, ScraperAPI `api.scraperapi.com`, or a self-hosted js-proxy-pool on a separate VPS with a public IP).
+- Files: src/lib/boppy.ts (getFireproxUrl + getBoppyBase production guard + isLocalhostUrl), src/lib/relay.ts (getRelay production guard + isLocalhostUrl).

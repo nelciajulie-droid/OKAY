@@ -32,14 +32,41 @@ async function readConfigValue(key: "relayUrl" | "relaySecret"): Promise<string>
   )?.trim() ?? "";
 }
 
-/** Effective relay config: DB settings take precedence over env vars. */
+/** Effective relay config: DB settings take precedence over env vars.
+ *  Returns null if the URL is a localhost URL AND NODE_ENV=production —
+ *  localhost relays (mini-services/treblo-relay) don't exist in prod. */
 export async function getRelay(): Promise<RelayConfig | null> {
   const [url, secret] = await Promise.all([
     readConfigValue("relayUrl"),
     readConfigValue("relaySecret"),
   ]);
   if (!url) return null;
+  // Production guard: ignore localhost relay URLs in prod.
+  if (process.env.NODE_ENV === "production" && isLocalhostUrl(url)) {
+    console.warn(
+      `[relay] relayUrl "${url}" is a localhost URL but NODE_ENV=production — ` +
+        `ignoring (localhost relays don't exist in prod).`,
+    );
+    return null;
+  }
   return { url, secret: secret || null };
+}
+
+/** Detect localhost URLs (127.0.0.1, 0.0.0.0, ::1, localhost). */
+function isLocalhostUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    return (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "0.0.0.0" ||
+      host === "::1" ||
+      host === "[::1]"
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**

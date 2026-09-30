@@ -42,13 +42,29 @@ export const BOPPY_MODEL = "AceStep_1_5_XL_Turbo_INT8";
  * Effective API base URL: AppSettings.apiBaseUrl (DB) > BOPPY_API_BASE env
  * > https://boppy.me. Lets the whole app point at a self-hosted,
  * boppy-compatible deployment (e.g. self-hosted ACE-Step) — no rate limits.
+ *
+ * PRODUCTION GUARD: localhost URLs are ignored in NODE_ENV=production
+ * (same reason as fireproxUrl — dev-only servers don't exist in prod).
  */
 export async function getBoppyBase(): Promise<string> {
-  const settings = await db.appSettings
-    .findUnique({ where: { id: "singleton" } })
-    .catch(() => null);
-  const raw = settings?.apiBaseUrl?.trim() || process.env.BOPPY_API_BASE?.trim() || "";
+  let raw: string | undefined;
+  try {
+    const settings = await db.appSettings
+      .findUnique({ where: { id: "singleton" } })
+      .catch(() => null);
+    raw = settings?.apiBaseUrl?.trim() || undefined;
+  } catch {
+    // DB unavailable — fall through to env.
+  }
+  if (!raw) raw = process.env.BOPPY_API_BASE?.trim() || undefined;
   if (!raw) return DEFAULT_BASE;
+  if (process.env.NODE_ENV === "production" && isLocalhostUrl(raw)) {
+    console.warn(
+      `[boppy] apiBaseUrl "${raw}" is a localhost URL but NODE_ENV=production — ` +
+        `ignoring (localhost servers don't exist in prod). Using boppy.me.`,
+    );
+    return DEFAULT_BASE;
+  }
   try {
     const url = new URL(raw);
     return url.protocol === "http:" || url.protocol === "https:" ? url.origin : DEFAULT_BASE;
@@ -82,17 +98,58 @@ export async function getBoppyBase(): Promise<string> {
  * All formats take precedence over the relay when set, and all spoof
  * X-Forwarded-For via X-My-X-Forwarded-For (FireProx AWS) or directly
  * (ScraperAPI / Oxylabs / TorProxy pass through client headers).
+ *
+ * PRODUCTION GUARD: in NODE_ENV=production, localhost / 127.0.0.1 /
+ * 0.0.0.0 proxy URLs are AUTOMATICALLY IGNORED — they almost always point
+ * at a dev-only mini-service (js-proxy-pool, treblo-relay, etc.) that
+ * doesn't exist on the production server. Returning null here lets the
+ * app fall back to direct fetch to boppy.me instead of crashing with a
+ * 599 / 502 connection error. This makes the app resilient to the common
+ * pitfall of republishing a dev DB file (with localhost proxy URLs) to prod.
  */
 export async function getFireproxUrl(): Promise<string | null> {
+  let raw: string | undefined;
   try {
     const settings = await db.appSettings.findUnique({ where: { id: "singleton" } });
-    const fromDb = settings?.fireproxUrl?.trim();
-    if (fromDb) return fromDb;
+    raw = settings?.fireproxUrl?.trim();
   } catch {
     // DB unavailable — fall through to env.
   }
-  const fromEnv = process.env.BOPPY_FIREPROX_URL?.trim();
-  return fromEnv || null;
+  if (!raw) raw = process.env.BOPPY_FIREPROX_URL?.trim();
+  if (!raw) return null;
+
+  // Production guard: ignore localhost proxy URLs in prod.
+  // A localhost proxy URL almost always means a dev-only mini-service
+  // (js-proxy-pool on :8792, treblo-relay on :8787, etc.) that was
+  // accidentally shipped to prod via the DB file. Returning null here lets
+  // the app fall back to direct fetch to boppy.me — avoiding 599/502
+  // connection errors.
+  if (process.env.NODE_ENV === "production" && isLocalhostUrl(raw)) {
+    console.warn(
+      `[boppy] fireproxUrl "${raw}" is a localhost URL but NODE_ENV=production — ` +
+        `ignoring (localhost proxies don't exist on the production server). ` +
+        `Falling back to direct fetch to boppy.me.`,
+    );
+    return null;
+  }
+  return raw;
+}
+
+/** Detect localhost URLs (127.0.0.1, 0.0.0.0, ::1, localhost). */
+function isLocalhostUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    return (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "0.0.0.0" ||
+      host === "::1" ||
+      host === "[::1]"
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Detect ScraperAPI URLs (api.scraperapi.com). Used to switch rewrite mode. */
