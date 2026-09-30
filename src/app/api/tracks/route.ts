@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import {
   aceFetchResult,
-  aceFetchStatus,
   fetchJob,
   getBoppyBase,
   getProvider,
@@ -86,12 +85,16 @@ export async function GET() {
           let audioUrl: string | null = null;
 
           if (provider === "ace") {
-            const status = await aceFetchStatus(jobId);
-            finalStatus = status.status;
-            progress = status.progress;
-            if (status.status === "SUCCESS") {
-              const result = await aceFetchResult(jobId);
+            // ACE: polling is done via query_result (NOT status endpoint).
+            // The status endpoint is just a client → server ack, not a poll.
+            const result = await aceFetchResult(jobId);
+            if (result.audioUrl) {
+              finalStatus = "SUCCESS";
+              progress = 100;
               audioUrl = result.audioUrl;
+            } else {
+              finalStatus = "PENDING";
+              progress = null;
             }
           } else {
             const job = await fetchJob(jobId);

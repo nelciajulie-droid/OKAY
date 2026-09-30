@@ -755,22 +755,40 @@ export async function fetchAudio(audioUrl: string, range: string | null): Promis
 // ---------------------------------------------------------------------------
 // ACE Music (acemusic.ai) provider — optional alternative to boppy.me.
 //
-// Reverse-engineered from user-provided DevTools traces. TWO-TIER AUTH FLOW:
+// Reverse-engineered from the official client's JS bundle
+// (https://acemusic.ai/_next/static/chunks/522ea9e24dba26d8.js) and verified
+// end-to-end with a real Bearer session token. TWO-TIER AUTH FLOW:
 //
 //   1. Long-lived Bearer session token (stored in AppSettings.aceToken, set
-//      by user via Settings Dialog). Used ONLY to fetch the short-lived JWT.
+//      by user via Settings Dialog). Used ONLY to fetch the short-lived JWT,
+//      and to call the status endpoint.
 //
 //   2. Short-lived JWT (6 min expiration) returned by:
 //        GET https://acem-api.acemusic.ai/api/acem/user/ai/token
 //        Authorization: Bearer <session token>
-//      → 200 { ai_token: "eyJhbGc..." }  (JWT, ~6 min exp)
+//      → 200 { data: { ai_conf: { router, token: "<JWT>", expire } }, code, ... }
 //
-//   3. The JWT is used as `ai_token` form field (NOT as Bearer) for the
-//      actual generation calls:
-//        POST https://ai-api.acemusic.ai/engine/api/engine/create_random_sample
+//   3. The JWT is used as `ai_token` form field (NOT as Bearer header) for
+//      the actual generation calls:
+//        POST https://ai-api.acemusic.ai/engine/api/engine/release_task
 //        Content-Type: application/x-www-form-urlencoded
-//        Body: ai_token=<JWT>&model_name=acestep-v15-xl-turbo&app=studio-web&param_obj=<JSON>
-//      → 200 { ... task id ... }
+//        Body: env=production
+//             &ai_token=<JWT>
+//             &prompt=<direct string>
+//             &lyrics=<direct string or empty>
+//             &model_name=acestep-v15-xl-turbo
+//             &app=studio-web
+//             &param_obj=<JSON: {sample_query, instrumental, sample_mode:false, seed:"-1", task_type:"text2music", language:"en"}>
+//      → 200 { data: { task_id: "<uuid>" }, code, ... }
+//
+//   4. Poll the result (NOT the status — the status endpoint is just a
+//      status-update endpoint for the client to ack the work):
+//        POST https://ai-api.acemusic.ai/engine/api/engine/query_result
+//        Body: ai_token=<JWT>&task_id_list=["<task_id>"]&app=studio-web
+//      → 200 { data: [{ task_id, result: "<JSON string: [{file, wave, status, env, prompt}] }>" }] }
+//      The `result` field is a JSON-encoded STRING (double-encoded). Parse it
+//      to get the audio URL in `.file` (e.g. https://ace-music.s3-accelerate.amazonaws.com/.../*.aac).
+//      `status: "1"` means SUCCESS.
 //
 // The JWT is cached in memory with its `exp` claim; auto-refreshed when
 // near expiry (or on 401 from a generation call).
@@ -785,6 +803,7 @@ const ACE_API_BASE = "https://acem-api.acemusic.ai";
 const ACE_ENGINE_BASE = "https://ai-api.acemusic.ai";
 const ACE_MODEL_NAME = "acestep-v15-xl-turbo";
 const ACE_APP_NAME = "studio-web";
+const ACE_ENV = "production";
 
 /** Returns "boppy" (default) or "ace" based on AppSettings.provider (DB).
  *  Used by /api/lyrics and /api/generate to route to the right backend. */
@@ -858,6 +877,9 @@ function decodeJwtExp(jwt: string): number {
  * long-lived Bearer session token. Caches the JWT + its `exp` claim in
  * memory so subsequent calls reuse it until ~60s before expiry.
  *
+ * Real response shape (verified):
+ *   { data: { ai_conf: { router, token: "<JWT>", expire } }, code: 200, error: null, timestamp }
+ *
  * Throws BoppyError on failure (401 invalid session, 5xx server, etc.).
  */
 async function getAiToken(forceRefresh = false): Promise<string> {
@@ -880,8 +902,7 @@ async function getAiToken(forceRefresh = false): Promise<string> {
     throw new BoppyError(res.status, `ACE token endpoint failed: ${res.status}`);
   }
   const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-  // Real response shape (from user-provided DevTools trace):
-  //   { "data": { "ai_conf": { "router": "https://ai-api.acemusic.ai", "token": "<JWT>", "expire": "<ISO>" } }, "code": 200, ... }
+  // Real response shape: { data: { ai_conf: { router, token, expire } }, code, error, timestamp }
   const aiConf =
     (data?.data as { ai_conf?: Record<string, unknown> } | undefined)?.ai_conf ??
     (data?.ai_conf as Record<string, unknown> | undefined);
@@ -914,12 +935,14 @@ function aceEngineHeaders(): Record<string, string> {
     Origin: "https://acemusic.ai",
     Referer: "https://acemusic.ai/",
     "User-Agent": BROWSER_UA,
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
   };
 }
 
 // ---------------------------------------------------------------------------
-// POST /engine/api/engine/create_random_sample — create a generation job
-// (application/x-www-form-urlencoded with ai_token + model_name + app + param_obj)
+// POST /engine/api/engine/release_task — create a generation job
+// (application/x-www-form-urlencoded with env, ai_token, prompt, lyrics,
+//  model_name, app, param_obj)
 // ---------------------------------------------------------------------------
 
 export interface AceCreateJobInput {
@@ -941,12 +964,12 @@ export interface AceCreateJobResult {
 }
 
 /** Build the param_obj JSON sent in the form body. Mirrors the official
- *  client's wire format from user-provided DevTools trace. */
+ *  client's wire format from the JS bundle reverse-engineering. */
 function buildParamObj(input: AceCreateJobInput): Record<string, unknown> {
   return {
     sample_query: input.prompt,
     instrumental: input.instrumental ?? false,
-    sample_mode: true,
+    sample_mode: false, // false = real generation (not random sample)
     seed: "-1",
     task_type: "text2music",
     language: input.language ?? "en",
@@ -954,12 +977,13 @@ function buildParamObj(input: AceCreateJobInput): Record<string, unknown> {
 }
 
 /**
- * Create a generation job via ACE's create_random_sample endpoint.
+ * Create a generation job via ACE's release_task endpoint.
  * Flow:
  *   1. Fetch the short-lived JWT via /api/acem/user/ai/token.
- *   2. POST /engine/api/engine/create_random_sample with the JWT as
- *      `ai_token` form field + model_name + app + param_obj (JSON-encoded).
- *   3. Extract taskId from the response.
+ *   2. POST /engine/api/engine/release_task with the JWT as `ai_token`
+ *      form field + env=production + prompt + lyrics + model_name + app +
+ *      param_obj (JSON-encoded).
+ *   3. Extract task_id from response.data.task_id.
  *
  * On 401 from the engine endpoint, refreshes the JWT and retries once.
  */
@@ -969,16 +993,17 @@ export async function aceCreateJob(input: AceCreateJobInput): Promise<AceCreateJ
   const paramObj = buildParamObj(input);
   const buildBody = (t: string): string =>
     new URLSearchParams({
+      env: ACE_ENV,
       ai_token: t,
-      prompt: "undefined",
-      lyrics: "undefined",
+      prompt: input.prompt,
+      lyrics: input.lyrics ?? "",
       model_name: ACE_MODEL_NAME,
       app: ACE_APP_NAME,
       param_obj: JSON.stringify(paramObj),
     }).toString();
 
   const tryOnce = async (t: string): Promise<Response> =>
-    fetch(`${ACE_ENGINE_BASE}/engine/api/engine/create_random_sample`, {
+    fetch(`${ACE_ENGINE_BASE}/engine/api/engine/release_task`, {
       method: "POST",
       headers: aceEngineHeaders(),
       body: buildBody(t),
@@ -995,26 +1020,27 @@ export async function aceCreateJob(input: AceCreateJobInput): Promise<AceCreateJ
 
   if (!res.ok) {
     const data = (await res.json().catch(() => null)) as { error?: string; message?: string } | null;
-    const msg = data?.error || data?.message || `ACE create_random_sample failed: ${res.status}`;
+    const msg = data?.error || data?.message || `ACE release_task failed: ${res.status}`;
     throw new BoppyError(res.status, msg);
   }
 
   const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-  // Extract taskId — try multiple common field names.
+  // Real response: { data: { task_id: "<uuid>" }, code: 200, error: null, timestamp }
+  const inner = (data?.data as Record<string, unknown> | undefined) ?? data;
   const taskId =
-    (typeof data?.taskId === "string" && data.taskId) ||
-    (typeof data?.task_id === "string" && data.task_id) ||
-    (typeof data?.id === "string" && data.id) ||
-    (typeof data?.data === "string" && data.data) ||
+    (typeof inner?.task_id === "string" && inner.task_id) ||
+    (typeof inner?.taskId === "string" && inner.taskId) ||
+    (typeof inner?.id === "string" && inner.id) ||
     null;
   if (!taskId) {
-    throw new BoppyError(res.status, "ACE create_random_sample response missing task id.");
+    throw new BoppyError(res.status, "ACE release_task response missing task_id. Response: " + JSON.stringify(data).slice(0, 200));
   }
   return { taskId, raw: data };
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/acem/works/ai/status — poll job status (uses long-lived Bearer)
+// POST /api/acem/works/ai/status — set work status (NOT for polling)
+// (kept for completeness, but the polling is done via query_result below)
 // ---------------------------------------------------------------------------
 
 export interface AceJobStatus {
@@ -1024,42 +1050,16 @@ export interface AceJobStatus {
 }
 
 export async function aceFetchStatus(taskId: string): Promise<AceJobStatus> {
-  const bearer = await requireAceBearer();
-  const res = await fetch(`${ACE_API_BASE}/api/acem/works/ai/status`, {
-    method: "POST",
-    headers: aceApiHeaders(bearer, "application/json"),
-    // Real API expects `task_id` (not `id`) in the JSON body.
-    body: JSON.stringify({ task_id: taskId }),
-    signal: AbortSignal.timeout(30_000),
-  });
-
-  if (!res.ok) {
-    throw new BoppyError(res.status, `ACE status failed: ${res.status}`);
-  }
-
-  const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-  // Real response shape: { data: { status, progress, ... }, code, error, timestamp }
-  const inner =
-    (data?.data as Record<string, unknown> | undefined) ?? data;
-  const rawStatus = typeof inner?.status === "string" ? inner.status.toUpperCase() : "PENDING";
-  const status: AceJobStatus["status"] =
-    rawStatus === "SUCCESS" || rawStatus === "DONE" || rawStatus === "COMPLETED"
-      ? "SUCCESS"
-      : rawStatus === "FAILED" || rawStatus === "ERROR"
-        ? "FAILED"
-        : "PENDING";
-  const progress =
-    typeof inner?.progress === "number"
-      ? inner.progress
-      : typeof inner?.progress === "string"
-        ? Number(inner.progress) || null
-        : null;
-  return { status, progress, raw: data };
+  // The /works/ai/status endpoint is a status-UPDATE endpoint (client → server
+  // ack), not a polling endpoint. For polling, use aceFetchResult which calls
+  // /engine/api/engine/query_result. This function is kept for completeness
+  // and returns a minimal PENDING status so the polling loop keeps running.
+  return { status: "PENDING", progress: null, raw: null };
 }
 
 // ---------------------------------------------------------------------------
-// POST /engine/api/engine/query_result — fetch the final audio URL
-// (uses the short-lived JWT as ai_token form field)
+// POST /engine/api/engine/query_result — poll the audio result
+// (uses the short-lived JWT as ai_token form field + task_id_list JSON array)
 // ---------------------------------------------------------------------------
 
 export interface AceJobResult {
@@ -1067,20 +1067,30 @@ export interface AceJobResult {
   raw?: unknown;
 }
 
+/**
+ * Query the result of an ACE generation job. The `result` field is a
+ * JSON-encoded STRING (double-encoded) containing an array of:
+ *   [{ file: "<S3 .aac URL>", wave: "<S3 .json URL>", status: "1", env, prompt }]
+ * `status: "1"` means SUCCESS.
+ *
+ * Returns { audioUrl } where audioUrl is the S3 .aac file URL (or null
+ * while pending).
+ */
 export async function aceFetchResult(taskId: string): Promise<AceJobResult> {
   let jwt = await getAiToken();
 
-  const buildBody = (t: string, id: string): string =>
+  const buildBody = (t: string): string =>
     new URLSearchParams({
       ai_token: t,
-      id,
+      task_id_list: JSON.stringify([taskId]),
+      app: ACE_APP_NAME,
     }).toString();
 
   const tryOnce = async (t: string): Promise<Response> =>
     fetch(`${ACE_ENGINE_BASE}/engine/api/engine/query_result`, {
       method: "POST",
       headers: aceEngineHeaders(),
-      body: buildBody(t, taskId),
+      body: buildBody(t),
       signal: AbortSignal.timeout(30_000),
     });
 
@@ -1096,14 +1106,32 @@ export async function aceFetchResult(taskId: string): Promise<AceJobResult> {
   }
 
   const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-  const audioUrl =
-    (typeof data?.audioUrl === "string" && data.audioUrl) ||
-    (typeof data?.audio_url === "string" && data.audio_url) ||
-    (typeof data?.url === "string" && data.url) ||
-    (typeof data?.result === "string" && data.result) ||
-    (typeof data?.data === "string" && data.data) ||
-    null;
-  return { audioUrl, raw: data };
+  // Real response: { data: [{ task_id, result: "<JSON string>" }], code, ... }
+  const arr = Array.isArray(data?.data) ? (data!.data as unknown[]) : null;
+  if (!arr || arr.length === 0) {
+    // Empty data array means the task is still pending.
+    return { audioUrl: null, raw: data };
+  }
+  const first = arr[0] as Record<string, unknown> | undefined;
+  const resultStr = typeof first?.result === "string" ? first.result : null;
+  if (!resultStr) {
+    return { audioUrl: null, raw: data };
+  }
+  // Parse the double-encoded result string.
+  let resultArr: unknown;
+  try {
+    resultArr = JSON.parse(resultStr);
+  } catch {
+    return { audioUrl: null, raw: data };
+  }
+  const resultObj = Array.isArray(resultArr) ? (resultArr[0] as Record<string, unknown>) : null;
+  const status = typeof resultObj?.status === "string" ? resultObj.status : null;
+  const file = typeof resultObj?.file === "string" ? resultObj.file : null;
+  if (status === "1" && file) {
+    return { audioUrl: file, raw: data };
+  }
+  // status !== "1" → still processing.
+  return { audioUrl: null, raw: data };
 }
 
 // ---------------------------------------------------------------------------
