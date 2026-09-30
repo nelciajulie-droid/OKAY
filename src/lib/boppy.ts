@@ -755,46 +755,36 @@ export async function fetchAudio(audioUrl: string, range: string | null): Promis
 // ---------------------------------------------------------------------------
 // ACE Music (acemusic.ai) provider — optional alternative to boppy.me.
 //
-// Reverse-engineered from the user-provided DevTools traces (4 endpoints):
+// Reverse-engineered from user-provided DevTools traces. TWO-TIER AUTH FLOW:
 //
-//   GET  https://acem-api.acemusic.ai/api/acem/user/ai/token
-//        Authorization: Bearer <aceToken>
-//        → checks token validity + returns AI quota info
+//   1. Long-lived Bearer session token (stored in AppSettings.aceToken, set
+//      by user via Settings Dialog). Used ONLY to fetch the short-lived JWT.
 //
-//   POST https://ai-api.acemusic.ai/engine/api/engine/release_task
-//        Authorization: Bearer <aceToken>
-//        Content-Type: multipart/form-data
-//        → creates a generation job (returns taskId)
+//   2. Short-lived JWT (6 min expiration) returned by:
+//        GET https://acem-api.acemusic.ai/api/acem/user/ai/token
+//        Authorization: Bearer <session token>
+//      → 200 { ai_token: "eyJhbGc..." }  (JWT, ~6 min exp)
 //
-//   POST https://ai-api.acemusic.ai/engine/api/engine/create_random_sample
-//        Authorization: Bearer <aceToken>
+//   3. The JWT is used as `ai_token` form field (NOT as Bearer) for the
+//      actual generation calls:
+//        POST https://ai-api.acemusic.ai/engine/api/engine/create_random_sample
 //        Content-Type: application/x-www-form-urlencoded
-//        → creates a sample (used by "random" / quick generation)
+//        Body: ai_token=<JWT>&model_name=acestep-v15-xl-turbo&app=studio-web&param_obj=<JSON>
+//      → 200 { ... task id ... }
 //
-//   POST https://acem-api.acemusic.ai/api/acem/works/ai/status
-//        Authorization: Bearer <aceToken>
-//        Content-Type: application/json
-//        body: { id: <taskId> }
-//        → polls the job status (PENDING / SUCCESS / FAILED)
+// The JWT is cached in memory with its `exp` claim; auto-refreshed when
+// near expiry (or on 401 from a generation call).
 //
-//   POST https://ai-api.acemusic.ai/engine/api/engine/query_result
-//        Authorization: Bearer <aceToken>
-//        Content-Type: application/x-www-form-urlencoded
-//        → fetches the generated audio result (mp3 URL)
-//
-// The aceToken is stored in AppSettings (DB-only, never in source). Set via
-// Settings Dialog password field. When provider="ace", boppy.ts uses aceToken
-// to call these endpoints.
-//
-// SECURITY: aceToken is a Bearer session token — anyone with it can
-// impersonate the user on acemusic.ai until it expires. The token is NEVER
-// logged, NEVER returned by GET /api/settings (only a boolean hasAceToken),
-// and NEVER sent to the client. It travels backend-only: DB → boppy.ts →
-// Authorization header to acem-api/ai-api.
+// SECURITY: the long-lived Bearer session token is NEVER logged, NEVER
+// returned by GET /api/settings (only a boolean hasAceToken), and NEVER
+// sent to the client. The JWT is also short-lived (6 min) so even if it
+// leaked, the blast radius is tiny.
 // ---------------------------------------------------------------------------
 
 const ACE_API_BASE = "https://acem-api.acemusic.ai";
 const ACE_ENGINE_BASE = "https://ai-api.acemusic.ai";
+const ACE_MODEL_NAME = "acestep-v15-xl-turbo";
+const ACE_APP_NAME = "studio-web";
 
 /** Returns "boppy" (default) or "ace" based on AppSettings.provider (DB).
  *  Used by /api/lyrics and /api/generate to route to the right backend. */
@@ -807,8 +797,9 @@ export async function getProvider(): Promise<"boppy" | "ace"> {
   }
 }
 
-/** Returns the ACE Bearer token from DB (or env ACE_TOKEN). Backend-only. */
-async function getAceToken(): Promise<string | null> {
+/** Returns the long-lived Bearer session token from DB (or env ACE_TOKEN).
+ *  Backend-only — never logged, never sent to client. */
+async function getAceBearerToken(): Promise<string | null> {
   try {
     const settings = await db.appSettings.findUnique({ where: { id: "singleton" } });
     const fromDb = settings?.aceToken?.trim();
@@ -819,19 +810,19 @@ async function getAceToken(): Promise<string | null> {
   return process.env.ACE_TOKEN?.trim() || null;
 }
 
-/** Throws a clean error if ACE provider is selected but no token is set. */
-async function requireAceToken(): Promise<string> {
-  const token = await getAceToken();
+/** Throws a clean error if ACE provider is selected but no Bearer token is set. */
+async function requireAceBearer(): Promise<string> {
+  const token = await getAceBearerToken();
   if (!token) {
-    throw new BoppyError(401, "ACE provider selected but no Bearer token is set. Open Settings → 'ACE Bearer Token' and paste your acemusic.ai token.", { code: "ace_no_token" });
+    throw new BoppyError(401, "ACE provider selected but no Bearer token is set. Open Settings → 'ACE Bearer Token' and paste your acemusic.ai session token (the long Bearer string from your browser DevTools, NOT the short JWT).", { code: "ace_no_token" });
   }
   return token;
 }
 
-/** Common headers for ACE API requests. */
-function aceHeaders(token: string, contentType: string): Record<string, string> {
+/** Common headers for ACE API requests (acem-api.acemusic.ai). */
+function aceApiHeaders(bearer: string, contentType: string): Record<string, string> {
   return {
-    Authorization: `Bearer ${token}`,
+    Authorization: `Bearer ${bearer}`,
     "Content-Type": contentType,
     Accept: "application/json, text/plain, */*",
     Origin: "https://acemusic.ai",
@@ -841,34 +832,88 @@ function aceHeaders(token: string, contentType: string): Record<string, string> 
 }
 
 // ---------------------------------------------------------------------------
-// GET /api/acem/user/ai/token — verify token validity + AI quota
+// JWT cache (in-memory, per-process). The short-lived JWT is fetched once
+// per (near-)expiry window and reused across all generation calls.
 // ---------------------------------------------------------------------------
+interface CachedJwt {
+  token: string;
+  expMs: number; // milliseconds since epoch
+}
+let cachedJwt: CachedJwt | null = null;
+const JWT_REFRESH_BUFFER_MS = 60_000; // refresh if < 60s left
 
-export interface AceTokenInfo {
-  valid: boolean;
-  raw?: unknown;
+function decodeJwtExp(jwt: string): number {
+  try {
+    const parts = jwt.split(".");
+    if (parts.length < 2) return 0;
+    const payload = JSON.parse(Buffer.from(parts[1]!, "base64").toString("utf8")) as { exp?: number };
+    return typeof payload.exp === "number" ? payload.exp * 1000 : 0;
+  } catch {
+    return 0;
+  }
 }
 
-export async function aceVerifyToken(): Promise<AceTokenInfo> {
-  const token = await requireAceToken();
+/**
+ * Fetch a fresh short-lived JWT from /api/acem/user/ai/token using the
+ * long-lived Bearer session token. Caches the JWT + its `exp` claim in
+ * memory so subsequent calls reuse it until ~60s before expiry.
+ *
+ * Throws BoppyError on failure (401 invalid session, 5xx server, etc.).
+ */
+async function getAiToken(forceRefresh = false): Promise<string> {
+  if (!forceRefresh && cachedJwt) {
+    const now = Date.now();
+    if (cachedJwt.expMs - now > JWT_REFRESH_BUFFER_MS) {
+      return cachedJwt.token;
+    }
+  }
+  const bearer = await requireAceBearer();
   const res = await fetch(`${ACE_API_BASE}/api/acem/user/ai/token`, {
     method: "GET",
-    headers: aceHeaders(token, "application/json"),
+    headers: aceApiHeaders(bearer, "application/json"),
     signal: AbortSignal.timeout(30_000),
   });
   if (res.status === 401 || res.status === 403) {
-    return { valid: false };
+    throw new BoppyError(res.status, "Your acemusic.ai Bearer token is invalid or expired. Logout from acemusic.ai, log back in, and paste the new Bearer in Settings → 'ACE Bearer Token'.", { code: "ace_invalid_session" });
   }
   if (!res.ok) {
-    throw new BoppyError(res.status, `ACE token check failed: ${res.status}`);
+    throw new BoppyError(res.status, `ACE token endpoint failed: ${res.status}`);
   }
-  const data = (await res.json().catch(() => null)) as unknown;
-  return { valid: true, raw: data };
+  const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  const aiToken =
+    (typeof data?.ai_token === "string" && data.ai_token) ||
+    (typeof data?.token === "string" && data.token) ||
+    null;
+  if (!aiToken) {
+    throw new BoppyError(500, "ACE token endpoint returned no ai_token field.");
+  }
+  const expMs = decodeJwtExp(aiToken) || (Date.now() + 5 * 60_000); // fallback: 5 min if exp missing
+  cachedJwt = { token: aiToken, expMs };
+  return aiToken;
+}
+
+/** Invalidate the cached JWT — called when a generation call gets 401,
+ *  so the next call fetches a fresh JWT. */
+function invalidateJwt(): void {
+  cachedJwt = null;
+}
+
+/** Common headers for ACE engine requests (ai-api.acemusic.ai). The JWT
+ *  is sent as a form field (`ai_token`), not as Bearer, per the official
+ *  client's wire format. */
+function aceEngineHeaders(): Record<string, string> {
+  return {
+    Accept: "application/json, text/plain, */*",
+    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+    Origin: "https://acemusic.ai",
+    Referer: "https://acemusic.ai/",
+    "User-Agent": BROWSER_UA,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// POST /engine/api/engine/release_task — create a full generation job
-// (multipart/form-data with the prompt + options)
+// POST /engine/api/engine/create_random_sample — create a generation job
+// (application/x-www-form-urlencoded with ai_token + model_name + app + param_obj)
 // ---------------------------------------------------------------------------
 
 export interface AceCreateJobInput {
@@ -880,6 +925,8 @@ export interface AceCreateJobInput {
   bpm?: number;
   keyscale?: string;
   timesignature?: string;
+  instrumental?: boolean;
+  language?: string;
 }
 
 export interface AceCreateJobResult {
@@ -887,58 +934,81 @@ export interface AceCreateJobResult {
   raw?: unknown;
 }
 
+/** Build the param_obj JSON sent in the form body. Mirrors the official
+ *  client's wire format from user-provided DevTools trace. */
+function buildParamObj(input: AceCreateJobInput): Record<string, unknown> {
+  return {
+    sample_query: input.prompt,
+    instrumental: input.instrumental ?? false,
+    sample_mode: true,
+    seed: "-1",
+    task_type: "text2music",
+    language: input.language ?? "en",
+  };
+}
+
 /**
- * Create a generation job via ACE's release_task endpoint.
- * Uses multipart/form-data (the official client sends a 1055-byte form
- * with multiple fields). We mirror that shape but only send the fields
- * the user provided — the server accepts a subset.
+ * Create a generation job via ACE's create_random_sample endpoint.
+ * Flow:
+ *   1. Fetch the short-lived JWT via /api/acem/user/ai/token.
+ *   2. POST /engine/api/engine/create_random_sample with the JWT as
+ *      `ai_token` form field + model_name + app + param_obj (JSON-encoded).
+ *   3. Extract taskId from the response.
+ *
+ * On 401 from the engine endpoint, refreshes the JWT and retries once.
  */
 export async function aceCreateJob(input: AceCreateJobInput): Promise<AceCreateJobResult> {
-  const token = await requireAceToken();
-  const form = new FormData();
-  form.append("prompt", input.prompt);
-  if (input.styleTags) form.append("tags", input.styleTags);
-  if (input.title) form.append("title", input.title);
-  if (input.lyrics) form.append("lyrics", input.lyrics);
-  if (input.duration) form.append("duration", String(input.duration));
-  if (input.bpm) form.append("bpm", String(input.bpm));
-  if (input.keyscale) form.append("keyscale", input.keyscale);
-  if (input.timesignature) form.append("timesignature", input.timesignature);
+  let jwt = await getAiToken();
 
-  const res = await fetch(`${ACE_ENGINE_BASE}/engine/api/engine/release_task`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json, text/plain, */*",
-      Origin: "https://acemusic.ai",
-      Referer: "https://acemusic.ai/",
-      "User-Agent": BROWSER_UA,
-      // Note: do NOT set Content-Type manually — fetch() will set
-      // multipart/form-data; boundary=... automatically.
-    },
-    body: form,
-    signal: AbortSignal.timeout(60_000),
-  });
+  const paramObj = buildParamObj(input);
+  const buildBody = (t: string): string =>
+    new URLSearchParams({
+      ai_token: t,
+      prompt: "undefined",
+      lyrics: "undefined",
+      model_name: ACE_MODEL_NAME,
+      app: ACE_APP_NAME,
+      param_obj: JSON.stringify(paramObj),
+    }).toString();
+
+  const tryOnce = async (t: string): Promise<Response> =>
+    fetch(`${ACE_ENGINE_BASE}/engine/api/engine/create_random_sample`, {
+      method: "POST",
+      headers: aceEngineHeaders(),
+      body: buildBody(t),
+      signal: AbortSignal.timeout(60_000),
+    });
+
+  let res = await tryOnce(jwt);
+  if (res.status === 401) {
+    // JWT expired mid-flight — refresh and retry once.
+    invalidateJwt();
+    jwt = await getAiToken(true);
+    res = await tryOnce(jwt);
+  }
 
   if (!res.ok) {
-    const data = (await res.json().catch(() => null)) as { error?: string } | null;
-    throw new BoppyError(res.status, data?.error || `ACE release_task failed: ${res.status}`);
+    const data = (await res.json().catch(() => null)) as { error?: string; message?: string } | null;
+    const msg = data?.error || data?.message || `ACE create_random_sample failed: ${res.status}`;
+    throw new BoppyError(res.status, msg);
   }
 
   const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  // Extract taskId — try multiple common field names.
   const taskId =
     (typeof data?.taskId === "string" && data.taskId) ||
     (typeof data?.task_id === "string" && data.task_id) ||
     (typeof data?.id === "string" && data.id) ||
+    (typeof data?.data === "string" && data.data) ||
     null;
   if (!taskId) {
-    throw new BoppyError(res.status, "ACE release_task response missing taskId.");
+    throw new BoppyError(res.status, "ACE create_random_sample response missing task id.");
   }
   return { taskId, raw: data };
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/acem/works/ai/status — poll job status
+// POST /api/acem/works/ai/status — poll job status (uses long-lived Bearer)
 // ---------------------------------------------------------------------------
 
 export interface AceJobStatus {
@@ -948,10 +1018,10 @@ export interface AceJobStatus {
 }
 
 export async function aceFetchStatus(taskId: string): Promise<AceJobStatus> {
-  const token = await requireAceToken();
+  const bearer = await requireAceBearer();
   const res = await fetch(`${ACE_API_BASE}/api/acem/works/ai/status`, {
     method: "POST",
-    headers: aceHeaders(token, "application/json"),
+    headers: aceApiHeaders(bearer, "application/json"),
     body: JSON.stringify({ id: taskId }),
     signal: AbortSignal.timeout(30_000),
   });
@@ -979,6 +1049,7 @@ export async function aceFetchStatus(taskId: string): Promise<AceJobStatus> {
 
 // ---------------------------------------------------------------------------
 // POST /engine/api/engine/query_result — fetch the final audio URL
+// (uses the short-lived JWT as ai_token form field)
 // ---------------------------------------------------------------------------
 
 export interface AceJobResult {
@@ -987,15 +1058,28 @@ export interface AceJobResult {
 }
 
 export async function aceFetchResult(taskId: string): Promise<AceJobResult> {
-  const token = await requireAceToken();
-  // Official client uses application/x-www-form-urlencoded.
-  const body = new URLSearchParams({ id: taskId }).toString();
-  const res = await fetch(`${ACE_ENGINE_BASE}/engine/api/engine/query_result`, {
-    method: "POST",
-    headers: aceHeaders(token, "application/x-www-form-urlencoded;charset=UTF-8"),
-    body,
-    signal: AbortSignal.timeout(30_000),
-  });
+  let jwt = await getAiToken();
+
+  const buildBody = (t: string, id: string): string =>
+    new URLSearchParams({
+      ai_token: t,
+      id,
+    }).toString();
+
+  const tryOnce = async (t: string): Promise<Response> =>
+    fetch(`${ACE_ENGINE_BASE}/engine/api/engine/query_result`, {
+      method: "POST",
+      headers: aceEngineHeaders(),
+      body: buildBody(t, taskId),
+      signal: AbortSignal.timeout(30_000),
+    });
+
+  let res = await tryOnce(jwt);
+  if (res.status === 401) {
+    invalidateJwt();
+    jwt = await getAiToken(true);
+    res = await tryOnce(jwt);
+  }
 
   if (!res.ok) {
     throw new BoppyError(res.status, `ACE query_result failed: ${res.status}`);
@@ -1007,6 +1091,28 @@ export async function aceFetchResult(taskId: string): Promise<AceJobResult> {
     (typeof data?.audio_url === "string" && data.audio_url) ||
     (typeof data?.url === "string" && data.url) ||
     (typeof data?.result === "string" && data.result) ||
+    (typeof data?.data === "string" && data.data) ||
     null;
   return { audioUrl, raw: data };
+}
+
+// ---------------------------------------------------------------------------
+// Optional: verify the long-lived Bearer session token validity.
+// ---------------------------------------------------------------------------
+
+export interface AceTokenInfo {
+  valid: boolean;
+  raw?: unknown;
+}
+
+export async function aceVerifyBearer(): Promise<AceTokenInfo> {
+  try {
+    await getAiToken(true); // force refresh
+    return { valid: true };
+  } catch (err) {
+    if (err instanceof BoppyError && (err.status === 401 || err.status === 403)) {
+      return { valid: false };
+    }
+    throw err;
+  }
 }
