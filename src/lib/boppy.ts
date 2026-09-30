@@ -131,6 +131,100 @@ function getProxyAgent(proxyUrl: string): ProxyAgent {
 }
 
 /**
+ * Drop the cached ProxyAgent for a proxy URL so the next call creates a fresh
+ * one with a new connection pool. Used by retryOnProxyFailure when a proxy
+ * dies (502 / network error) — closing the old agent forces undici to open a
+ * new connection to the proxy gateway, which for proxy-scraper-cli / mubeng
+ * / Oxylabs means a different upstream proxy IP gets assigned.
+ */
+async function resetProxyAgent(proxyUrl: string): Promise<void> {
+  const agent = proxyAgentCache.get(proxyUrl);
+  if (agent) {
+    proxyAgentCache.delete(proxyUrl);
+    try {
+      // undici ProxyAgent exposes close() to release the connection pool.
+      await (agent as unknown as { close?: () => Promise<void> }).close?.();
+    } catch {
+      // Ignore — agent close is best-effort.
+    }
+  }
+}
+
+/**
+ * Retry wrapper for proxy-routed fetches. When a free proxy dies mid-request
+ * (network error, 502/503/504, or aborted), the wrapper:
+ *   1. Resets the cached ProxyAgent (drops the dead connection pool).
+ *   2. Re-runs the fetch — undici opens a fresh connection to the proxy
+ *      gateway, which assigns a different upstream proxy IP (proxy-scraper
+ *      rotates per connection, mubeng rotates per request, Oxylabs rotates
+ *      per request on port 7777).
+ *
+ * Idempotent for GET/HEAD (safe retries). For POST it retries up to
+ * MAX_PROXY_RETRIES times — boppy's POST /api/llm/compose and
+ * POST /api/generate are idempotent via the dedupe mechanism (identical
+ * params reuse the existing generation), so retrying is safe.
+ *
+ * Non-proxy errors (4xx other than 429-like, 2xx) are returned as-is.
+ * 429 is returned as-is so the upper-layer 429 banner shows the real
+ * retryAfter — retrying on a 429 with a different proxy WOULD work but
+ * boppy rate-limits by IP, so the 429 will clear naturally.
+ */
+const MAX_PROXY_RETRIES = 3;
+const PROXY_RETRY_BACKOFF_MS = 250;
+
+async function fetchWithProxyRetry(
+  target: string,
+  init: {
+    method: string;
+    headers: Record<string, string>;
+    body?: string;
+    range?: string | null;
+    timeoutMs: number;
+  },
+  proxyUrl: string,
+): Promise<Response> {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= MAX_PROXY_RETRIES; attempt++) {
+    try {
+      const res = await undiciFetch(target, {
+        method: init.method,
+        headers: init.headers,
+        body: init.body,
+        dispatcher: getProxyAgent(proxyUrl),
+        signal: AbortSignal.timeout(init.timeoutMs),
+      });
+      // 502 / 503 / 504 → proxy died or upstream unavailable. Retry.
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
+        // Drain the body so the connection can be reused/closed cleanly.
+        try { await res.arrayBuffer(); } catch { /* ignore */ }
+        lastError = new Error(`upstream ${res.status} via proxy`);
+        if (attempt < MAX_PROXY_RETRIES) {
+          await resetProxyAgent(proxyUrl);
+          await new Promise((r) => setTimeout(r, PROXY_RETRY_BACKOFF_MS * attempt));
+          continue;
+        }
+        return res;
+      }
+      return res;
+    } catch (err) {
+      lastError = err;
+      // Network failure / aborted / timeout → try a fresh proxy connection.
+      if (attempt < MAX_PROXY_RETRIES) {
+        await resetProxyAgent(proxyUrl);
+        await new Promise((r) => setTimeout(r, PROXY_RETRY_BACKOFF_MS * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+  // All retries exhausted — rethrow the last error so the caller can
+  // surface it (typically a 502 to /api/lyrics or /api/generate).
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("proxy retry exhausted");
+}
+
+/**
  * Generate a random IPv4 for the X-My-X-Forwarded-For header. FireProx's AWS
  * API Gateway config copies this into the X-Forwarded-For header sent to the
  * upstream, so boppy sees a fresh client IP per request instead of the
@@ -221,16 +315,17 @@ async function boppyFetch(
       });
     }
     if (isPlainProxy(fireproxUrl)) {
-      // Plain HTTP proxy (TorProxy, Squid, ...) — tunnel via undici ProxyAgent.
-      // Use undici's own fetch (not the global) so the ProxyAgent dispatcher
-      // is from the same package version (see top-of-file import comment).
-      return undiciFetch(target, {
-        method: options.method,
-        headers,
-        body: options.body,
-        dispatcher: getProxyAgent(fireproxUrl),
-        signal: AbortSignal.timeout(options.timeoutMs ?? 60_000),
-      });
+      // Plain HTTP proxy (TorProxy, Oxylabs, proxy-scraper-cli, mubeng,
+      // Squid, ...) — tunnel via undici ProxyAgent. Use undici's own fetch
+      // (not the global) so the ProxyAgent dispatcher is from the same
+      // package version (see top-of-file import comment). Wrapped with
+      // fetchWithProxyRetry so dead free proxies (502/network error) auto
+      // retry with a fresh proxy connection from the rotation pool.
+      return fetchWithProxyRetry(
+        target,
+        { method: options.method, headers, body: options.body, timeoutMs: options.timeoutMs ?? 60_000 },
+        fireproxUrl,
+      );
     }
     // AWS FireProx (default): path-prefix rewriting.
     return fetch(`${fireproxUrl.replace(/\/+$/, "")}${path}`, {
@@ -466,12 +561,19 @@ export async function fetchAudio(audioUrl: string, range: string | null): Promis
       });
     }
     if (isPlainProxy(fireproxUrl)) {
-      // Plain HTTP proxy (TorProxy, Squid, ...) — tunnel via undici ProxyAgent.
-      return undiciFetch(target, {
-        headers: range ? { ...headers, Range: range } : headers,
-        dispatcher: getProxyAgent(fireproxUrl),
-        signal: AbortSignal.timeout(120_000),
-      });
+      // Plain HTTP proxy (TorProxy, Oxylabs, proxy-scraper-cli, mubeng,
+      // Squid, ...) — tunnel via undici ProxyAgent. Wrapped with
+      // fetchWithProxyRetry so dead free proxies (502/network error) auto
+      // retry with a fresh proxy connection from the rotation pool.
+      return fetchWithProxyRetry(
+        target,
+        {
+          method: "GET",
+          headers: range ? { ...headers, Range: range } : headers,
+          timeoutMs: 120_000,
+        },
+        fireproxUrl,
+      );
     }
     return fetch(target, {
       headers: range ? { ...headers, Range: range } : headers,
