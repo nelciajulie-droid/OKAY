@@ -169,7 +169,7 @@ async function resetProxyAgent(proxyUrl: string): Promise<void> {
  * retryAfter — retrying on a 429 with a different proxy WOULD work but
  * boppy rate-limits by IP, so the 429 will clear naturally.
  */
-const MAX_PROXY_RETRIES = 3;
+const MAX_PROXY_RETRIES = 4;
 const PROXY_RETRY_BACKOFF_MS = 250;
 
 async function fetchWithProxyRetry(

@@ -1,9 +1,0 @@
-{
-  "name": "mock-fireprox",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Mock AWS API Gateway mimicking FireProx (github.com/ustayready/fireprox) for local end-to-end tests. Forwards /api/* and /uploads/* to https://boppy.me while injecting AWS-like headers (X-Amzn-Trace-Id) and honoring the X-My-X-Forwarded-For convention (copied into X-Forwarded-For).",
-  "scripts": {
-    "dev": "bun --hot index.ts"
-  }
-}

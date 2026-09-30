@@ -1,9 +1,0 @@
-{
-  "name": "mock-scraperapi",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Mock ScraperAPI (scraperapi.com) for local tests. Forwards requests where the target URL is passed as ?url= query param, mimicking ScraperAPI's wire protocol. Accepts any api_key, rotates X-Forwarded-For per request to mimic residential IP rotation, injects X-ScraperApi-Trace-Id fingerprint. Streams response (Range not supported — full GET only, just like real ScraperAPI).",
-  "scripts": {
-    "dev": "bun --hot index.ts"
-  }
-}

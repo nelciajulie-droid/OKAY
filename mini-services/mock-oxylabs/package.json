@@ -1,9 +1,0 @@
-{
-  "name": "mock-oxylabs",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Mock Oxylabs residential proxy (pr.oxylabs.io:7777) for local tests. Standard HTTP proxy with Basic auth (customer-USER:PASS), per-request IP rotation simulated by random X-Forwarded-For header, forwards everything to https://boppy.me with Range/206 streaming preserved. Acts exactly like the real Oxylabs gateway except the actual IP isn't residential — it's the sandbox's IP.",
-  "scripts": {
-    "dev": "bun --hot index.ts"
-  }
-}
