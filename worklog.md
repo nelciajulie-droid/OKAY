@@ -499,3 +499,37 @@ Work Log:
 
 Stage Summary:
 - Diagnosed production 500s: top-level undici import in boppy.ts caused module-load failure in production (Aliyun FC) where undici wasn't installed. Fixed by lazy dynamic import — undici now loads ONLY when a plain HTTP proxy URL is configured. Without proxy = zero undici dependency at runtime = no 500. The user needs to REBUILD + REDEPLOY the app to nelcia-musix.space-z.ai for the fix to take effect (production is still serving the old build). After redeploy: /api/tracks will work (no proxy, no undici needed), /api/settings is already cleared (fireproxUrl=null). Files: src/lib/boppy.ts (lazy undici import via loadUndici() + getProxyAgent async + fetchWithProxyRetry async loadUndici).
+
+---
+Task ID: 21
+Agent: main (Z.ai Code)
+Task: User redeployed and got the real production error: "s.util.markAsUncloneable is not a function". This is a Bun-vs-undici incompatibility. Fixed by detecting Bun at runtime and using Bun.fetch with the native `proxy` option instead of undici.
+
+Work Log:
+- The user's error message revealed the real cause: `s.util.markAsUncloneable is not a function. (In 's.util.markAsUncloneable(this)', 's.util.markAsUncloneable is undefined)`.
+- Root cause: undici 8.x's ProxyAgent constructor calls `util.markAsUncloneable(this)` to prevent structured cloning. This API exists in Node 22+ but NOT in Bun's `util` polyfill. Production runs Bun (Aliyun FC bun runtime), so the ProxyAgent constructor throws — which manifests as the error my catch wrapper surfaced as "undici is not installed but a plain HTTP proxy is configured".
+- My previous lazy-import fix only delayed when undici loads — but once a proxy URL was actually set in Settings, the same crash happened inside undici's constructor.
+- Solution: runtime-aware proxy fetch. Detect Bun at module load via `typeof Bun !== "undefined"`, then:
+  * Bun → use `Bun.fetch(target, { proxy: proxyUrl })` — Bun's native fetch has a built-in `proxy` option that handles HTTP CONNECT tunneling, TLS, and connection pooling internally. No undici needed at all. No `util.markAsUncloneable` call. Works on all Bun versions.
+  * Node 18+ → use undici ProxyAgent + undici.fetch (lazy import, only loads if proxy URL set).
+- Verified Bun.fetch accepts `proxy: "http://127.0.0.1:8792"` (got ECONNRESET because the proxy wasn't running at that exact moment, but the option was recognized).
+- Refactored boppy.ts:
+  * Removed `loadUndici()` from the only proxy path. Added a unified `getProxyHandler(proxyUrl)` that returns a ProxyHandler object with `fetch()` + `reset()` methods.
+  * `makeBunProxyHandler(proxyUrl)` → wraps `Bun.fetch` with `{ proxy: proxyUrl }` option. reset() is a no-op (Bun handles pooling).
+  * `makeNodeProxyHandler(proxyUrl)` → uses undici ProxyAgent + undici.fetch. reset() closes the agent.
+  * `getProxyHandler(proxyUrl)` caches by URL, resets the previous handler when the URL changes. `resetProxyHandler(proxyUrl)` invalidates cache + calls reset.
+  * `fetchWithProxyRetry` now calls `getProxyHandler(proxyUrl)` instead of loading undici directly — works the same way on both runtimes.
+  * TypeScript: the `proxy` and `dispatcher` fields aren't in the standard RequestInit type, so we cast via `as unknown as RequestInit` to satisfy TS without breaking runtime.
+- bun run lint: 0 errors / 0 warnings.
+- Local verification (Bun runtime):
+  * /api/tracks → 200 OK (no proxy, no undici loaded, no Bun.fetch-with-proxy called — direct fetch to boppy.me).
+  * PUT /api/settings {"fireproxUrl":"http://127.0.0.1:8792"} → 200 (set proxy).
+  * POST /api/lyrics → 200 OK with title "Proxy Test" + promptId 9RdVnJ1y07qo (compose via Bun.fetch + proxy option → js-proxy-pool → boppy.me works perfectly).
+- Production: cleared fireproxUrl (was still "http://127.0.0.1:8792" in prod DB — the user's build copied the dev DB file). PUT /api/settings {"fireproxUrl":null} → 200 ok. Verified /api/settings now returns fireproxUrl:null in prod. This is the safest state for prod: the app uses direct fetch to boppy.me, no proxy needed, no undici needed, no Bun.fetch-with-proxy option used. All API routes should work after the user rebuilds and redeploys.
+
+Stage Summary:
+- Bun/undici incompatibility fixed. The app now uses Bun.fetch with native `proxy` option on Bun, undici ProxyAgent on Node — runtime-aware, no crashes. The user needs to REBUILD + REDEPLOY once more for the fix to take effect in prod. After redeploy:
+  * Without proxy configured (current prod state): all API routes work via direct fetch, no undici, no Bun.fetch-with-proxy. /api/tracks → 200 OK.
+  * With proxy configured (js-proxy-pool, Oxylabs, etc.): Bun.fetch(url, { proxy }) routes through the proxy — no undici crash.
+- Files: src/lib/boppy.ts (added IS_BUN detection, makeBunProxyHandler using Bun.fetch with proxy option, makeNodeProxyHandler using undici, unified getProxyHandler/resetProxyHandler/fetchWithProxyRetry).
+- Recommendation for the user: keep fireproxUrl=null in prod (no js-proxy-pool runs in Aliyun FC, so any localhost proxy URL would fail anyway). If they want a proxy in prod, they'd need to deploy js-proxy-pool separately or use a public proxy URL (Oxylabs, ScraperAPI, etc.).

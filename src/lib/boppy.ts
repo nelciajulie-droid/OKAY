@@ -121,21 +121,77 @@ function isPlainProxy(url: string): boolean {
   return /^https?:\/\//i.test(url);
 }
 
-// undici ProxyAgent is created lazily per-URL (different proxies need different
-// agents). Cached by URL to avoid creating one per request (the agent manages
-// a connection pool — we want it to persist). undici itself is imported
-// dynamically (lazy) so the app works without undici installed when no
-// proxy is configured (production resilience).
-type UndiciModule = typeof import("undici");
-type ProxyAgentLike = InstanceType<UndiciModule["ProxyAgent"]>;
-const proxyAgentCache = new Map<string, ProxyAgentLike>();
-let undiciPromise: Promise<UndiciModule> | null = null;
+// IMPORTANT: Proxy routing uses RUNTIME-AWARE fetch.
+//
+// Two runtime paths are supported, detected once at module load:
+//
+//   • Bun (Aliyun FC bun runtime, local `bun run dev`): use Bun.fetch with
+//     the native `proxy` option. Bun handles connection pooling, CONNECT
+//     tunneling, and TLS internally — no undici needed. This avoids the
+//     `s.util.markAsUncloneable is not a function` crash that undici 8.x
+//     triggers on Bun (undici's ProxyAgent calls `util.markAsUncloneable`,
+//     which exists in Node 22+ but not in Bun's `util` polyfill).
+//
+//   • Node 18+: use undici's ProxyAgent + undici.fetch (lazy-imported only
+//     when a proxy URL is actually set, so the app works without undici
+//     installed when no proxy is configured — production resilience).
+//
+// Both paths feed into fetchWithProxyRetry (dead-proxy auto-retry with a
+// fresh connection).
+const IS_BUN = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
 
+type ProxyFetchFn = (
+  target: string,
+  init: {
+    method: string;
+    headers: Record<string, string>;
+    body?: string | null;
+    signal?: AbortSignal;
+  },
+) => Promise<Response>;
+
+interface ProxyHandler {
+  fetch: ProxyFetchFn;
+  /** Reset the connection pool / agent so the next fetch opens a fresh
+   *  connection to the proxy gateway → different upstream proxy IP. */
+  reset: () => Promise<void>;
+}
+
+// Cache one handler per proxy URL — Bun handles pooling internally, undici
+// ProxyAgent manages its own pool, so we don't want to recreate either on
+// every request.
+const proxyHandlerCache = new Map<string, ProxyHandler>();
+let activeProxyUrl: string | null = null;
+
+// Bun path — uses the native Bun.fetch with `proxy` option.
+const bunFetchNative: typeof fetch =
+  (globalThis as { Bun?: { fetch: typeof fetch } }).Bun?.fetch ?? fetch;
+
+function makeBunProxyHandler(proxyUrl: string): ProxyHandler {
+  return {
+    fetch: (target, init) =>
+      bunFetchNative(target, {
+        method: init.method,
+        headers: init.headers,
+        body: init.body ?? null,
+        signal: init.signal,
+        // Bun's native proxy option — accepts http://user:pass@host:port
+        proxy: proxyUrl,
+      // The `proxy` field isn't in the standard RequestInit type yet, but
+      // Bun's fetch accepts it. Cast to satisfy TS without breaking runtime.
+      } as unknown as RequestInit),
+    // Bun manages connections internally — reset is a no-op.
+    reset: async () => {},
+  };
+}
+
+// Node path — uses undici's ProxyAgent + undici.fetch (lazy import).
+type UndiciModule = typeof import("undici");
+let undiciPromise: Promise<UndiciModule> | null = null;
 async function loadUndici(): Promise<UndiciModule> {
   if (!undiciPromise) {
     undiciPromise = import("undici").catch((err) => {
-      // Reset so a subsequent call (after the user installs undici) can retry.
-      undiciPromise = null;
+      undiciPromise = null; // allow retry after install
       throw new Error(
         `undici is not installed but a plain HTTP proxy is configured. ` +
           `Install it with \`bun add undici\` or \`npm install undici\`. ` +
@@ -146,43 +202,68 @@ async function loadUndici(): Promise<UndiciModule> {
   return undiciPromise;
 }
 
-async function getProxyAgent(proxyUrl: string): Promise<ProxyAgentLike> {
-  let agent = proxyAgentCache.get(proxyUrl);
-  if (!agent) {
-    const { ProxyAgent } = await loadUndici();
-    agent = new ProxyAgent({ uri: proxyUrl });
-    proxyAgentCache.set(proxyUrl, agent);
-  }
-  return agent;
+async function makeNodeProxyHandler(proxyUrl: string): Promise<ProxyHandler> {
+  const { ProxyAgent, fetch: undiciFetch } = await loadUndici();
+  const agent = new ProxyAgent({ uri: proxyUrl });
+  return {
+    fetch: (target, init) =>
+      undiciFetch(target, {
+        method: init.method,
+        headers: init.headers,
+        body: init.body ?? null,
+        signal: init.signal,
+        dispatcher: agent,
+      // `dispatcher` is an undici-specific init option — cast for TS.
+      } as unknown as RequestInit),
+    reset: async () => {
+      try {
+        await (agent as unknown as { close?: () => Promise<void> }).close?.();
+      } catch {
+        // Ignore — agent close is best-effort.
+      }
+    },
+  };
 }
 
-/**
- * Drop the cached ProxyAgent for a proxy URL so the next call creates a fresh
- * one with a new connection pool. Used by retryOnProxyFailure when a proxy
- * dies (502 / network error) — closing the old agent forces undici to open a
- * new connection to the proxy gateway, which for proxy-scraper-cli / mubeng
- * / Oxylabs means a different upstream proxy IP gets assigned.
- */
-async function resetProxyAgent(proxyUrl: string): Promise<void> {
-  const agent = proxyAgentCache.get(proxyUrl);
-  if (agent) {
-    proxyAgentCache.delete(proxyUrl);
-    try {
-      await (agent as unknown as { close?: () => Promise<void> }).close?.();
-    } catch {
-      // Ignore — agent close is best-effort.
-    }
+async function getProxyHandler(proxyUrl: string): Promise<ProxyHandler> {
+  if (activeProxyUrl === proxyUrl) {
+    const cached = proxyHandlerCache.get(proxyUrl);
+    if (cached) return cached;
+  }
+  // Different proxy URL → reset the previous one (free its connection pool).
+  if (activeProxyUrl && activeProxyUrl !== proxyUrl) {
+    const prev = proxyHandlerCache.get(activeProxyUrl);
+    if (prev) await prev.reset();
+    proxyHandlerCache.delete(activeProxyUrl);
+  }
+  activeProxyUrl = proxyUrl;
+  let handler = proxyHandlerCache.get(proxyUrl);
+  if (!handler) {
+    handler = IS_BUN
+      ? makeBunProxyHandler(proxyUrl)
+      : await makeNodeProxyHandler(proxyUrl);
+    proxyHandlerCache.set(proxyUrl, handler);
+  }
+  return handler;
+}
+
+async function resetProxyHandler(proxyUrl: string): Promise<void> {
+  const handler = proxyHandlerCache.get(proxyUrl);
+  if (handler) {
+    proxyHandlerCache.delete(proxyUrl);
+    if (activeProxyUrl === proxyUrl) activeProxyUrl = null;
+    await handler.reset();
   }
 }
 
 /**
  * Retry wrapper for proxy-routed fetches. When a free proxy dies mid-request
  * (network error, 502/503/504, or aborted), the wrapper:
- *   1. Resets the cached ProxyAgent (drops the dead connection pool).
- *   2. Re-runs the fetch — undici opens a fresh connection to the proxy
- *      gateway, which assigns a different upstream proxy IP (proxy-scraper
- *      rotates per connection, mubeng rotates per request, Oxylabs rotates
- *      per request on port 7777).
+ *   1. Resets the cached proxy handler (drops the dead connection pool).
+ *   2. Re-runs the fetch — opens a fresh connection to the proxy gateway,
+ *      which assigns a different upstream proxy IP (proxy-scraper rotates
+ *      per connection, mubeng rotates per request, Oxylabs rotates per
+ *      request on port 7777, Bun.fetch pool picks a fresh connection).
  *
  * Idempotent for GET/HEAD (safe retries). For POST it retries up to
  * MAX_PROXY_RETRIES times — boppy's POST /api/llm/compose and
@@ -208,15 +289,14 @@ async function fetchWithProxyRetry(
   },
   proxyUrl: string,
 ): Promise<Response> {
-  const { fetch: undiciFetch } = await loadUndici();
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= MAX_PROXY_RETRIES; attempt++) {
     try {
-      const res = await undiciFetch(target, {
+      const handler = await getProxyHandler(proxyUrl);
+      const res = await handler.fetch(target, {
         method: init.method,
         headers: init.headers,
         body: init.body,
-        dispatcher: await getProxyAgent(proxyUrl),
         signal: AbortSignal.timeout(init.timeoutMs),
       });
       // 502 / 503 / 504 → proxy died or upstream unavailable. Retry.
@@ -225,7 +305,7 @@ async function fetchWithProxyRetry(
         try { await res.arrayBuffer(); } catch { /* ignore */ }
         lastError = new Error(`upstream ${res.status} via proxy`);
         if (attempt < MAX_PROXY_RETRIES) {
-          await resetProxyAgent(proxyUrl);
+          await resetProxyHandler(proxyUrl);
           await new Promise((r) => setTimeout(r, PROXY_RETRY_BACKOFF_MS * attempt));
           continue;
         }
@@ -236,7 +316,7 @@ async function fetchWithProxyRetry(
       lastError = err;
       // Network failure / aborted / timeout → try a fresh proxy connection.
       if (attempt < MAX_PROXY_RETRIES) {
-        await resetProxyAgent(proxyUrl);
+        await resetProxyHandler(proxyUrl);
         await new Promise((r) => setTimeout(r, PROXY_RETRY_BACKOFF_MS * attempt));
         continue;
       }
