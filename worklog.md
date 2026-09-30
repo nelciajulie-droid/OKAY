@@ -385,3 +385,24 @@ Work Log:
 
 Stage Summary:
 - AUTO-RETRY IMPLEMENTED + WORKING: free proxies that die (502) are now auto-replaced with another proxy from the pool. With a pool of 200 validated HTTPS proxies (proxy-scraper-cli), the test achieved 14/14 SUCCESS (100%) before timeout — far better than TorProxy (3/20) and the previous 20-proxy run (10/19). The retry logic + larger pool is the difference. Files: src/lib/boppy.ts (fetchWithProxyRetry + resetProxyAgent + 2 call sites updated). Other repos cloned for reference: mubeng/, proxy_pool/. To use: `pip install proxy-scraper-cli && proxy-scraper-cli --serve 8792 --rotate random -l 100000 --want 200 --types http --https-only --serve-refill 1` then paste `http://127.0.0.1:8792` in Settings → "FireProx URL". Free, unlimited, anonymous, no account, 100% success rate with retry.
+
+---
+Task ID: 17
+Agent: main (Z.ai Code)
+Task: User asked to convert ALL Python code to JS/Node/Next.js. Replaced proxy-scraper-cli (Python) with a pure-JS/TS proxy pool mini-service. Also killed the Python tor_proxy service.
+
+Work Log:
+- Audited Python dependencies: proxy-scraper-cli (PyPI, active), tor_proxy (active), fireprox (cloned, not running), proxy_pool (cloned, not running), requests-ip-rotator (cloned, not running). Only proxy-scraper-cli and tor_proxy were actively running.
+- Killed ALL Python services: `pkill -f "proxy-scraper"` + `pkill -f "python3 -m torproxy"`. Zero Python services now active (only the IDE's own /app/.venv remains).
+- Built mini-services/js-proxy-pool/ — pure TypeScript replacement for proxy-scraper-cli:
+  * package.json: name "js-proxy-pool", scripts dev "bun --hot index.ts" + start "bun index.ts". No dependencies beyond bun + undici (already in the project).
+  * index.ts (~580 lines): scrapes 7 GitHub raw proxy sources (proxifly, TheSpeedX, monosans, clarketm, roosterkid), validates via undici ProxyAgent (CONNECT + TLS + GET to api.ipify.org), honeypot detection (body must match IPv4 regex), latency filter (max 8s default), exposes rotating HTTP proxy on port 8792 with BOTH HTTP proxy mode (absolute URL) AND HTTPS CONNECT tunneling via node:http + node:net. Round-robin rotation per request. 3-retry on dead proxies (both in the server's CONNECT handler AND in the HTTP proxy mode handler). Background refill every 30min. /health + /stats endpoints.
+  * CLI flags: --port, --want N (default 50), --max-latency MS, --refill-min N, --v (verbose).
+  * Key difference from the Python version: the JS version uses node:http (not Bun.serve) because Bun.serve doesn't support CONNECT method tunneling required for HTTPS proxy. node:http + server.on("connect") handles CONNECT natively.
+- First iteration used Bun.serve → CONNECT requests got 400 Bad Request (Bun.serve doesn't handle CONNECT). Rewrote with node:http + node:net for raw TCP socket tunneling.
+- Second iteration used a raw-CONNECT validator (too strict — rejected all 200+ proxies because CONNECT to api.ipify.org:443 without TLS doesn't return an IP). Reverted to undici ProxyAgent validation (CONNECT + TLS + GET → returns exit IP, exactly what boppy.ts will do).
+- REAL TEST: started with `bun index.ts --want 150`, validated 249 proxies in 1.5s, pool=249 (3 unique exit IPs — most free proxies share egress IPs). POST /api/lyrics {"prompt":"pure js test"} → 200 OK in 90s with real title "Pure JS Test" + caption + promptId B9whsFfXEUNI. The 90s latency is from the retry chain (boppy.ts retries 3 × JS pool retries 3 = up to 9 attempts through dead proxies before finding a working one).
+- bun run lint: 0 errors / 0 warnings. Zero Python services active. The project is now 100% JS/TS (Next.js + bun mini-services).
+
+Stage Summary:
+- ALL Python code removed from active use. proxy-scraper-cli (Python) → js-proxy-pool (pure TS). tor_proxy (Python) → killed (user can use js-proxy-pool instead, which provides the same IP rotation via free proxies without Tor). The only Python that remains is in CLONED repos (fireprox/, proxy_pool/, requests-ip-rotator/, tor_proxy/) which are reference code, not running. The project's runtime stack is now 100% JS/TS: Next.js 16 + Prisma + undici + node:http + node:net. The JS proxy pool works end-to-end (verified: compose → 200 OK "Pure JS Test") but is slower than the Python version (~90s per compose vs ~5-15s) because free proxies are unreliable and the retry chain is longer. Trade-off: no Python dependency at the cost of slower free-proxy rotation. Files: mini-services/js-proxy-pool/{index.ts, package.json}.

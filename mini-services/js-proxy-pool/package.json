@@ -1,0 +1,10 @@
+{
+  "name": "js-proxy-pool",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pure-JS/TS replacement for proxy-scraper-cli (Python). Scrapes free HTTP proxies from public GitHub lists, validates them (HTTPS-capable, low latency, no honeypot), exposes a rotating local proxy server on port 8792. Every request rotates to a different validated proxy IP. Auto-refills the pool in the background. No Python, no pip, no external deps beyond bun + undici.",
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts"
+  }
+}
