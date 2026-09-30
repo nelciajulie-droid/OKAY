@@ -1062,19 +1062,31 @@ export async function aceFetchStatus(taskId: string): Promise<AceJobStatus> {
 // (uses the short-lived JWT as ai_token form field + task_id_list JSON array)
 // ---------------------------------------------------------------------------
 
+/** One variation returned by ACE. There are typically 2 per generation. */
+export interface AceResultVariation {
+  audioUrl: string;
+  waveUrl: string | null;
+  prompt: string | null;
+  lyrics: string | null;
+  title: string | null;
+}
+
+/** Result of polling an ACE generation. Empty array = still pending.
+ *  2 entries = both variations ready. */
 export interface AceJobResult {
-  audioUrl: string | null;
+  variations: AceResultVariation[];
   raw?: unknown;
 }
 
 /**
  * Query the result of an ACE generation job. The `result` field is a
- * JSON-encoded STRING (double-encoded) containing an array of:
- *   [{ file: "<S3 .aac URL>", wave: "<S3 .json URL>", status: "1", env, prompt }]
- * `status: "1"` means SUCCESS.
+ * JSON-encoded STRING (double-encoded) containing an array of typically
+ * 2 variations:
+ *   [{ file, wave, status:"1", env, prompt, lyrics, title }, {...}]
+ * `status: "1"` means SUCCESS. We return all variations with status==="1".
  *
- * Returns { audioUrl } where audioUrl is the S3 .aac file URL (or null
- * while pending).
+ * Returns { variations: [] } while pending, or { variations: [{...}, {...}] }
+ * when both variations are ready.
  */
 export async function aceFetchResult(taskId: string): Promise<AceJobResult> {
   let jwt = await getAiToken();
@@ -1106,32 +1118,45 @@ export async function aceFetchResult(taskId: string): Promise<AceJobResult> {
   }
 
   const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-  // Real response: { data: [{ task_id, result: "<JSON string>" }], code, ... }
+  // Real response: { data: [{ task_id, result: "<JSON string>", status: 1 }], code, ... }
   const arr = Array.isArray(data?.data) ? (data!.data as unknown[]) : null;
   if (!arr || arr.length === 0) {
     // Empty data array means the task is still pending.
-    return { audioUrl: null, raw: data };
+    return { variations: [], raw: data };
   }
   const first = arr[0] as Record<string, unknown> | undefined;
   const resultStr = typeof first?.result === "string" ? first.result : null;
   if (!resultStr) {
-    return { audioUrl: null, raw: data };
+    return { variations: [], raw: data };
   }
-  // Parse the double-encoded result string.
+  // Parse the double-encoded result string — should be an array of 2 variations.
   let resultArr: unknown;
   try {
     resultArr = JSON.parse(resultStr);
   } catch {
-    return { audioUrl: null, raw: data };
+    return { variations: [], raw: data };
   }
-  const resultObj = Array.isArray(resultArr) ? (resultArr[0] as Record<string, unknown>) : null;
-  const status = typeof resultObj?.status === "string" ? resultObj.status : null;
-  const file = typeof resultObj?.file === "string" ? resultObj.file : null;
-  if (status === "1" && file) {
-    return { audioUrl: file, raw: data };
+  if (!Array.isArray(resultArr)) {
+    return { variations: [], raw: data };
   }
-  // status !== "1" → still processing.
-  return { audioUrl: null, raw: data };
+  // Filter to successful variations (status === "1") and map to our shape.
+  const variations: AceResultVariation[] = [];
+  for (const item of resultArr) {
+    if (!item || typeof item !== "object") continue;
+    const obj = item as Record<string, unknown>;
+    const status = typeof obj.status === "string" ? obj.status : null;
+    if (status !== "1") continue;
+    const file = typeof obj.file === "string" ? obj.file : null;
+    if (!file) continue;
+    variations.push({
+      audioUrl: file,
+      waveUrl: typeof obj.wave === "string" ? obj.wave : null,
+      prompt: typeof obj.prompt === "string" ? obj.prompt : null,
+      lyrics: typeof obj.lyrics === "string" ? obj.lyrics : null,
+      title: typeof obj.title === "string" ? obj.title : null,
+    });
+  }
+  return { variations, raw: data };
 }
 
 // ---------------------------------------------------------------------------

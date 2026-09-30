@@ -788,3 +788,46 @@ Stage Summary:
 - All research artifacts cleaned up. DB reset to safe state (provider=boppy, no tokens) for both dev and prod. The integration is production-ready IF the user pastes a valid Bearer in Settings (DB-only, never in code, never returned to client).
 - ⚠️ Security reminder: the user pasted their Bearer 3+ times in chat. They MUST logout from acemusic.ai NOW to invalidate all leaked tokens, then re-login to get a fresh Bearer (which they should paste via Settings UI only, never in chat).
 - Files modified: src/lib/boppy.ts (ACE client refactored with release_task + query_result + task_id_list + double-encoded result parsing), src/app/api/tracks/route.ts (polls via aceFetchResult only, removed unused aceFetchStatus import).
+
+---
+Task ID: 28
+Agent: main (Z.ai Code)
+Task: User noticed that ACE Music generates 2 variations per generation but our app only showed 1. Fix: create 2 tracks per ACE generation, populate both audio URLs from the 2 variations in query_result response. Also remove unused mini-services (js-proxy-pool, treblo-relay, worker) since we now use ACE directly.
+
+Work Log:
+- Inspected the real query_result response via direct curl with user's Bearer (already in chat). Confirmed the parsed `result` array contains 2 variations:
+  * variation 1: { file: ".../3d00ab72ec9e46fe06c6e268f98facaa.aac", wave, status:"1", prompt, lyrics:"[Instrumental]", title:"lo-fi hip-hop instrumental" }
+  * variation 2: { file: ".../6a914abf5eb27c035925c21a013dd90d.aac", wave, status:"1", prompt, lyrics:"[Instrumental]", title:"lo-fi hip-hop instrumental with a dusty piano and" }
+  Each variation has its own title (slightly different — ACE describes each variation).
+- Refactored src/lib/boppy.ts:
+  * New interfaces: `AceResultVariation` (audioUrl, waveUrl, prompt, lyrics, title) + `AceJobResult` (variations: AceResultVariation[], raw).
+  * `aceFetchResult` now returns ALL successful variations (status === "1"), not just the first one. Filters the parsed result array and maps each to AceResultVariation.
+- Refactored src/app/api/generate/route.ts:
+  * When provider="ace", create 2 tracks (v1, v2) instead of 1. Uses `Array.from({length: 2}, (_, i) => ({ status: "PENDING", title, prompt: caption, lyrics, version: "v${i+1}" }))`.
+  * boppy.me still creates 1 track (single variation).
+- Refactored src/app/api/tracks/route.ts:
+  * Group stale tracks by jobId — ACE creates 2 tracks per job, both share the same jobId. Polling once per unique jobId (not once per track) avoids duplicate ACE API calls.
+  * For ACE: poll query_result once, get 2 variations, update each track with its corresponding variation (track[0] → variation[0], track[1] → variation[1]). If fewer variations than tracks, mark extra tracks as FAILED.
+  * Each track gets its own songPath (different S3 .aac URL), its own title (ACE provides variation-specific titles like "classical piano fade" vs "classical piano masterpiece"), its own lyrics.
+  * For boppy: still 1 track per job — poll fetchJob once, update the single track.
+  * Mirror audio for both variations (each variation has its own S3 URL).
+- Removed unused mini-services (per user request "remove les autres service"):
+  * mini-services/js-proxy-pool (proxy-chain free proxy pool — not needed now that ACE is the active provider, no rate-limit issue with user's account)
+  * mini-services/treblo-relay (CF-bypass relay — never used in production, localhost only)
+  * worker/ (Cloudflare Worker code — never deployed)
+  * .zscripts/ (logs from old mini-services)
+  * Killed the lingering node index.ts process (was running the deleted js-proxy-pool).
+- bun run lint: 0 errors / 0 warnings.
+- REAL END-TO-END TEST:
+  * POST /api/generate (mode ace, unique prompt "A unique jazz piano with brass section test 98765") → 201 OK, jobId f6809412-..., 2 tracks created: v1 PENDING + v2 PENDING.
+  * Poll /api/tracks every 5s → both tracks flip to SUCCESS 100 with different songPaths (https://ace-music.s3-accelerate.amazonaws.com/app/user/works/...).
+  * GET /api/audio/{v1 trackId} → 200, 227,703 bytes AAC.
+  * GET /api/audio/{v2 trackId} → 200, 228,098 bytes AAC. **Different file sizes prove they're 2 different audio files** (not the same file served twice).
+  * Browser: 2 track cards visible per generation ("classical piano fade" + "classical piano masterpiece" — ACE provides variation-specific titles). Both Play buttons work (clicked → Pause).
+- Confirmed via DB query: generation cmuo0ni2w has exactly 2 tracks (v1 + v2), both SUCCESS. Older generations (created before the fix) have 1 track each.
+
+Stage Summary:
+- ACE Music now generates 2 tracks per generation (matching acemusic.ai's real behavior). Both variations are tracked, mirrored, and playable independently in the UI. Each track has its own title (ACE's variation-specific title), songPath (different S3 URL), and audio file (verified different sizes: 227KB vs 228KB).
+- Removed unused mini-services (js-proxy-pool, treblo-relay, worker, .zscripts). The project is now lean: Next.js + Prisma + ACE Music integration. No proxy infrastructure needed (ACE uses the user's account quota directly, no rate-limit issue).
+- Files: src/lib/boppy.ts (AceResultVariation + AceJobResult interfaces, aceFetchResult returns all variations), src/app/api/generate/route.ts (creates 2 tracks for ACE), src/app/api/tracks/route.ts (group by jobId, populate both tracks with their variation).
+- ⚠️ Security unchanged: Bearer still in local DB (cleared in Task 27 but the user re-set it in Task 28 testing). User MUST logout from acemusic.ai to revoke before redeploying. The `aceToken` is in db/custom.db — clear it via PUT /api/settings {"aceToken":null} before bun run build.

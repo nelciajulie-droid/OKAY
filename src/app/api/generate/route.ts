@@ -115,6 +115,17 @@ export async function POST(req: Request) {
             promptId: promptId ?? undefined,
           });
 
+    // ACE generates 2 variations per job — create 2 tracks so both audio
+    // URLs are tracked and mirrored. boppy.me generates only 1.
+    const tracksToCreate = provider === "ace" ? 2 : 1;
+    const trackCreateData = Array.from({ length: tracksToCreate }, (_, i) => ({
+      status: "PENDING",
+      title: title || null,
+      prompt: caption,
+      lyrics: lyrics || null,
+      version: `v${i + 1}`,
+    }));
+
     const generation = await db.generation.create({
       data: {
         jobId,
@@ -128,13 +139,7 @@ export async function POST(req: Request) {
         timesignature,
         promptId,
         tracks: {
-          create: {
-            status: "PENDING",
-            title: title || null,
-            prompt: caption,
-            lyrics: lyrics || null,
-            version: "v1",
-          },
+          create: trackCreateData,
         },
       },
       include: { tracks: true },

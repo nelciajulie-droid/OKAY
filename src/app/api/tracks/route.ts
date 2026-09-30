@@ -61,8 +61,12 @@ async function listTracks() {
  * from the provider's job status endpoint when stale (> 2s).
  *
  * Routing:
- *   - provider="boppy" (default): GET /api/generate/jobs/{jobId} on boppy.me
- *   - provider="ace": POST /api/acem/works/ai/status + POST /engine/api/engine/query_result on acemusic.ai
+ *   - provider="boppy" (default): GET /api/generate/jobs/{jobId} on boppy.me → 1 track
+ *   - provider="ace": POST /engine/api/engine/query_result on acemusic.ai → 2 variations
+ *
+ * ACE generates 2 variations per job. Both tracks in our DB share the same
+ * jobId — we poll once per unique jobId and update each track with its
+ * corresponding variation (track[0] → variation[0], track[1] → variation[1]).
  */
 export async function GET() {
   let tracks = await listTracks();
@@ -75,67 +79,113 @@ export async function GET() {
   );
 
   if (stale.length > 0) {
+    // Group stale tracks by jobId — ACE creates 2 tracks per job, both with
+    // the same jobId. We poll once per jobId to avoid duplicate ACE API calls.
+    const staleByJobId = new Map<string, typeof stale>();
+    for (const t of stale) {
+      const jobId = t.generation?.jobId;
+      if (!jobId) continue;
+      if (!staleByJobId.has(jobId)) staleByJobId.set(jobId, []);
+      staleByJobId.get(jobId)!.push(t);
+    }
+
     await Promise.all(
-      stale.map(async (track) => {
-        const jobId = track.generation?.jobId;
-        if (!jobId) return;
+      Array.from(staleByJobId.entries()).map(async ([jobId, jobTracks]) => {
         try {
-          let finalStatus: string;
-          let progress: number | null;
-          let audioUrl: string | null = null;
-
           if (provider === "ace") {
-            // ACE: polling is done via query_result (NOT status endpoint).
-            // The status endpoint is just a client → server ack, not a poll.
+            // ACE: poll query_result once, get 2 variations, update both tracks.
             const result = await aceFetchResult(jobId);
-            if (result.audioUrl) {
-              finalStatus = "SUCCESS";
-              progress = 100;
-              audioUrl = result.audioUrl;
-            } else {
-              finalStatus = "PENDING";
-              progress = null;
+            if (result.variations.length === 0) {
+              // Still pending — bump lastCheckedAt for both tracks.
+              await Promise.all(
+                jobTracks.map((t) =>
+                  db.track
+                    .update({ where: { id: t.id }, data: { lastCheckedAt: new Date() } })
+                    .catch(() => undefined),
+                ),
+              );
+              return;
             }
+            // Update each track with its corresponding variation.
+            await Promise.all(
+              jobTracks.map(async (track, idx) => {
+                const variation = result.variations[idx];
+                if (!variation) {
+                  // Fewer variations than tracks — mark as FAILED.
+                  await db.track.update({
+                    where: { id: track.id },
+                    data: {
+                      status: "FAILED",
+                      lastCheckedAt: new Date(),
+                    },
+                  });
+                  return;
+                }
+                // Stale-track timeout guard.
+                let finalStatus = "SUCCESS";
+                if (now - track.createdAt.getTime() > STALE_TRACK_TIMEOUT_MS) {
+                  finalStatus = "TIMEOUT";
+                }
+                await db.track.update({
+                  where: { id: track.id },
+                  data: {
+                    status: finalStatus,
+                    progress: 100,
+                    songPath: variation.audioUrl,
+                    title: variation.title || track.title,
+                    lyrics: variation.lyrics || track.lyrics,
+                    lastCheckedAt: new Date(),
+                  },
+                });
+                // Mirror the finished AAC locally.
+                if (finalStatus === "SUCCESS") {
+                  void mirrorAudio(track.id, variation.audioUrl);
+                }
+              }),
+            );
           } else {
+            // boppy: 1 track per job — poll fetchJob once, update the single track.
             const job = await fetchJob(jobId);
-            finalStatus = mapJobStatus(job.status);
-            progress = finalStatus === "SUCCESS" ? 100 : job.progress;
-            audioUrl = job.audioUrl;
-          }
-
-          // Guard against jobs stuck in a non-terminal state forever.
-          if (!isTerminal(finalStatus) && now - track.createdAt.getTime() > STALE_TRACK_TIMEOUT_MS) {
-            finalStatus = "TIMEOUT";
-          }
-
-          await db.track.update({
-            where: { id: track.id },
-            data: {
-              status: finalStatus,
-              progress: progress !== null ? Math.round(progress) : null,
-              songPath:
-                finalStatus === "SUCCESS" && audioUrl
-                  ? (provider === "ace"
-                    ? audioUrl
-                    : await resolveAudioUrl(audioUrl))
-                  : undefined,
-              lastCheckedAt: new Date(),
-            },
-          });
-
-          // Mirror the finished MP3 locally: replays/seeks/downloads then
-          // never hit boppy.me again (see src/lib/mirror.ts).
-          if (finalStatus === "SUCCESS" && audioUrl) {
-            const mirrorSource =
-              provider === "ace" ? audioUrl : await resolveAudioUrl(audioUrl, base);
-            void mirrorAudio(track.id, mirrorSource);
+            const finalStatus =
+              !isTerminal(mapJobStatus(job.status)) &&
+              now - jobTracks[0]!.createdAt.getTime() > STALE_TRACK_TIMEOUT_MS
+                ? "TIMEOUT"
+                : mapJobStatus(job.status);
+            const audioUrl = job.audioUrl;
+            await Promise.all(
+              jobTracks.map(async (track) => {
+                await db.track.update({
+                  where: { id: track.id },
+                  data: {
+                    status: finalStatus,
+                    progress:
+                      finalStatus === "SUCCESS"
+                        ? 100
+                        : typeof job.progress === "number"
+                          ? Math.round(job.progress)
+                          : null,
+                    songPath:
+                      finalStatus === "SUCCESS" && audioUrl
+                        ? await resolveAudioUrl(audioUrl)
+                        : undefined,
+                    lastCheckedAt: new Date(),
+                  },
+                });
+                if (finalStatus === "SUCCESS" && audioUrl) {
+                  void mirrorAudio(track.id, await resolveAudioUrl(audioUrl, base));
+                }
+              }),
+            );
           }
         } catch {
-          // Network error on this poll: keep the track pending,
-          // just bump lastCheckedAt so we don't hammer the API.
-          await db.track
-            .update({ where: { id: track.id }, data: { lastCheckedAt: new Date() } })
-            .catch(() => undefined);
+          // Network error on this poll: bump lastCheckedAt for all tracks of this job.
+          await Promise.all(
+            jobTracks.map((t) =>
+              db.track
+                .update({ where: { id: t.id }, data: { lastCheckedAt: new Date() } })
+                .catch(() => undefined),
+            ),
+          );
         }
       }),
     );

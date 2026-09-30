@@ -1,9 +1,0 @@
-{
-  "name": "treblo-relay",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Tiny forwarding relay for Treblo Studio. Run it on a machine with a trusted IP (home connection) so Cloudflare sees that IP instead of your hosting server's.",
-  "scripts": {
-    "dev": "bun --hot index.ts"
-  }
-}
