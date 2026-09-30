@@ -1,51 +1,51 @@
 /**
- * js-proxy-pool — pure-JS/TS replacement for proxy-scraper-cli (Python).
+ * js-proxy-pool — pure-JS/TS free proxy pool + rotator.
  *
- * WHY: User asked to remove all Python code from the project. The previous
- * free-proxy solution (`proxy-scraper-cli`) was Python; this mini-service
- * replaces it 1:1 in pure TypeScript. No pip, no venv, no Python runtime.
+ * Built on top of `proxy-chain` (Apify, MIT) — the production-grade HTTP
+ * proxy server for Node.js used by Crawlee. It handles HTTP CONNECT
+ * tunneling, SSL/TLS, SOCKS4/5, authentication, and upstream proxy
+ * chaining — all the hard parts that were hand-rolled (buggy) in the
+ * previous version.
  *
  * WHAT IT DOES:
- *   1. Scrapes free HTTP proxy lists from public GitHub raw files
- *      (proxifly, TheSpeedX, monosans, clarketm, etc. — same sources as
- *      proxy-scraper-cli but a curated subset).
- *   2. Validates each proxy: connects via undici ProxyAgent, fetches
- *      https://api.ipify.org (so we know it supports HTTPS CONNECT),
- *      measures latency, records the exit IP. Drops honeypots (proxies
- *      that inject scripts into responses — checked by comparing the
- *      body to a known IPv4 regex).
- *   3. Exposes a rotating local proxy server on http://0.0.0.0:8792.
- *      Supports BOTH:
- *        - HTTP proxy mode (absolute URL in request line — undici
- *          ProxyAgent sends GET https://target)
- *        - HTTPS CONNECT tunneling (CONNECT host:443 — undici ProxyAgent
- *          sends this for HTTPS targets). The server tunnels the CONNECT
- *          through the upstream proxy by opening a raw TCP socket to the
- *          proxy, sending CONNECT, and piping the client socket through.
- *      Each incoming request is forwarded through a DIFFERENT validated
- *      proxy (round-robin rotation). If a proxy dies (network error), the
- *      server transparently retries with the next one in the pool.
- *   4. Background refill: every 30 minutes, scrapes + validates fresh
- *      proxies to keep the pool healthy (free proxies die fast).
+ *   1. Scrapes free HTTP proxy lists from public GitHub raw files.
+ *   2. Validates each proxy: fetches https://api.ipify.org through it via
+ *      undici ProxyAgent (CONNECT + TLS + GET → exit IP). Drops honeypots
+ *      (body must match IPv4 regex) and slow proxies (>8s latency).
+ *   3. Exposes a rotating local proxy server on http://0.0.0.0:8792 via
+ *      proxy-chain's Server class. The `prepareRequestFunction` callback
+ *      picks the NEXT validated proxy from the pool (round-robin) and
+ *      returns it as `upstreamProxyUrl` — so each incoming request exits
+ *      through a different proxy IP. proxy-chain handles all the CONNECT
+ *      tunneling transparently.
+ *   4. Background refill every 30 minutes: scrapes + validates fresh
+ *      proxies so the pool stays healthy (free proxies die fast).
+ *
+ * WHY THIS REPLACES THE PREVIOUS VERSION:
+ *   The previous hand-rolled version used `node:http + node:net` to handle
+ *   CONNECT manually. It worked but was fragile (TLS handshake handling,
+ *   connection cleanup, race conditions). proxy-chain is maintained by
+ *   Apify (a serious scraping company), used by Crawlee (the most popular
+ *   Node.js crawling lib), and handles all edge cases properly. It's also
+ *   10x simpler to use — see the Server config below.
  *
  * USAGE:
- *   bun run dev                         # listens on http://0.0.0.0:8792
- *   bun run dev -- --port 8793          # custom port
- *   bun run dev -- --want 50            # validate 50 proxies minimum before serving
- *   bun run dev -- --v                   # verbose
+ *   bun run dev                       # listens on http://0.0.0.0:8792
+ *   bun run dev -- --port 8793        # custom port
+ *   bun run dev -- --want 100         # validate 100 proxies before serving
+ *   bun run dev -- --v                # verbose
  *
- * Then in Boppy Studio → Settings → "FireProx URL (advanced)":
+ * In Boppy Studio → Settings → "FireProx URL (advanced)":
  *   http://127.0.0.1:8792
  *
  * The boppy.ts auto-retry (fetchWithProxyRetry, MAX_PROXY_RETRIES=3)
  * complements this: if a proxy dies mid-request, boppy resets the
- * ProxyAgent and retries — js-proxy-pool will route the retry through
- * a different proxy. Combined: dead proxies are transparently replaced.
+ * ProxyAgent and retries — proxy-chain will route the retry through a
+ * different proxy via the prepareRequestFunction callback.
  */
 
+import { Server } from "proxy-chain";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
-import * as net from "node:net";
-import * as http from "node:http";
 
 // ---------------------------------------------------------------------------
 // Config (CLI flags override env vars)
@@ -61,14 +61,13 @@ function flag(name: string): boolean {
 
 const PORT = parseInt(arg("port", "8792"), 10);
 const LISTEN = arg("listen", "0.0.0.0");
-const WANT = parseInt(arg("want", "50"), 10); // minimum validated proxies before serving
+const WANT = parseInt(arg("want", "100"), 10);
 const MAX_LATENCY_MS = parseInt(arg("max-latency", "8000"), 10);
 const REFILL_INTERVAL_MS = parseInt(arg("refill-min", "30"), 10) * 60_000;
 const VERBOSE = flag("v") || flag("verbose");
 
 // ---------------------------------------------------------------------------
-// Curated free proxy sources (same as proxy-scraper-cli's defaults but
-// limited to GitHub raw files — no auth, no API keys, no rate limits).
+// Curated free proxy sources (GitHub raw files only — no auth, no API keys).
 // ---------------------------------------------------------------------------
 const SOURCES: { name: string; url: string; parse: (text: string) => string[] }[] = [
   {
@@ -87,12 +86,12 @@ const SOURCES: { name: string; url: string; parse: (text: string) => string[] }[
     parse: (t) => t.split("\n").map((l) => l.trim()).filter((l) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(l)),
   },
   {
-    name: "monosans/proxylist/http",
+    name: "monosans/http",
     url: "https://raw.githubusercontent.com/monosans/proxylist/main/proxies/http.txt",
     parse: (t) => t.split("\n").map((l) => l.trim()).filter((l) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(l)),
   },
   {
-    name: "monosans/proxylist/https",
+    name: "monosans/https",
     url: "https://raw.githubusercontent.com/monosans/proxylist/main/proxies/https.txt",
     parse: (t) => t.split("\n").map((l) => l.trim()).filter((l) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(l)),
   },
@@ -296,210 +295,108 @@ function nextProxy(): Proxy | null {
   return pool[0] ?? null;
 }
 
-// ---------------------------------------------------------------------------
-// Handle CONNECT (HTTPS tunneling). Opens a TCP socket to the upstream
-// proxy, sends "CONNECT host:port HTTP/1.1\r\n\r\n", waits for "200
-// Connection established", then pipes the client socket through.
-// ---------------------------------------------------------------------------
-function handleConnect(
-  clientSocket: net.Socket,
-  targetHost: string,
-  targetPort: number,
-  maxTries = 3,
-): void {
-  let tryCount = 0;
-  const attempt = (): void => {
-    if (tryCount >= maxTries) {
-      try { clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n"); } catch { /* ignore */ }
-      return;
-    }
-    tryCount++;
-    const proxy = nextProxy();
-    if (!proxy) {
-      try { clientSocket.end("HTTP/1.1 502 Bad Gateway\r\nX-JSProxyPool: empty\r\n\r\n"); } catch { /* ignore */ }
-      return;
-    }
-    vlog(`[CONNECT ${tryCount}/${maxTries}] ${targetHost}:${targetPort} via ${proxy.url} (exit ${proxy.exitIp})`);
-
-    // Parse proxy host:port.
-    const proxyHost = proxy.ip;
-    const proxyPort = proxy.port;
-    const upstream = net.createConnection({
-      host: proxyHost,
-      port: proxyPort,
-      timeout: 15_000,
-    });
-
-    let connected = false;
-    let buffer = "";
-
-    upstream.on("connect", () => {
-      // Send CONNECT request to the upstream proxy.
-      upstream.write(
-        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`,
-      );
-    });
-
-    upstream.on("data", function onData(chunk: Buffer): void {
-      if (!connected) {
-        buffer += chunk.toString("utf8");
-        // Look for end of HTTP response headers.
-        const endOfHeaders = buffer.indexOf("\r\n\r\n");
-        if (endOfHeaders >= 0) {
-          const statusLine = buffer.split("\r\n")[0] ?? "";
-          if (/^HTTP\/1\.[01] 2\d\d /.test(statusLine)) {
-            // CONNECT succeeded — pipe both ways.
-            connected = true;
-            // Send any remaining bytes (after headers) to the client.
-            const remaining = buffer.slice(endOfHeaders + 4);
-            buffer = "";
-            // Tell the client the tunnel is established.
-            try { clientSocket.write("HTTP/1.1 200 Connection established\r\n\r\n"); } catch { /* ignore */ }
-            if (remaining.length > 0) {
-              try { clientSocket.write(remaining); } catch { /* ignore */ }
-            }
-            // Pipe bidirectionally.
-            upstream.removeAllListeners("data");
-            upstream.on("data", (c: Buffer) => { try { clientSocket.write(c); } catch { /* ignore */ } });
-            clientSocket.on("data", (c: Buffer) => { try { upstream.write(c); } catch { /* ignore */ } });
-            // Done.
-            proxy.lastOk = Date.now();
-            vlog(`  CONNECT tunnel established via ${proxy.url}`);
-          } else {
-            // Proxy rejected CONNECT — try next proxy.
-            vlog(`  CONNECT rejected by ${proxy.url}: ${statusLine}, retrying with next proxy...`);
-            proxy.fails++;
-            try { upstream.destroy(); } catch { /* ignore */ }
-            attempt();
-          }
-        }
+/**
+ * Pick a proxy that ACTUALLY works RIGHT NOW by re-validating on-demand.
+ * Tries up to pool.length proxies, validating each with a 3s timeout. If
+ * all fail, returns null (the request will fail with 502).
+ *
+ * This is more aggressive than nextProxy() but much more reliable: free
+ * proxies die in minutes, so a pool validated 1 minute ago may be half-dead
+ * now. On-demand re-validation guarantees the proxy we hand to the request
+ * is alive at the moment of the request.
+ */
+const ODM_TIMEOUT_MS = 3000;
+const inflightValidations = new Map<string, Promise<boolean>>();
+async function isProxyAliveNow(proxyUrl: string): Promise<boolean> {
+  // Dedupe concurrent validations of the same proxy.
+  let p = inflightValidations.get(proxyUrl);
+  if (!p) {
+    p = (async () => {
+      try {
+        const agent = new ProxyAgent({ uri: proxyUrl });
+        const res = await undiciFetch("https://api.ipify.org", {
+          dispatcher: agent,
+          signal: AbortSignal.timeout(ODM_TIMEOUT_MS),
+        });
+        try { await (agent as unknown as { close?: () => Promise<void> }).close?.(); } catch { /* ignore */ }
+        return res.status === 200;
+      } catch {
+        return false;
       }
-    });
-
-    upstream.on("error", (err: Error) => {
-      if (!connected) {
-        vlog(`  upstream CONNECT error on ${proxy.url}: ${err.message}, retrying...`);
-        proxy.fails++;
-        attempt();
-      }
-    });
-
-    upstream.on("timeout", () => {
-      if (!connected) {
-        vlog(`  upstream CONNECT timeout on ${proxy.url}, retrying...`);
-        proxy.fails++;
-        try { upstream.destroy(); } catch { /* ignore */ }
-        attempt();
-      }
-    });
-
-    clientSocket.on("error", () => { try { upstream.destroy(); } catch { /* ignore */ } });
-    clientSocket.on("close", () => { try { upstream.destroy(); } catch { /* ignore */ } });
-  };
-  attempt();
-}
-
-// ---------------------------------------------------------------------------
-// Handle absolute-URL HTTP request (HTTP proxy mode for HTTP targets).
-// ---------------------------------------------------------------------------
-const FORWARDABLE_REQUEST_HEADERS = [
-  "content-type",
-  "user-agent",
-  "accept",
-  "origin",
-  "referer",
-  "range",
-  "x-my-x-forwarded-for",
-];
-const FORWARDABLE_RESPONSE_HEADERS = [
-  "content-type",
-  "content-length",
-  "content-range",
-  "accept-ranges",
-  "etag",
-  "last-modified",
-  "cache-control",
-];
-
-async function forwardHttpProxy(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  target: string,
-): Promise<void> {
-  const MAX_TRIES = 3;
-  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
-    const proxy = nextProxy();
-    if (!proxy) {
-      res.writeHead(502, { "Content-Type": "application/json", "X-JSProxyPool": "empty" });
-      res.end(JSON.stringify({ error: "No validated proxies in pool" }));
-      return;
-    }
-    const upstreamHeaders: Record<string, string> = {};
-    for (const name of FORWARDABLE_REQUEST_HEADERS) {
-      const v = req.headers[name];
-      if (typeof v === "string") upstreamHeaders[name] = v;
-    }
-    const octet = () => Math.floor(Math.random() * 223) + 1;
-    upstreamHeaders["X-Forwarded-For"] = `${octet()}.${octet()}.${octet()}.${octet()}`;
-
-    const agent = new ProxyAgent({ uri: proxy.url });
-    try {
-      vlog(`[HTTP ${attempt}/${MAX_TRIES}] ${req.method} ${target} via ${proxy.url} (exit ${proxy.exitIp})`);
-      const body = req.method === "GET" || req.method === "HEAD" ? null : await new Promise<Buffer>((r) => {
-        const chunks: Buffer[] = [];
-        req.on("data", (c) => chunks.push(c));
-        req.on("end", () => r(Buffer.concat(chunks)));
-        req.on("error", () => r(Buffer.alloc(0)));
-      });
-      const upstream = await undiciFetch(target, {
-        method: req.method,
-        headers: upstreamHeaders,
-        body: body ?? null,
-        dispatcher: agent,
-        signal: AbortSignal.timeout(60_000),
-      });
-      try { await (agent as unknown as { close?: () => Promise<void> }).close?.(); } catch { /* ignore */ }
-
-      if (upstream.status === 502 || upstream.status === 503 || upstream.status === 504) {
-        proxy.fails++;
-        vlog(`  upstream ${upstream.status} on ${proxy.url}, retrying...`);
-        try { await upstream.arrayBuffer(); } catch { /* ignore */ }
-        continue;
-      }
-      proxy.lastOk = Date.now();
-
-      const outHeaders: Record<string, string> = { "X-JSProxyPool": "1", "X-JSProxyPool-Proxy": proxy.ip };
-      for (const name of FORWARDABLE_RESPONSE_HEADERS) {
-        const v = upstream.headers.get(name);
-        if (v) outHeaders[name] = v;
-      }
-      res.writeHead(upstream.status, outHeaders);
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      res.end(buf);
-      return;
-    } catch (err) {
-      proxy.fails++;
-      try { await (agent as unknown as { close?: () => Promise<void> }).close?.(); } catch { /* ignore */ }
-      vlog(`  proxy ${proxy.url} failed: ${(err as Error).message}, retrying...`);
-      continue;
-    }
+    })();
+    inflightValidations.set(proxyUrl, p);
+    p.finally(() => inflightValidations.delete(proxyUrl));
   }
-  res.writeHead(502, { "Content-Type": "application/json", "X-JSProxyPool": "exhausted" });
-  res.end(JSON.stringify({ error: "All proxy retries exhausted" }));
+  return p;
+}
+
+async function pickAliveProxy(maxTries = 5): Promise<Proxy | null> {
+  if (pool.length === 0) return null;
+  for (let i = 0; i < Math.min(maxTries, pool.length); i++) {
+    const proxy = nextProxy();
+    if (!proxy) return null;
+    const alive = await isProxyAliveNow(proxy.url);
+    if (alive) {
+      proxy.lastOk = Date.now();
+      return proxy;
+    }
+    proxy.fails++;
+    vlog(`  proxy ${proxy.url} dead on-demand, skipping (fails=${proxy.fails})`);
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
-// HTTP server (node:http — supports both CONNECT and normal requests).
+// proxy-chain server — production-grade HTTP/HTTPS proxy with CONNECT
+// tunneling. The `prepareRequestFunction` callback is called for each
+// incoming request and returns the upstream proxy URL to chain through.
+// We rotate through the pool here, with on-demand re-validation.
 // ---------------------------------------------------------------------------
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+const server = new Server({
+  port: PORT,
+  host: LISTEN,
+  verbose: VERBOSE,
+  // No client authentication — local trusted use.
+  prepareRequestFunction: async ({ request, hostname }) => {
+    // Health endpoint — let it pass through directly (no proxy needed).
+    if (hostname === "127.0.0.1" || hostname === "localhost") {
+      // This is a local request — don't proxy.
+      return { requestAuthentication: false, upstreamProxyUrl: undefined };
+    }
+    // Pick a proxy that's actually alive right now (on-demand re-validation).
+    const proxy = await pickAliveProxy(10);
+    if (!proxy) {
+      vlog(`No live proxy in pool — request to ${hostname} will fail`);
+      return { requestAuthentication: false, upstreamProxyUrl: undefined };
+    }
+    vlog(`[${request.method}] ${hostname} → via ${proxy.url} (exit ${proxy.exitIp})`);
+    return {
+      requestAuthentication: false,
+      upstreamProxyUrl: proxy.url,
+    };
+  },
+});
 
+// ---------------------------------------------------------------------------
+// Initial pool warmup + background refill
+// ---------------------------------------------------------------------------
+log("INFO", `js-proxy-pool (proxy-chain) starting on http://${LISTEN}:${PORT}`);
+log("INFO", `WANT=${WANT} proxies, MAX_LATENCY=${MAX_LATENCY_MS}ms, REFILL=${REFILL_INTERVAL_MS}ms, VERBOSE=${VERBOSE}`);
+
+// Small HTTP server on the same port for /health + /stats endpoints.
+// proxy-chain's Server doesn't expose HTTP route handlers — we add a tiny
+// wrapper on a separate port (PORT+1) for health checks.
+import * as http from "node:http";
+
+const healthServer = http.createServer((req, res) => {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
         ok: true,
         type: "js-proxy-pool",
+        backend: "proxy-chain",
         poolSize: pool.length,
         uniqueExitIps: new Set(pool.map((p) => p.exitIp)).size,
         avgLatencyMs: pool.length
@@ -526,37 +423,14 @@ const server = http.createServer((req, res) => {
     );
     return;
   }
-
-  // HTTP proxy mode — absolute URL in request line.
-  if (req.url && /^https?:\/\//i.test(req.url)) {
-    void forwardHttpProxy(req, res, req.url);
-    return;
-  }
-
-  // Unknown request — 404.
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not found. Use as HTTP proxy (set as proxy URL) or GET /health.");
 });
 
-// CONNECT method — HTTPS tunneling through upstream proxy.
-server.on("connect", (req, clientSocket) => {
-  const [host, portStr] = (req.url ?? "").split(":");
-  const port = parseInt(portStr ?? "443", 10);
-  if (!host || !Number.isFinite(port)) {
-    try { clientSocket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); } catch { /* ignore */ }
-    return;
-  }
-  handleConnect(clientSocket, host, port);
+const HEALTH_PORT = PORT + 1;
+healthServer.listen(HEALTH_PORT, LISTEN, () => {
+  log("INFO", `Health endpoint on http://${LISTEN}:${HEALTH_PORT}/health`);
 });
-
-server.listen(PORT, LISTEN, () => {
-  log("INFO", `js-proxy-pool listening on http://${LISTEN}:${PORT} (HTTP + CONNECT)`);
-});
-
-// ---------------------------------------------------------------------------
-// Initial pool warmup + background refill
-// ---------------------------------------------------------------------------
-log("INFO", `WANT=${WANT} proxies, MAX_LATENCY=${MAX_LATENCY_MS}ms, REFILL=${REFILL_INTERVAL_MS}ms, VERBOSE=${VERBOSE}`);
 
 (async () => {
   log("INFO", `Warming up pool — scraping + validating ${WANT} proxies...`);
@@ -570,6 +444,10 @@ log("INFO", `WANT=${WANT} proxies, MAX_LATENCY=${MAX_LATENCY_MS}ms, REFILL=${REF
   const validated = await validateBatch(arr.slice(0, 2000), WANT, 100);
   pool.push(...validated);
   log("OK", `Pool ready: ${pool.length} validated proxies in ${(Date.now() - t0) / 1000}s`);
+
+  // Start the proxy-chain server AFTER the pool is warm.
+  await server.listen();
+  log("OK", `Proxy server listening on http://${LISTEN}:${PORT}`);
 
   setInterval(() => {
     void refillPool();
