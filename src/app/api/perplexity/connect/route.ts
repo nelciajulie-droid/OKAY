@@ -166,12 +166,17 @@ function extractSdpAnswer(body: string): string | null {
   return null;
 }
 
-/** Build the JSON body for the Perplexity session request. */
+/** Build the JSON body for the Perplexity session request.
+ * Perplexity requires: source, timezone, voice, sdp (all required). */
 function buildPerplexityBody(sdp: string): string {
-  // The captured request sends the SDP offer as a JSON object. Perplexity
-  // accepts the offer under both `sdp` and `offer_sdp`, so we send both to
-  // be safe (extra fields are ignored by the server).
-  return JSON.stringify({ sdp, offer_sdp: sdp, type: "offer" });
+  return JSON.stringify({
+    source: "default",
+    timezone: "Africa/Nairobi",
+    voice: "default",
+    sdp,
+    offer_sdp: sdp,
+    type: "offer",
+  });
 }
 
 /**
