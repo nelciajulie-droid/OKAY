@@ -1619,3 +1619,64 @@ Stage Summary:
   1. **Chrome extension for auto-refresh** — a Manifest V3 service worker (like the ChatGPT one) that polls chat.qwen.ai from the user's browser every ~10 min, gets a fresh access_token via the `/api/v2/auths/refresh` endpoint (with the user's IP-bound cookies), and PUTs it to `/api/qwen/token`. This would make the token auto-refresh without manual intervention. NOT implemented in this task — needs the Chrome extension infrastructure (similar to `tools/chrome-extension/`).
   2. **Settings UI for Qwen token** — a text input in the Settings dialog where the user can paste the token directly (stored via PUT /api/qwen/token). Currently the user needs to use curl. NOT implemented — the realtime providers don't have a Settings UI yet (they use env vars or the vault Worker).
   3. **Token expiry warning in the UI** — the frontend could poll `GET /api/qwen/token` every 30s and show a "Qwen token expires in X min" warning badge when `exp - now < 5min`. NOT implemented.
+
+---
+Task ID: 66
+Agent: main (Z.ai Code)
+Task: Test Qwen Voice with the fresh token the user provided. The user pasted a new access_token (exp: 1790965149 = 18:19:09 UTC, valid ~13 min). Set the token via PUT /api/qwen/token + tested the SDP exchange.
+
+Work Log:
+- Decoded the fresh access_token: `{id: "d6168114-...", type: "access_token", exp: 1790965149, iat: 1790964249}` — valid for 13.4 min.
+- Set the token via PUT: `curl -X PUT http://localhost:3000/api/qwen/token -d '{"token":"eyJ..."}'` → `{ok: true, source: "db", expired: false, warning: "Token expires at 2026-10-02T18:19:09.000Z (in 13 min)."}` ✓.
+- Tested the POST /api/qwen/token (SDP exchange) with a minimal fake SDP. The Qwen backend accepted the token (no 401!) but the response was NOT an SDP answer — it was **Aliyun Bailian RTC channel credentials**:
+  ```json
+  {
+    "success": true,
+    "data": {
+      "success": true,
+      "token": "44d7022f...",           // Aliyun RTC channel auth token
+      "channel": "rtc-channel-...",      // Channel name
+      "app_id": "42a6a669-...",         // Aliyun Bailian app ID
+      "gslb": "https://gw.rtn.aliyuncs.com",  // Aliyun RTC gateway
+      "user_id_client": "rtc-user-client",
+      "user_id_voicechat": "rtc-user-voiceChat",
+      "sdp_token": null,                // ALWAYS null!
+      "chat_id": "b2af0466-...",
+      "times_left": 12,                  // Remaining voice chat uses
+      "audio_timeout": 600               // Max session 10 min
+    }
+  }
+  ```
+- KEY FINDING: `sdp_token` is ALWAYS `null` — even with a complete SDP offer (with DTLS fingerprint + ICE credentials). The `/users/user/audio_chat_token` endpoint does NOT do an SDP exchange. It only creates an Aliyun Bailian RTC channel + returns the credentials.
+- ARCHITECTURE CORRECTION: Qwen Voice is NOT standard WebRTC SDP exchange like ChatGPT. It uses the **Aliyun Bailian RTC SDK** (`aliyun-rtc-sdk-vendor-C04dIEth.js`, 242 KB) which has its own proprietary WebRTC implementation. The browser uses the Aliyun RTC SDK's `joinChannel(token, userId)` method to connect — NOT `RTCPeerConnection.setRemoteDescription(answer)`.
+- The Qwen Omni SDK (`qwen-chat-omni-sdk-vendor-DVoDTvDO.js`, 56 KB) wraps the Aliyun RTC SDK + adds the OpenAI Realtime API event handling (session.created, input_audio_buffer.*, response.*, etc.) on top of the Aliyun RTC data channel.
+- Updated the backend `POST /api/qwen/token` to return the FULL Aliyun RTC credentials (not just `sdp_token`):
+  - `rtc_token`, `rtc_channel`, `rtc_app_id`, `rtc_gslb`, `rtc_user_id_client`, `rtc_user_id_voicechat`
+  - `chat_id`, `times_left`, `audio_timeout` (session metadata)
+  - `sdp_token: null`, `sdp: null` (kept for API compatibility — always null for Qwen)
+- Tested the updated backend: `POST /api/qwen/token` now returns `{ok: true, rtc_token: "...", rtc_channel: "rtc-channel-...", rtc_app_id: "42a6a669-...", rtc_gslb: "https://gw.rtn.aliyuncs.com", ...}` ✓.
+- Committed as `fdbce34` ("fix(qwen): backend returns Aliyun RTC credentials (token, channel, app_id, gslb) instead of sdp_token — Qwen uses Aliyun Bailian RTC, not standard WebRTC SDP exchange") — 2 files, +39 / -12.
+- `git push origin main` → `dfeff90..fdbce34 main -> main`.
+
+- FRONTEND BLOCKER: the current `connectWebRtc` approach (standard `RTCPeerConnection` + SDP exchange) CANNOT work for Qwen because:
+  1. The backend returns Aliyun RTC credentials, not an SDP answer.
+  2. `setRemoteDescription({type: "answer", sdp: null})` would fail (null SDP).
+  3. The Aliyun RTC SDK handles the WebRTC handshake internally using its own protocol (not standard SDP).
+- The frontend needs a SEPARATE `connectQwen` function that:
+  1. Loads the Qwen Omni SDK + Aliyun RTC SDK from alicdn (ES modules with relative imports — can't use a simple `<script>` tag; needs dynamic `import()` with a module loader or an importmap).
+  2. Creates an instance of the SDK's main class (exported as `L`) with the Aliyun RTC credentials from the backend.
+  3. Calls `startSpeech()` on the SDK instance.
+  4. Listens for events: `onDataChannelMsg` (OpenAI Realtime API events), `onConnectionStatusChange`, `onOccurError`, `onAudioSubscribeStateChanged`.
+  5. Surfaces transcripts + audio in the UI.
+- The SDK's public API (constructor options, event listener API) is NOT documented — it's minified. Reverse-engineering it from the 56 KB minified bundle is feasible but time-consuming.
+
+Stage Summary:
+- The backend is now correct: `POST /api/qwen/token` returns the Aliyun RTC credentials (token, channel, app_id, gslb) instead of trying to extract a non-existent `sdp_token`.
+- The frontend `connectWebRtc` approach is WRONG for Qwen — it assumes standard WebRTC SDP exchange, but Qwen uses Aliyun Bailian RTC (proprietary SDK). A separate `connectQwen` function is needed that loads the Qwen Omni SDK from alicdn + uses its API.
+- The Qwen Omni SDK is an ES module with relative imports (can't be loaded via `<script>` tag). It needs either:
+  a. A dynamic `import()` with an importmap mapping the relative module paths to alicdn URLs.
+  b. Bundling the SDK + its dependencies locally (download 242 KB + 56 KB + dayjs + uuid vendors).
+  c. A simpler approach: load just the Aliyun RTC SDK + implement the OpenAI Realtime API event handling ourselves (skip the Qwen Omni SDK wrapper).
+- Token is set and valid for ~10 more minutes. The backend works (returns Aliyun RTC credentials). The frontend needs a rewrite to use the Aliyun RTC SDK approach.
+- Files modified: `src/app/api/qwen/token/route.ts` (+39 / -12 lines — return full Aliyun RTC credentials instead of rejecting null `sdp_token`), `db/custom.db` (the stored token).
+- Lint 0/0, push OK (`dfeff90..fdbce34`).
