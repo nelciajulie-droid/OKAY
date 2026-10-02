@@ -211,6 +211,7 @@ function buildGoogleHeaders(cookies: string, sapisidHash: string, isGet = false)
     "User-Agent": GEMINI_UA,
     Accept: "*/*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity", // prevent gzip — we need to parse the body
     Origin: GEMINI_ORIGIN,
     Referer: `${GEMINI_ORIGIN}/`,
     Cookie: cookies,
@@ -225,7 +226,6 @@ function buildGoogleHeaders(cookies: string, sapisidHash: string, isGet = false)
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Dest": "empty",
   };
-  // Only send Content-Type for POST (GET has no body)
   if (!isGet) {
     h["Content-Type"] = "application/x-www-form-urlencoded";
   }
@@ -797,19 +797,16 @@ async function handleStart(_body: GeminiRequestBody) {
       );
     }
     // gsessionid: Google returns it in the x-http-session-id RESPONSE HEADER
-    // (NOT in the body or cookies). This is the PRIMARY source.
+    // Vercel might strip this header, so also try body extraction + SID fallback
+    const headerGsid = (res.headers["x-http-session-id"] as string) ?? "";
+    const sid = extractSid(res.body) ?? headerGsid ?? "";
     const gsessionid =
-      (res.headers["x-http-session-id"] as string) ??
-      extractGsessionId(res.setCookie, res.body) ??
-      // Also try to find it in the response body (some Google responses include it)
-      (res.body.match(/gsessionid=([A-Za-z0-9_\-]+)/)?.[1]) ??
-      // If all else fails, generate a UUID
+      headerGsid ||
+      extractGsessionId(res.setCookie, res.body) ||
+      (res.body.match(/gsessionid=([A-Za-z0-9_\-]+)/)?.[1]) ||
+      sid || // Use SID as gsessionid if header is missing (Google sometimes uses the same value)
       randomUuid();
-    // SID: extracted from the response body (Web Channel stream format)
-    const sid = extractSid(res.body) ??
-      (res.headers["x-http-session-id"] as string) ??
-      "";
-    console.log(`[gemini] start response: status=${res.status}, gsessionid=${gsessionid.slice(0, 30)}..., sid=${sid.slice(0, 30)}...`);
+    console.log(`[gemini] start: headerGsid=${headerGsid ? "yes" : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
     // Surface the parsed setup response too — it may carry the first
     // server message (a greeting audio chunk, etc.).
     const parsed = parseBidiChunks(res.body);
