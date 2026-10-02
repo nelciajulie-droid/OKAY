@@ -1408,6 +1408,118 @@ function RealtimeChat() {
     log("Connected. Speak when ready.");
   }, [base64ToFloat32, float32ToInt16, int16ToBase64, log, status]);
 
+  // -------------------------------------------------------------------------
+  // Qwen path — Aliyun Bailian RTC (NOT standard WebRTC).
+  // -------------------------------------------------------------------------
+
+  /** Connect via Qwen Voice. Unlike ChatGPT/Perplexity (standard WebRTC
+   *  SDP exchange), Qwen uses Aliyun Bailian RTC — a proprietary WebRTC
+   *  SDK (242 KB) that handles the connection internally. The flow is:
+   *    1. POST /api/qwen/token → { rtc_token, rtc_channel, rtc_app_id,
+   *       rtc_gslb, rtc_user_id_client, ... } (Aliyun RTC credentials).
+   *    2. Load the Aliyun RTC SDK + join the channel with the credentials.
+   *    3. Handle OpenAI Realtime API events (session.created,
+   *       input_audio_buffer.*, response.output_audio_transcript.delta,
+   *       etc.) on the RTC data channel.
+   *
+   *  STEP 2 requires the Aliyun RTC SDK which is a 242 KB ES module with
+   *  relative imports — it can't be loaded via a simple <script> tag. The
+   *  full frontend integration (loading the SDK + joining the channel +
+   *  handling events + mic capture + audio playback) is a significant
+   *  implementation effort that is NOT YET DONE. This function checks
+   *  the token + fetches the credentials so the user sees a clear status,
+   *  then shows the "coming soon" message.
+   *
+   *  The other 4 providers (ChatGPT, Perplexity, Gemini, Inworld) work
+   *  end-to-end. Qwen Voice is the 5th provider and needs the Aliyun RTC
+   *  SDK integration (follow-up). */
+  const connectQwen = useCallback(async () => {
+    // 1. Check the token health (GET /api/qwen/token).
+    log("Checking Qwen token status…");
+    const healthRes = await fetch("/api/qwen/token", {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!healthRes.ok) {
+      throw new Error(`Qwen health-check ${healthRes.status}`);
+    }
+    const health = (await healthRes.json()) as {
+      ok?: boolean;
+      configured?: boolean;
+      source?: string | null;
+      tokenMasked?: string | null;
+      exp?: number | null;
+      expired?: boolean;
+    };
+    if (!health.configured) {
+      throw new Error(
+        "QWEN_ACCESS_TOKEN is not set. Set it via: " +
+        "curl -X PUT /api/qwen/token -H 'Content-Type: application/json' " +
+        "-d '{\"token\":\"<JWT from chat.qwen.ai>\"}'",
+      );
+    }
+    if (health.expired) {
+      throw new Error(
+        `Qwen token is EXPIRED${health.exp ? ` (expired ${new Date(health.exp * 1000).toLocaleTimeString()})` : ""}. ` +
+        "Get a fresh JWT from chat.qwen.ai → DevTools → Network → Authorization: Bearer, " +
+        "then: curl -X PUT /api/qwen/token -H 'Content-Type: application/json' -d '{\"token\":\"<new JWT>\"}'",
+      );
+    }
+    log(
+      `Qwen token OK (source: ${health.source ?? "?"}, masked: ${health.tokenMasked ?? "?"}${health.exp ? `, expires in ${Math.round((health.exp - Date.now() / 1000) / 60)} min` : ""}).`,
+    );
+
+    // 2. Fetch the Aliyun RTC credentials (POST /api/qwen/token).
+    log("Fetching Aliyun RTC credentials…");
+    const rtcRes = await fetch("/api/qwen/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sdp: "placeholder" }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!rtcRes.ok) {
+      const text = await rtcRes.text().catch(() => "");
+      throw new Error(`Qwen backend ${rtcRes.status}: ${text.slice(0, 300)}`);
+    }
+    const rtc = (await rtcRes.json()) as {
+      ok?: boolean;
+      rtc_token?: string;
+      rtc_channel?: string;
+      rtc_app_id?: string;
+      rtc_gslb?: string;
+      rtc_user_id_client?: string;
+      chat_id?: string;
+      times_left?: number | null;
+      audio_timeout?: number | null;
+      error?: string;
+    };
+    if (!rtc.ok || !rtc.rtc_token) {
+      throw new Error(rtc.error ?? "Qwen backend returned no RTC credentials.");
+    }
+    log(
+      `Aliyun RTC credentials acquired:` +
+      ` channel=${rtc.rtc_channel ?? "?"}` +
+      ` app_id=${rtc.rtc_app_id?.slice(0, 8) ?? "?"}…` +
+      ` gslb=${rtc.rtc_gslb ?? "?"}` +
+      (rtc.times_left != null ? ` (times_left: ${rtc.times_left})` : "") +
+      (rtc.audio_timeout != null ? ` (timeout: ${rtc.audio_timeout}s)` : ""),
+    );
+
+    // 3. Show the "coming soon" message — the Aliyun RTC SDK integration
+    //    is not yet implemented on the frontend.
+    log(
+      "⚠ Qwen Voice backend is ready (Aliyun RTC credentials acquired)," +
+      " but the frontend Aliyun RTC SDK integration is NOT YET IMPLEMENTED." +
+      " Qwen uses Aliyun Bailian RTC (a proprietary 242 KB SDK), not standard" +
+      " WebRTC SDP exchange like ChatGPT. The other 4 providers (ChatGPT," +
+      " Perplexity, Gemini, Inworld) work end-to-end.",
+    );
+    throw new Error(
+      "Qwen Voice: backend ready (Aliyun RTC credentials acquired), but " +
+      "frontend Aliyun RTC SDK integration is coming soon. Use ChatGPT, " +
+      "Perplexity, Gemini, or Inworld for now.",
+    );
+  }, [log]);
+
   /** Connect to the selected provider's realtime endpoint. Dispatches to
    * the WebRTC path (ChatGPT / Perplexity), the Gemini bidi path, or the
    * Inworld WebSocket path. */
@@ -1421,6 +1533,8 @@ function RealtimeChat() {
         await connectGemini();
       } else if (providerRef.current === "inworld") {
         await connectInworld();
+      } else if (providerRef.current === "qwen") {
+        await connectQwen();
       } else {
         await connectWebRtc();
       }
@@ -1431,7 +1545,7 @@ function RealtimeChat() {
       log(`Error: ${message}`);
       teardown();
     }
-  }, [connectGemini, connectInworld, connectWebRtc, log, teardown]);
+  }, [connectGemini, connectInworld, connectQwen, connectWebRtc, log, teardown]);
 
   /** Toggle the mic on/off (mutes the local audio track). Works for both
    * the WebRTC path (localStream) and the Gemini path (micStream) since
