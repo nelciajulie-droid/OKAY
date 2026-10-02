@@ -1346,3 +1346,77 @@ Stage Summary:
   - Barge-in works: when you start speaking, the AI stops talking immediately (you can interrupt)
   - On disconnect, all AI audio stops cleanly
 - This now matches the Inworld playground's realtime audio behavior (confirmed by reading the playground's actual source code).
+
+---
+Task ID: 62
+Agent: main (Z.ai Code)
+Task: Fix "au micro il detect plusieur foi" — the user said "Ok merci" once but got 3 `You:` lines:
+  [20:15:33] [inworld] speech started
+  [20:15:34] You: Ok, mas.        ← partial (delta)
+  [20:15:35] You: Ok merci.       ← final (completed #1)
+  [20:15:35] [inworld] speech stopped
+  [20:15:35] You: Ok merci.      ← duplicate (completed #2)
+
+Work Log:
+- Re-fetched the Inworld playground's `RealtimePlaygroundForm.CqwBKYtM.js` chunk (84 KB) to study how the playground handles user transcripts. Found the key pattern:
+  ```js
+  // Playground (de-minified):
+  mr = (t, e) => {  // delta handler
+    const s = t.delta ?? "";
+    e.buffers.userText.current = s;  // REPLACE (not append!)
+    if (e.buffers.userTranscriptItemId.current) {
+      e.transcript.updateItem(e.buffers.userTranscriptItemId.current, {content: s});  // UPDATE existing
+    } else {
+      e.buffers.userTranscriptItemId.current = e.transcript.addItem(I.USER_MESSAGE, s, {isInterim: true});  // CREATE new, store ID
+    }
+  };
+  "conversation.item.input_audio_transcription.completed": (t, e) => {
+    if (t.transcript) {
+      const a = e.buffers.userTranscriptItemId.current;
+      if (a) {
+        e.transcript.updateItem(a, {content: t.transcript, isInterim: false});  // UPDATE to final
+      } else {
+        e.transcript.addItem(I.USER_MESSAGE, t.transcript, {voiceProfile: i});  // CREATE (no delta was received)
+      }
+      e.buffers.userText.current = "";
+      e.buffers.userTranscriptItemId.current = null;  // RESET after completed
+    }
+  };
+  ```
+- **Root cause of the user's bug:** my code in Task 57/59 logged BOTH `delta` and `completed` events as separate `log(\`You: ${text}\`)` calls — each creating a NEW transcript line. For one speech with 1 delta + 2 completed events, the user saw 3 `You:` lines. The playground instead UPDATES one line per speech (via `userTranscriptItemId.current`).
+- **KEY INSIGHT from the playground:** the `delta` field in OpenAI Realtime API's `conversation.item.input_audio_transcription.delta` event is the **FULL current transcription** (not an incremental chunk). The playground does `userText.current = s` (REPLACE, not `+=`). This is why the user saw "Ok, mas." then "Ok merci." (corrected transcription), not "Ok" then ", mas." then "Ok" then " merci." (incremental).
+- Edits to `src/app/page.tsx`:
+  1. **Added `inUserSpeechRef`** (useRef<boolean>) to track whether we're currently in a user speech (between `speech_started` and the next `speech_started`). Matches the playground's `userTranscriptItemId.current` (but simpler — boolean instead of an item ID, since we use "last line is a You: line" as the update condition).
+  2. **Added `upsertUserLine(text)` useCallback** — the single helper that both `delta` and `completed` handlers call. Logic:
+     - If `inUserSpeechRef.current === true` AND the last transcript line contains `"] You:"` → UPDATE it: replace the content (each delta is the FULL current transcription, so REPLACE not append).
+     - Else → CREATE a new `You: ${text}` line + set `inUserSpeechRef.current = true`.
+     - This collapses all deltas + completed events for one speech into ONE growing line.
+  3. **Changed `conversation.item.input_audio_transcription.completed` handler** from `log(\`You: ${t}\`)` to `upsertUserLine(t)`.
+  4. **Changed `conversation.item.input_audio_transcription.delta` handler** from `log(\`You: ${d}\`)` to `upsertUserLine(d)`.
+  5. **Added reset on `speech_started`:** `inUserSpeechRef.current = false` so the next speech creates a FRESH `You:` line (don't append to the previous speech's line). This is placed AFTER `clearAudioQueue()` (barge-in) in the speech_started handler.
+- Note: the ChatGPT WebRTC path (line ~340) still uses `log(\`You: ${msg.transcript}\`)` for `conversation.item.input_audio_transcription.completed` — that path receives only the `completed` event (no streaming deltas), so it doesn't have the duplicate problem. Left unchanged.
+- `bun run lint` → 0 errors / 0 warnings. 1 file, +43 / -2 lines.
+- Committed as `6785748` ("fix(inworld): collapse user transcript deltas+completed into ONE You: line per speech (was showing multiple You: for one utterance)").
+- `git push origin main` → `5011b04..6785748 main -> main`.
+- Vercel auto-deploy: waited 100s. Confirmed new production chunk hash rotated from `0c603096d88c3977` (Task 61) to `0e4d72d6110b1d3b` (Task 62).
+- Verified Task 62 fix is live by grepping the new production chunk (350 KB):
+  - `I(e.transcript??e.text??"")` ✓ present (completed → upsertUserLine, inlined as `I`)
+  - `I(e.delta??"")` ✓ present (delta → upsertUserLine)
+  - `O.current&&i.includes("] You:")` ✓ present (the in-speech + last-line-is-You check)
+  - `?n[n.length-1]=\`${t} ${e}\`` ✓ present (UPDATE: replace content)
+  - `:(n.push(\`${t} ${e}\`),O.current=!0)` ✓ present (CREATE new + mark in-speech)
+  - `O.current=!1` on `speech_started` ✓ present (reset for next speech)
+  - Verbatim minified production JS for upsertUserLine: `I=(0,D.useCallback)(e=>{if(!e)return;let t=\`[\${new Date().toLocaleTimeString()}] You:\`;...return O.current&&i.includes("] You:")?n[n.length-1]=\`${t} ${e}`:(n.push(\`${t} ${e}\`),O.current=!0),n.slice(-200)})` — exact match to source.
+  - Verbatim minified production JS for speech_started: `"input_audio_buffer.speech_started":z(),O.current=!1,T("[inworld] speech started")` — `z()`=clearAudioQueue, `O.current=!1`=inUserSpeechRef reset, `T(...)`=log. Exact match to source.
+- Production page render: `GET https://ace-studio-orcin.vercel.app/` → HTTP 200 in 0.26s. Token endpoint returns the Inworld token as before.
+
+Stage Summary:
+- Root cause: my code logged BOTH `delta` and `completed` events as separate `You:` lines. The OpenAI Realtime API sends multiple deltas (streaming partials) + potentially multiple completed events (if server_vad commits mid-utterance) for ONE speech → the user saw 3+ `You:` lines for one "Ok merci".
+- Fix: matched the Inworld playground's pattern — UPDATE one `You:` line per speech (via `inUserSpeechRef` + `upsertUserLine`), reset on `speech_started`. The `delta` field is the FULL current transcription (REPLACE, not append) — so the user sees the transcription stream + correct in real-time, then collapse to the final on `completed`.
+- Files modified: `src/app/page.tsx` only (+43 / -2 lines).
+- Lint 0/0, push OK (`5011b04..6785748`), Vercel redeploy verified by chunk hash rotation + byte-level grep of the new chunk (all 5 fix markers present in production).
+- What to expect on the next live run:
+  - User says "Ok merci" once → sees ONE `You:` line that updates in real-time ("Ok, mas." → "Ok merci.") as deltas arrive, then settles on the final "Ok merci." when completed fires.
+  - No more duplicate `You:` lines for one speech.
+  - Each new speech (after `speech_started`) creates a fresh `You:` line.
+  - The barge-in (clearAudioQueue on speech_started) still works — AI audio stops when user starts speaking.
