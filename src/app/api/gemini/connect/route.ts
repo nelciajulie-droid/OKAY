@@ -340,10 +340,29 @@ function buildBidiUrl(opts: {
   ].join("\n");
   u.searchParams.set("$httpHeaders", headerLines);
 
-  // For a receive (long-poll) request, the Web Channel uses `TYPE` and
-  // a `jsh` param. We add the common ones here.
+  // For a receive (long-poll) request, Google's Web Channel uses a different
+  // URL format:
+  //   /v1/bidiGenerateContent?gsessionid=<gsessionid>&VER=8&RID=rpc&SID=<sid>&AID=0&CI=0&TYPE=xmlhttp&zx=<zx>&t=1
+  // Key differences from the POST (start/send) URL:
+  //   - gsessionid is a query param (not X-HTTP-Session-Id)
+  //   - RID=rpc (not the numeric rid)
+  //   - TYPE=xmlhttp (not 'xml')
+  //   - AID=0 and CI=0 params
+  //   - No $httpHeaders param (headers are sent as real HTTP headers)
   if (opts.receive) {
-    u.searchParams.set("TYPE", "xml");
+    // Clear the $httpHeaders param — for GET long-poll, headers go as real HTTP headers
+    u.searchParams.delete("$httpHeaders");
+    u.searchParams.delete("X-HTTP-Session-Id");
+    // Set gsessionid as a query param (not as X-HTTP-Session-Id)
+    if (opts.gsessionid) {
+      u.searchParams.set("gsessionid", opts.gsessionid);
+    }
+    // RID=rpc for the long-poll (not the original numeric rid)
+    u.searchParams.set("RID", "rpc");
+    // Required Web Channel params
+    u.searchParams.set("AID", "0");
+    u.searchParams.set("CI", "0");
+    u.searchParams.set("TYPE", "xmlhttp");
   }
   return u.toString();
 }
