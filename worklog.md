@@ -1281,3 +1281,68 @@ Stage Summary:
 - Follow-up if needed:
   - If the user's browser falls back to non-24 kHz context AND the mic capture is at the wrong rate (server hears the user at wrong speed), I'll need to add an explicit downsampler for the mic path (48 kHz → 24 kHz via linear interpolation or simple decimation). The `log("AudioContext @ X Hz")` line will tell us if this is the case.
   - The same jitter buffer cap fix should eventually be applied to the Gemini path too (it uses the same unbounded scheduling pattern). Leaving alone for now since the user only reported Inworld issues.
+
+---
+Task ID: 61
+Agent: main (Z.ai Code)
+Task: Fix "parle en plusieurs audio" (fragmented/garbled voice) for Inworld. User pointed to the original Inworld playground (https://platform.inworld.ai/workspaces/fancy-penguin-4288/realtime/playground) as the reference. After Task 60 made audio play at 24 kHz + added a 300ms jitter buffer cap, the user reported the AI voice plays in "several audio" (disjointed/overlapping fragments) rather than smooth continuous realtime audio.
+
+Work Log:
+- **Investigated the Inworld playground's actual implementation** by fetching its JS bundle. Found the playground uses code-splitting — the `RealtimePlaygroundForm.CqwBKYtM.js` chunk (84 KB) contains the realtime audio handler. Searched the minified code for the exact playback pattern and found:
+  ```js
+  // Playground's scheduleChunk (de-minified):
+  Me = 24e3;  // 24000 Hz — confirms Task 60's sample rate fix
+  const y = ur(w);  // base64 → Float32 decoder (same as our base64ToFloat32)
+  const m = h.createBuffer(1, y.length, Me);
+  m.getChannelData(0).set(y);
+  const C = h.createBufferSource();
+  C.buffer = m;
+  C.connect(f);
+  const A = Math.max(l.current, h.currentTime);  // GAPLESS, NO cap
+  C.start(A);
+  l.current = A + m.duration;
+  o.current.push(C);  // track active sources for barge-in
+  C.onended = () => { o.current = o.current.filter(v => v !== C) };
+  ```
+- **Root cause of "parle en plusieurs audio":** the Task 60 jitter buffer cap was `Math.min(Math.max(ctx.currentTime, nextStartTimeRef.current), ctx.currentTime + 0.3)`. When the AI sends a burst (77 chunks in ~100ms), `nextStartTimeRef.current` grows past `ctx.currentTime + 0.3` after ~23 chunks. Then EVERY subsequent chunk gets scheduled at `ctx.currentTime + 0.3` (the cap), which is the SAME timestamp for all of them → they play SIMULTANEOUSLY → overlapping/garbled audio. The user heard this as "parle en plusieurs audio".
+- **The lag concern from Task 60 was already solved by the 24 kHz fix:** at 24 kHz, 77 chunks * 13ms = 1000ms of audio plays in 1000ms (real-time). The previous "accumulating lag" was caused by the 16 kHz mismatch (1.5x slow), not by bursty delivery. Gapless playback at 24 kHz IS real-time.
+- Edits to `src/app/page.tsx`:
+  1. **Added `activeSourcesRef`** (a `Set<AudioBufferSourceNode>`) to track currently-scheduled/playing AI audio sources — matches the playground's `o.current` array.
+  2. **Added `clearAudioQueue()` useCallback** — stops all active sources via `src.stop()` + resets `nextStartTimeRef.current` to `ctx.currentTime`. Used for barge-in (when user starts speaking) + on teardown/disconnect.
+  3. **Rewrote the Inworld `playPcmChunkRef` closure to match the playground EXACTLY:**
+     - `Math.max(ctx.currentTime, nextStartTimeRef.current)` — gapless scheduling, NO jitter cap (removed the `Math.min(..., ctx.currentTime + 0.3)` cap that caused overlapping chunks)
+     - `activeSourcesRef.current.add(src)` — track each new source
+     - `src.onended = () => { activeSourcesRef.current.delete(src) }` — auto-remove when playback ends
+  4. **Added barge-in to `speech_started` handler:** `clearAudioQueue()` is now called when the server sends `input_audio_buffer.speech_started`, so the AI's current audio stops immediately when the user starts speaking → the user can interrupt the AI (matches the playground's `clearQueue` behavior).
+  5. **Added `clearAudioQueue()` to `teardown`:** stops all AI audio when the user disconnects (clean cleanup).
+  6. **Updated the `connectInworld` header comment** to document the gapless scheduling + barge-in pattern (replaced the Task 60 jitter cap documentation).
+- `bun run lint` → 0 errors / 0 warnings. 1 file, +63 / -31 lines.
+- Committed as `5011b04` ("fix(inworld): gapless playback (no jitter cap) + barge-in — matches Inworld playground scheduleChunk").
+- `git push origin main` → `e1771ea..5011b04 main -> main`.
+- Vercel auto-deploy: waited 100s. Confirmed new production chunk hash rotated from `bf20d876ca80a2fd` (Task 60) to `0c603096d88c3977` (Task 61).
+- Verified Task 61 fix is live by grepping the new production chunk (349 KB):
+  - `createBuffer(1,r.length,24e3)` ✓ present (24 kHz buffer — kept from Task 60)
+  - `Math.max(t.currentTime,A.current)` ✓ present (gapless scheduling — the fix)
+  - `currentTime+0.3` hits = **0** ✓ (the jitter cap is GONE from the Inworld path — confirmed removed)
+  - `M.current.add(i)` ✓ present (active source tracking)
+  - `i.onended=()=>{M.current.delete(i)}` ✓ present (auto-remove on end)
+  - `.stop()` calls ✓ present (clearAudioQueue for barge-in)
+  - `"suspended"===e.state&&e.resume()` ✓ present (auto-resume — kept from Task 60)
+  - Verbatim minified production JS for the Inworld playback closure: `let r=L(e),n=t.createBuffer(1,r.length,24e3);n.copyToChannel(r,0);let i=t.createBufferSource();i.buffer=n,i.connect(t.destination);let s=Math.max(t.currentTime,A.current);i.start(s),A.current=s+n.duration,M.current.add(i),i.onended=()=>{M.current.delete(i)}` — exact match to source + matches the playground's `scheduleChunk` pattern.
+- Production page render: `GET https://ace-studio-orcin.vercel.app/` → HTTP 200 in 33ms. Token endpoint returns the Inworld token as before.
+
+Stage Summary:
+- Root cause: the Task 60 jitter buffer cap (`Math.min(..., ctx.currentTime + 0.3)`) caused chunks to be scheduled at the SAME timestamp when the queue grew past 300ms → overlapping simultaneous playback → "parle en plusieurs audio". The cap was an incorrect "fix" for the lag that was already solved by the 24 kHz sample rate fix.
+- Fix: matched the Inworld playground's `scheduleChunk` implementation EXACTLY (extracted from the playground's minified JS bundle):
+  1. Gapless scheduling: `Math.max(ctx.currentTime, nextStartTimeRef.current)` with NO cap.
+  2. Active source tracking: `activeSourcesRef` (Set) for barge-in support.
+  3. Barge-in: `clearAudioQueue()` on `input_audio_buffer.speech_started` — stops AI audio when user starts speaking.
+  4. Clean teardown: `clearAudioQueue()` on disconnect.
+- Files modified: `src/app/page.tsx` only (+63 / -31 lines).
+- Lint 0/0, push OK (`e1771ea..5011b04`), Vercel redeploy verified by chunk hash rotation + byte-level grep of the new chunk (all 5 fix markers present in production, jitter cap confirmed removed).
+- What to expect on the next live run:
+  - Smooth, continuous AI voice (no more overlapping/fragmented chunks)
+  - Real-time playback at 24 kHz (correct pitch + speed, no lag)
+  - Barge-in works: when you start speaking, the AI stops talking immediately (you can interrupt)
+  - On disconnect, all AI audio stops cleanly
+- This now matches the Inworld playground's realtime audio behavior (confirmed by reading the playground's actual source code).
