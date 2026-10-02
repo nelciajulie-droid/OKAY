@@ -205,27 +205,54 @@ export async function POST(req: Request) {
     );
   }
 
-  // Extract the sdp_token — try a few field paths for robustness.
+  // Extract the Aliyun RTC credentials from the response.
+  // The `/users/user/audio_chat_token` endpoint returns Aliyun Bailian
+  // RTC channel credentials (NOT an SDP answer — `sdp_token` is always
+  // null). The browser uses the Aliyun RTC SDK to join the channel with
+  // these credentials:
+  //   - token: the Aliyun RTC channel auth token
+  //   - channel: the channel name (e.g. "rtc-channel-xxx")
+  //   - app_id: the Aliyun Bailian app ID
+  //   - gslb: the Aliyun RTC gateway URL (e.g. "https://gw.rtn.aliyuncs.com")
+  //   - user_id_client / user_id_voicechat: the user IDs for the RTC session
+  //   - sdp_token: always null (the Aliyun RTC SDK handles the WebRTC
+  //     handshake internally, not via standard SDP exchange)
+  //   - chat_id: the Qwen chat session ID (for the chat history)
+  //   - times_left: remaining voice chat uses
+  //   - audio_timeout: max session duration in seconds (600 = 10 min)
   const obj = parsed as Record<string, unknown>;
   const dataObj = (obj.data ?? obj) as Record<string, unknown> | undefined;
-  const sdpToken =
-    (typeof dataObj?.sdp_token === "string" ? (dataObj.sdp_token as string) : "") ||
-    (typeof dataObj?.sdp === "string" ? (dataObj.sdp as string) : "") ||
-    (typeof obj.sdp_token === "string" ? (obj.sdp_token as string) : "");
-
-  if (!sdpToken || sdpToken.length < 20) {
+  if (!dataObj || !dataObj.token) {
     return NextResponse.json(
       {
-        error: "Qwen response did not contain a valid sdp_token.",
-        raw: responseText.slice(0, 400),
+        error: "Qwen response did not contain Aliyun RTC credentials (no 'token' field).",
+        raw: responseText.slice(0, 600),
       },
       { status: 502 },
     );
   }
 
-  // 7. Return the answer SDP to the browser. The frontend accepts either
-  //    `sdp` or `sdp_token` — return both for maximum compatibility.
-  return NextResponse.json({ sdp_token: sdpToken, sdp: sdpToken, type: "answer" });
+  // Return the full Aliyun RTC credentials to the browser. The browser
+  // will use the Qwen Omni SDK (or Aliyun RTC SDK directly) to join the
+  // channel with these credentials.
+  return NextResponse.json({
+    ok: true,
+    // Aliyun RTC credentials (the browser uses these to join the channel).
+    rtc_token: dataObj.token as string,
+    rtc_channel: (dataObj.channel as string) ?? "",
+    rtc_app_id: (dataObj.app_id as string) ?? "",
+    rtc_gslb: (dataObj.gslb as string) ?? "",
+    rtc_user_id_client: (dataObj.user_id_client as string) ?? "",
+    rtc_user_id_voicechat: (dataObj.user_id_voicechat as string) ?? "",
+    // Session metadata.
+    chat_id: (dataObj.chat_id as string) ?? "",
+    times_left: dataObj.times_left ?? null,
+    audio_timeout: dataObj.audio_timeout ?? null,
+    // sdp_token (always null for Qwen — kept for API compatibility).
+    sdp_token: (dataObj.sdp_token as string | null) ?? null,
+    sdp: (dataObj.sdp_token as string | null) ?? null,
+    type: "answer",
+  });
 }
 
 /** GET — quick health-check endpoint (returns the token status without
