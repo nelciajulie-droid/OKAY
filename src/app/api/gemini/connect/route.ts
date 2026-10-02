@@ -61,7 +61,7 @@
  * other routes and as a fallback if the TLS fingerprint ever matters.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import https from "node:https";
 import { URL } from "node:url";
@@ -489,6 +489,8 @@ async function sendViaCurlImpersonate(
   body: string | null,
   timeoutMs: number,
 ): Promise<BidiResponse> {
+  // Use a temp file for header dump (more reliable than -D -)
+  const tmpHeaderFile = `/tmp/gemini-headers-${Date.now()}.txt`;
   const args = [
     "-sS",
     "--max-time",
@@ -497,8 +499,10 @@ async function sendViaCurlImpersonate(
     "20",
     "-X",
     method,
-    "-D", // dump headers to stdout (so we can read Set-Cookie)
-    "-",
+    "-D",
+    tmpHeaderFile,
+    "-o",
+    "-", // body to stdout
     url,
     "--impersonate",
     "chrome131",
@@ -527,18 +531,33 @@ async function sendViaCurlImpersonate(
         reject(new Error(`curl-impersonate exited ${code}: ${stderr.slice(0, 400)}`));
         return;
       }
-      // -D - dumps headers + blank line + body. Split at the first \r\n\r\n.
-      const split = stdout.indexOf("\r\n\r\n");
-      const headerBlock = split >= 0 ? stdout.slice(0, split) : stdout;
-      const bodyText = split >= 0 ? stdout.slice(split + 4) : "";
-      const statusMatch = headerBlock.match(/^HTTP\/[\d.]+\s+(\d+)/);
-      const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+      // Read body from stdout, headers from the temp file
+      const bodyText = stdout;
+      let headerBlock = "";
+      try {
+        headerBlock = readFileSync(tmpHeaderFile, "utf-8");
+      } catch { /* headers not written */ }
+      try { unlinkSync(tmpHeaderFile); } catch { /* ignore */ }
+
+      // Parse status (HTTP/2 format: "HTTP/2 200" or HTTP/1.1 format)
+      const statusMatch = headerBlock.match(/^HTTP\/[\d.]+\s+(\d+)/m);
+      const status = statusMatch ? parseInt(statusMatch[1], 10) : 200;
       const setCookie: string[] = [];
-      for (const line of headerBlock.split("\r\n")) {
-        const m = line.match(/^set-cookie:\s*(.*)$/i);
-        if (m) setCookie.push(m[1]);
+      // Parse ALL headers — we need x-http-session-id
+      const parsedHeaders: Record<string, string | string[] | undefined> = {};
+      for (const line of headerBlock.split("\n")) {
+        const colonIdx = line.indexOf(":");
+        if (colonIdx > 0) {
+          const name = line.slice(0, colonIdx).trim().toLowerCase();
+          const value = line.slice(colonIdx + 1).trim();
+          if (name === "set-cookie") {
+            setCookie.push(value);
+          } else {
+            parsedHeaders[name] = value;
+          }
+        }
       }
-      resolve({ status, body: bodyText, headers: {}, setCookie });
+      resolve({ status, body: bodyText, headers: parsedHeaders, setCookie });
     });
     if (body != null) child.stdin.end(body);
     else child.stdin.end();
