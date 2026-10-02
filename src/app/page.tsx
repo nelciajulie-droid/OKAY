@@ -215,6 +215,16 @@ function RealtimeChat() {
   const sendTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const micBufferRef = useRef<Int16Array[]>([]);
   const inworldWsRef = useRef<WebSocket | null>(null);
+  // `qwenEngineRef` holds the Aliyun RTC engine instance for the Qwen
+  // provider. The SDK is dynamically imported inside `connectQwen` (it
+  // uses browser-only APIs like navigator.mediaDevices + RTCPeerConnection
+  // so it cannot be imported at module top-level — Next.js SSR would
+  // fail). We use a loose `any` type because the SDK is loaded via dynamic
+  // `import()` and its types are not easily reachable at the ref
+  // declaration site. `teardown` calls `publishLocalAudioStream(false)`,
+  // `leaveChannel()`, + `destroy()` on this instance to release the mic
+  // + the WebRTC resources.
+  const qwenEngineRef = useRef<any>(null);
   useEffect(() => {
     voiceRef.current = voice;
   }, [voice]);
@@ -283,6 +293,21 @@ function RealtimeChat() {
     }
     geminiSessionRef.current = null;
     micBufferRef.current = [];
+    // --- Qwen Aliyun RTC engine ---
+    // Tear down the engine BEFORE clearing the shared mic — the engine
+    // owns its own getUserMedia stream internally, but `destroy()` is
+    // async + we want to start it as early as possible. All three calls
+    // return Promises (per the Aliyun RTC SDK types); we fire-and-forget
+    // them with `.catch(() => {})` so a rejected promise doesn't crash
+    // the React app. Clearing the ref first means a duplicate teardown
+    // (e.g. on unmount after explicit disconnect) is a no-op.
+    if (qwenEngineRef.current) {
+      const eng = qwenEngineRef.current;
+      qwenEngineRef.current = null;
+      try { void eng.publishLocalAudioStream(false).catch(() => { /* ignore */ }); } catch { /* ignore */ }
+      try { void eng.leaveChannel().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+      try { void eng.destroy().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+    }
     // --- Shared mic ---
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -1413,28 +1438,49 @@ function RealtimeChat() {
   // -------------------------------------------------------------------------
 
   /** Connect via Qwen Voice. Unlike ChatGPT/Perplexity (standard WebRTC
-   *  SDP exchange), Qwen uses Aliyun Bailian RTC — a proprietary WebRTC
-   *  SDK (242 KB) that handles the connection internally. The flow is:
-   *    1. POST /api/qwen/token → { rtc_token, rtc_channel, rtc_app_id,
-   *       rtc_gslb, rtc_user_id_client, ... } (Aliyun RTC credentials).
-   *    2. Load the Aliyun RTC SDK + join the channel with the credentials.
-   *    3. Handle OpenAI Realtime API events (session.created,
-   *       input_audio_buffer.*, response.output_audio_transcript.delta,
-   *       etc.) on the RTC data channel.
+   *  SDP exchange via RTCPeerConnection), Qwen uses Aliyun Bailian RTC —
+   *  a proprietary WebRTC SDK (`aliyun-rtc-sdk`, 242 KB) that handles the
+   *  WebRTC handshake internally with its own protocol (NOT standard SDP
+   *  offer/answer). The flow is:
+   *    1. GET /api/qwen/token → health-check (token configured? expired?).
+   *    2. POST /api/qwen/token → { rtc_token, rtc_channel, rtc_app_id,
+   *       rtc_gslb, rtc_user_id_client, rtc_user_id_voicechat, ... }
+   *       (Aliyun RTC channel credentials from chat.qwen.ai).
+   *    3. Dynamically `import("aliyun-rtc-sdk")` — the SDK uses
+   *       browser-only APIs (navigator.mediaDevices, RTCPeerConnection)
+   *       so it MUST be dynamically imported (Next.js SSR would fail if
+   *       imported at module top-level). The dynamic import also keeps
+   *       the 242 KB SDK out of the main bundle — it only loads when the
+   *       user clicks Connect with Qwen selected.
+   *    4. AliRtcEngine.createInstance() → joinChannel(authInfo) — joins
+   *       the Aliyun RTC channel using the credentials from step 2.
+   *    5. publishLocalAudioStream(true) — the SDK handles getUserMedia
+   *       internally; we don't need to call getUserMedia ourselves.
+   *    6. subscribeAllRemoteAudioStreams(true) + on
+   *       `remoteTrackAvailableNotify` for the AI user
+   *       (rtc_user_id_voicechat) → getAudioTrack + play via a hidden
+   *       <audio> element (reuses audioElRef).
+   *    7. on `dataChannelMsg` — decode the ArrayBuffer as JSON + dispatch
+   *       on the OpenAI Realtime API event name (session.created,
+   *       input_audio_buffer.*, conversation.item.input_audio_transcription.*,
+   *       response.output_audio_transcript.*, error, etc.).
+   *    8. On `session.created`, send a `session.update` event to the
+   *       server via sendDataChannelMessage (voice: Tina, server_vad
+   *       800ms silence, pcm16 audio, ASR model qwen3-asr-flash-realtime).
    *
-   *  STEP 2 requires the Aliyun RTC SDK which is a 242 KB ES module with
-   *  relative imports — it can't be loaded via a simple <script> tag. The
-   *  full frontend integration (loading the SDK + joining the channel +
-   *  handling events + mic capture + audio playback) is a significant
-   *  implementation effort that is NOT YET DONE. This function checks
-   *  the token + fetches the credentials so the user sees a clear status,
-   *  then shows the "coming soon" message.
+   *  Teardown is handled by the shared `teardown` function, which calls
+   *  `engine.publishLocalAudioStream(false)`, `engine.leaveChannel()`,
+   *  and `engine.destroy()` on `qwenEngineRef.current`.
    *
-   *  The other 4 providers (ChatGPT, Perplexity, Gemini, Inworld) work
-   *  end-to-end. Qwen Voice is the 5th provider and needs the Aliyun RTC
-   *  SDK integration (follow-up). */
+   *  The other 4 providers (ChatGPT, Perplexity, Gemini, Inworld) are
+   *  unaffected — only the `provider === "qwen"` branch in `connect`
+   *  dispatches here. */
   const connectQwen = useCallback(async () => {
-    // 1. Check the token health (GET /api/qwen/token).
+    // 1. Health-check the token (GET /api/qwen/token). The route returns
+    //    { ok, configured, source, tokenMasked, exp, expired }. We bail
+    //    out with a clear actionable message BEFORE attempting the SDK
+    //    load (saves the 242 KB download + the Aliyun RTC handshake if
+    //    the token is missing or expired).
     log("Checking Qwen token status…");
     const healthRes = await fetch("/api/qwen/token", {
       signal: AbortSignal.timeout(10_000),
@@ -1468,12 +1514,26 @@ function RealtimeChat() {
       `Qwen token OK (source: ${health.source ?? "?"}, masked: ${health.tokenMasked ?? "?"}${health.exp ? `, expires in ${Math.round((health.exp - Date.now() / 1000) / 60)} min` : ""}).`,
     );
 
-    // 2. Fetch the Aliyun RTC credentials (POST /api/qwen/token).
+    // 2. Fetch the Aliyun RTC credentials (POST /api/qwen/token). The
+    //    backend requires the SDP body to start with `v=0` (its
+    //    validation check), but the SDP content is NOT actually used —
+    //    chat.qwen.ai just creates a new RTC channel + returns the
+    //    credentials regardless of the SDP. The Aliyun RTC SDK handles
+    //    the WebRTC handshake internally. We send a minimal valid SDP
+    //    to pass the backend check.
     log("Fetching Aliyun RTC credentials…");
+    const fakeSdp =
+      "v=0\r\n" +
+      "o=- 0 0 IN IP4 0.0.0.0\r\n" +
+      "s=-\r\n" +
+      "t=0 0\r\n" +
+      "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n" +
+      "c=IN IP4 0.0.0.0\r\n" +
+      "a=rtpmap:0 PCMU/8000\r\n";
     const rtcRes = await fetch("/api/qwen/token", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sdp: "placeholder" }),
+      body: JSON.stringify({ sdp: fakeSdp }),
       signal: AbortSignal.timeout(30_000),
     });
     if (!rtcRes.ok) {
@@ -1487,6 +1547,7 @@ function RealtimeChat() {
       rtc_app_id?: string;
       rtc_gslb?: string;
       rtc_user_id_client?: string;
+      rtc_user_id_voicechat?: string;
       chat_id?: string;
       times_left?: number | null;
       audio_timeout?: number | null;
@@ -1504,21 +1565,298 @@ function RealtimeChat() {
       (rtc.audio_timeout != null ? ` (timeout: ${rtc.audio_timeout}s)` : ""),
     );
 
-    // 3. Show the "coming soon" message — the Aliyun RTC SDK integration
-    //    is not yet implemented on the frontend.
-    log(
-      "⚠ Qwen Voice backend is ready (Aliyun RTC credentials acquired)," +
-      " but the frontend Aliyun RTC SDK integration is NOT YET IMPLEMENTED." +
-      " Qwen uses Aliyun Bailian RTC (a proprietary 242 KB SDK), not standard" +
-      " WebRTC SDP exchange like ChatGPT. The other 4 providers (ChatGPT," +
-      " Perplexity, Gemini, Inworld) work end-to-end.",
-    );
-    throw new Error(
-      "Qwen Voice: backend ready (Aliyun RTC credentials acquired), but " +
-      "frontend Aliyun RTC SDK integration is coming soon. Use ChatGPT, " +
-      "Perplexity, Gemini, or Inworld for now.",
-    );
-  }, [log]);
+    // 3. Dynamically import the Aliyun RTC SDK. The SDK uses browser-only
+    //    APIs (navigator.mediaDevices, RTCPeerConnection, MediaStream,
+    //    MediaStreamTrack, etc.) so it MUST be loaded via dynamic
+    //    `import()` — importing it at module top-level would crash
+    //    Next.js SSR (those APIs don't exist on the server). The dynamic
+    //    import also keeps the 242 KB SDK out of the main page bundle —
+    //    it loads as a separate chunk only when the user clicks Connect
+    //    with Qwen selected.
+    log("Loading Aliyun RTC SDK…");
+    let AliRtcEngine: any;
+    let AliRtcDataChannelMsg: any;
+    try {
+      const mod = await import("aliyun-rtc-sdk");
+      AliRtcEngine = mod.default;
+      AliRtcDataChannelMsg = mod.AliRtcDataChannelMsg;
+    } catch (err) {
+      throw new Error(
+        `Failed to load Aliyun RTC SDK: ${(err as Error).message}. ` +
+        "The `aliyun-rtc-sdk` package is installed; run `bun install` if missing.",
+      );
+    }
+    if (!AliRtcEngine || typeof AliRtcEngine.createInstance !== "function") {
+      throw new Error(
+        "Aliyun RTC SDK loaded but `createInstance` is missing — the " +
+        "package may be corrupted. Try `bun remove aliyun-rtc-sdk && bun add aliyun-rtc-sdk`.",
+      );
+    }
+
+    // 4. Create the AliRtcEngine instance + store it in qwenEngineRef so
+    //    `teardown` can destroy it on disconnect/unmount. Clearing the
+    //    ref first would let a duplicate connect call tear down the old
+    //    engine — but the connect dispatcher disables the Connect button
+    //    while connected, so this is a no-op safety net.
+    if (qwenEngineRef.current) {
+      try { void qwenEngineRef.current.destroy().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+      qwenEngineRef.current = null;
+    }
+    const engine = AliRtcEngine.createInstance();
+    qwenEngineRef.current = engine;
+
+    // 5. Listen for connection status changes + errors. These are
+    //    informational logs — the user can see the channel lifecycle.
+    engine.on("connectionStatusChange", (status: number, reason: number) => {
+      log(`[qwen] connection status: ${status} (reason: ${reason})`);
+    });
+    engine.on("occurError", (err: unknown, uid?: string) => {
+      log(`[qwen] error: ${JSON.stringify(err).slice(0, 200)}${uid ? ` (uid: ${uid})` : ""}`);
+    });
+    engine.on("bye", (code: number) => {
+      log(`[qwen] kicked from channel (code: ${code}).`);
+    });
+
+    // 6. Join the Aliyun RTC channel. The auth info matches the
+    //    AliRtcAuthInfo shape from the SDK types (channelId, userId,
+    //    appId, nonce, timestamp, token). Qwen doesn't use the nonce
+    //    field — we pass an empty string (the Qwen Omni SDK does the
+    //    same). The timestamp is the current time in milliseconds.
+    const authInfo = {
+      channelId: rtc.rtc_channel ?? "",
+      userId: rtc.rtc_user_id_client ?? "",
+      appId: rtc.rtc_app_id ?? "",
+      nonce: "",
+      timestamp: Date.now(),
+      token: rtc.rtc_token ?? "",
+    };
+    log(`Joining Aliyun RTC channel ${authInfo.channelId.slice(0, 24)}…`);
+    try {
+      await engine.joinChannel(authInfo, "rtc-user-client");
+    } catch (err) {
+      throw new Error(
+        `Failed to join Aliyun RTC channel: ${(err as Error).message}. ` +
+        "The token may be expired or the channel may be full.",
+      );
+    }
+    log("Joined Aliyun RTC channel.");
+
+    // 7. Publish local mic audio. The Aliyun RTC SDK handles
+    //    getUserMedia internally — we don't need to call
+    //    navigator.mediaDevices.getUserMedia ourselves. The SDK creates
+    //    its own RTCPeerConnection + audio track + RTP encapsulation.
+    //    Note: this means `localStreamRef.current` stays null for Qwen,
+    //    so the existing `toggleMute` (which reads localStreamRef) is a
+    //    no-op — see the toggleMute update below for the Qwen-specific
+    //    path via `engine.muteLocalMic`.
+    try {
+      await engine.publishLocalAudioStream(true);
+      log("[qwen] publishing local mic audio.");
+    } catch (err) {
+      throw new Error(
+        `Failed to publish local mic audio: ${(err as Error).message}. ` +
+        "Check that the mic permission is granted + no other app is using it.",
+      );
+    }
+
+    // 8. Subscribe to all remote audio (the AI's voice). The AI user is
+    //    `rtc_user_id_voicechat` — it joins the channel after we do.
+    engine.subscribeAllRemoteAudioStreams(true);
+    log("[qwen] subscribed to remote audio.");
+
+    // 9. When the AI's audio track arrives, get it via getAudioTrack +
+    //    play it via a hidden <audio> element. We listen for the
+    //    `remoteTrackAvailableNotify` event — fires when a remote
+    //    user's audio track becomes available. The audioTrack enum
+    //    value 0 = no track, 1 = mic, 2 = dual stream — we check it's
+    //    non-zero. Reuses the shared audioElRef so teardown can stop
+    //    playback by setting srcObject = null.
+    const voiceChatUid = rtc.rtc_user_id_voicechat ?? "";
+    const playRemoteAudio = async () => {
+      try {
+        const track = await engine.getAudioTrack(voiceChatUid);
+        if (!track) return;
+        const remoteStream = new MediaStream([track]);
+        if (!audioElRef.current) {
+          audioElRef.current = new Audio();
+          audioElRef.current.autoplay = true;
+        }
+        audioElRef.current.srcObject = remoteStream;
+        await audioElRef.current.play().catch(() => {
+          /* autoplay may need a user gesture — the Connect click counts */
+        });
+        log("[qwen] remote audio track playing.");
+      } catch (err) {
+        log(`[qwen] failed to play remote audio: ${(err as Error).message}`);
+      }
+    };
+    engine.on("remoteTrackAvailableNotify", (uid: string, audioTrack: number, _videoTrack: number) => {
+      if (uid === voiceChatUid && audioTrack !== 0) {
+        void playRemoteAudio();
+      }
+    });
+
+    // 10. Helper: append an AI transcript delta to the last AI: log
+    //     line (or create a new one if the last line isn't an AI: line).
+    //     Matches the Inworld `appendAiDelta` pattern — gives ONE
+    //     growing AI: line per response instead of N separate lines.
+    const appendAiDelta = (delta: string) => {
+      if (!delta) return;
+      setTranscript((t) => {
+        const next = [...t];
+        const last = next[next.length - 1] ?? "";
+        if (last.includes("] AI:")) {
+          next[next.length - 1] = last + delta;
+        } else {
+          next.push(`[${new Date().toLocaleTimeString()}] AI: ${delta}`);
+        }
+        return next.slice(-200);
+      });
+    };
+
+    // 11. Listen for OpenAI Realtime API events on the data channel.
+    //     The Qwen Omni server sends events as JSON-encoded strings
+    //     over the Aliyun RTC data channel. We decode the ArrayBuffer
+    //     + dispatch on the event `type`. The event names match the
+    //     OpenAI Realtime API (with the `output_` infix used by Qwen
+    //     + Inworld, e.g. `response.output_audio_transcript.delta`).
+    engine.on("dataChannelMsg", (_uid: string, message: { data: ArrayBuffer }) => {
+      try {
+        const text = new TextDecoder().decode(message.data);
+        const msg = JSON.parse(text) as { type?: string; [k: string]: unknown };
+        const t = msg.type ?? "";
+        switch (t) {
+          // --- Session lifecycle ---
+          case "session.created": {
+            log("[qwen] session created");
+            // Send a session.update event to configure the AI voice +
+            // VAD. Matches the Qwen Omni SDK's `sendUpdate` behavior +
+            // the Qwen web client's session config (Task 64
+            // reverse-engineering). The server's session.created
+            // already set sensible defaults, but we send an explicit
+            // update to be safe + match the web client.
+            const updateEvent = {
+              type: "session.update",
+              session: {
+                modalities: ["text", "audio"],
+                voice: "Tina",
+                input_audio_format: "pcm16",
+                output_audio_format: "pcm16",
+                turn_detection: {
+                  type: "server_vad",
+                  threshold: 0.5,
+                  prefix_padding_ms: 300,
+                  silence_duration_ms: 800,
+                  create_response: true,
+                  interrupt_response: true,
+                },
+                input_audio_transcription: { model: "qwen3-asr-flash-realtime" },
+              },
+            };
+            try {
+              const encoder = new TextEncoder();
+              const data = encoder.encode(JSON.stringify(updateEvent));
+              // Build the AliRtcDataChannelMsg instance if the class is
+              // available; otherwise fall back to a plain object (the
+              // SDK reads only `.data` + `.type` at runtime). `type: 1`
+              // matches the Qwen Omni SDK's sendUpdate behavior.
+              const dcMsg = AliRtcDataChannelMsg
+                ? new AliRtcDataChannelMsg(data.buffer, 1)
+                : { data: data.buffer, type: 1 };
+              engine.sendDataChannelMessage(dcMsg);
+              log("[qwen] sent session.update (voice: Tina, server_vad 800ms).");
+            } catch (err) {
+              log(`[qwen] failed to send session.update: ${(err as Error).message}`);
+            }
+            break;
+          }
+          // --- Server-side VAD (voice activity detection) ---
+          case "input_audio_buffer.speech_started": {
+            log("[qwen] speech started");
+            // Barge-in: stop any active audio playback (matches the
+            // Inworld pattern). For Qwen the AI's audio is played via
+            // a MediaStreamTrack (not Web Audio), so `clearAudioQueue`
+            // is effectively a no-op — but the server's
+            // `interrupt_response: true` already stops the AI's audio
+            // at the source. Reset the user-speech tracking so the
+            // next transcription creates a fresh "You:" line.
+            clearAudioQueue();
+            inUserSpeechRef.current = false;
+            break;
+          }
+          case "input_audio_buffer.speech_stopped": {
+            log("[qwen] speech stopped");
+            break;
+          }
+          // --- User mic transcript (server-side transcription) ---
+          // Both `.delta` and `.completed` UPDATE the same "You:" line
+          // via `upsertUserLine` (collapses all deltas + completed
+          // events for one speech into ONE growing line — matches
+          // the Inworld pattern from Task 62).
+          case "conversation.item.input_audio_transcription.completed": {
+            const transcript = (msg.transcript as string) ?? (msg.text as string) ?? "";
+            upsertUserLine(transcript);
+            break;
+          }
+          case "conversation.item.input_audio_transcription.delta": {
+            const d = (msg.delta as string) ?? "";
+            upsertUserLine(d);
+            break;
+          }
+          // --- AI transcript (streaming text of the spoken reply) ---
+          // Qwen uses the `output_` infix (response.output_audio_transcript.delta),
+          // but we also accept the standard OpenAI name (response.audio_transcript.delta)
+          // for forward-compat. Use appendAiDelta → ONE growing AI: line per response.
+          case "response.output_audio_transcript.delta":
+          case "response.audio_transcript.delta": {
+            appendAiDelta((msg.delta as string) ?? "");
+            break;
+          }
+          case "response.output_audio_transcript.done":
+          case "response.audio_transcript.done": {
+            // The .done event carries the FINAL transcript. If we
+            // already appended deltas above, this is redundant — only
+            // log if no AI line was started (e.g. the deltas were
+            // empty / not received). Matches the Inworld pattern.
+            const finalText = (msg.transcript as string) ?? (msg.text as string) ?? "";
+            if (finalText) {
+              setTranscript((prev) => {
+                const last = prev[prev.length - 1] ?? "";
+                if (last.includes("] AI:")) return prev; // already have streaming text
+                return [...prev.slice(-199), `[${new Date().toLocaleTimeString()}] AI: ${finalText}`];
+              });
+            }
+            break;
+          }
+          // --- Errors (OpenAI shape: {type:"error", error:{...}}) ---
+          case "error": {
+            const errObj = msg.error as Record<string, unknown> | undefined;
+            const errMsg =
+              (typeof errObj === "object" && errObj
+                ? ((errObj.message as string) ??
+                  (errObj.code as string) ??
+                  (errObj.type as string))
+                : undefined) ??
+              JSON.stringify(msg);
+            log(`[qwen] Server error: ${errMsg}`);
+            break;
+          }
+          // --- Other events (response.created, response.done,
+          //     conversation.item.added, rate_limits.updated, etc.)
+          //     are silent no-ops — they don't carry user-visible
+          //     payload (matches the Inworld pattern). ---
+          default:
+            break;
+        }
+      } catch {
+        // Non-JSON message — ignore. The Qwen Omni server may send
+        // binary control frames that aren't valid JSON.
+      }
+    });
+
+    setStatus("connected");
+    log("Connected. Speak when ready.");
+  }, [clearAudioQueue, log, upsertUserLine]);
 
   /** Connect to the selected provider's realtime endpoint. Dispatches to
    * the WebRTC path (ChatGPT / Perplexity), the Gemini bidi path, or the
@@ -1547,13 +1885,22 @@ function RealtimeChat() {
     }
   }, [connectGemini, connectInworld, connectQwen, connectWebRtc, log, teardown]);
 
-  /** Toggle the mic on/off (mutes the local audio track). Works for both
-   * the WebRTC path (localStream) and the Gemini path (micStream) since
-   * both store the MediaStream in localStreamRef. */
+  /** Toggle the mic on/off (mutes the local audio track). Works for the
+   * WebRTC path (localStream), the Gemini/Inworld paths (micStream), AND
+   * the Qwen path (Aliyun RTC SDK owns the mic — uses `muteLocalMic`). */
   const toggleMute = useCallback(() => {
+    const next = !muted;
+    // Qwen path — the Aliyun RTC SDK owns the mic stream.
+    if (qwenEngineRef.current) {
+      try { qwenEngineRef.current.muteLocalMic(next); } catch { /* ignore */ }
+      setMuted(next);
+      log(next ? "Mic muted." : "Mic unmuted.");
+      return;
+    }
+    // ChatGPT / Perplexity / Gemini / Inworld path — toggle the shared
+    // MediaStream tracks' `enabled` property.
     const stream = localStreamRef.current;
     if (!stream) return;
-    const next = !muted;
     stream.getAudioTracks().forEach((t) => (t.enabled = !next));
     setMuted(next);
     log(next ? "Mic muted." : "Mic unmuted.");
