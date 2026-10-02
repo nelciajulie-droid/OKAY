@@ -868,7 +868,9 @@ function RealtimeChat() {
             (msg.error as string) ??
             (msg.message as string) ??
             JSON.stringify(msg);
-          log(`[inworld] error: ${errMsg}`);
+          // Ensure it's a string (avoid [object Object])
+          const errStr = typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg);
+          log(`[inworld] error: ${errStr}`);
           break;
         }
         default: {
