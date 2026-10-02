@@ -796,16 +796,16 @@ async function handleStart(_body: GeminiRequestBody) {
         { status: 502 },
       );
     }
+    // gsessionid: Google returns it in the x-http-session-id RESPONSE HEADER
+    // (NOT in the body or cookies). This is the PRIMARY source.
     const gsessionid =
-      extractGsessionId(res.setCookie, res.body) ??
       (res.headers["x-http-session-id"] as string) ??
+      extractGsessionId(res.setCookie, res.body) ??
       randomUuid();
-    // SID: check the response body first, then the headers
-    // Google's Web Channel body starts with [0,"SID_value",...]
-    // If no SID found, use the gsessionid (some implementations use the same value)
+    // SID: extracted from the response body (Web Channel stream format)
+    // The SID is different from the gsessionid
     const sid = extractSid(res.body) ??
       (res.headers["x-http-session-id"] as string) ??
-      gsessionid ??
       "";
     // Surface the parsed setup response too — it may carry the first
     // server message (a greeting audio chunk, etc.).
