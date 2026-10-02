@@ -904,3 +904,111 @@ Stage Summary:
   - **Perplexity `cf_clearance` is IP-bound** — the pure-JS proxy fallback will only succeed if `PERPLEXITY_PROXY_LIST` points at the SAME proxy IP that the user's browser used to solve the Cloudflare challenge. The curl-impersonate path (when the binary is installed on the Vercel host — not the case on Vercel's default runtime) also needs the server IP to match the cookie's IP. For Vercel, the realistic path is: run a small relay on a fixed IP (e.g. the user's home connection) that has curl-impersonate, and point the route at it. The route is correct; the IP-matching is an operational concern.
   - **Vault currently holds a TEST cookie** (`__Secure-next-auth.session-token=TESTJWT; cf_clearance=TESTCF; account=11111111-…`) that I stored to verify the endpoints. The user's Chrome extension will overwrite it with real cookies on first run. Clearing it requires a POST with a new value (the vault has no DELETE endpoint).
 - Files created/modified: `src/app/api/perplexity/connect/route.ts` (new), `cloudflare-worker/jwt-vault.js` (new — saved from deployed + Perplexity endpoints added + redeployed), `tools/chrome-extension/manifest.json` (new), `tools/chrome-extension/background.js` (new), `src/app/page.tsx` (RealtimeChat component + imports + render), `eslint.config.mjs` (ignores), `.gitignore` (/tool-results/), `package.json` + `bun.lock` (socks-proxy-agent + https-proxy-agent).
+
+---
+Task ID: 55
+Agent: main (Z.ai Code)
+Task: Add Google Gemini Live (Google AI Studio's `gemini-3.8-live`, via `webchannel-alkalimakersuite-pa.clients6.google.com/v1/bidiGenerateContent`) as the 3rd Realtime voice provider, alongside ChatGPT and Perplexity. Implement the full stack: backend bidi route, vault Worker Google cookie endpoints, Chrome extension Google cookie refresh, and a frontend provider selector.
+
+Work Log:
+- Read worklog through Task 54 (the Perplexity task) to learn the existing patterns: vault Worker (Cloudflare KV + JWT_VAULT namespace + BACKEND_URL + PROXY_SECRET bindings), Chrome extension (Manifest V3 service worker with `refreshJwt` + `refreshPerplexityCookies`), RealtimeChat WebRTC component, curl-impersonate binary path, and the `ace-studio-nelth.vercel.app` Vercel deployment URL.
+
+- Probed existing code to map all 4 surfaces that needed editing:
+  - `src/app/api/perplexity/connect/route.ts` — 400 lines, two-tier strategy (curl-impersonate + pure-JS proxy fallback), vault fetch pattern, response parsing.
+  - `cloudflare-worker/jwt-vault.js` — 614 lines, KV keys for ChatGPT + Perplexity, multi-account pool, scheduled JWT refresh daemon.
+  - `tools/chrome-extension/{manifest.json,background.js}` — Manifest V3, `refreshJwt` + `refreshPerplexityCookies`, 2h alarm, badge surfacing.
+  - `src/app/page.tsx` — 716 lines, `RealtimeChat` component with WebRTC SDP flow (ChatGPT/Perplexity), voice selector (ChatGPT only).
+
+- Confirmed curl-impersonate binary IS present at `/home/z/my-project/node_modules/node-curl-impersonate/bin/curl-impersonate-chrome-linux-x86` (verified via `existsSync`), so the curl-impersonate path will be active for the Gemini route too — though Google doesn't use Cloudflare, so the pure-JS (`node:https`) path is the primary one.
+
+- CREATED `src/app/api/gemini/connect/route.ts` (Node runtime, force-dynamic, ~520 lines):
+  * 4-action POST API: `{ action: "start" | "send" | "receive" | "stop" }`.
+  * `computeSapisidHash(sapisid, origin)` — Google's auth scheme: `SAPISIDHASH <ts>_<SHA1(ts + " " + sapisid + " " + origin)>`. Origin = `https://aistudio.google.com`. Computed fresh per request (timestamp changes).
+  * `extractSapisid(cookies)` — pulls `SAPISID` (or `__Secure-1PAPISID` / `__Secure-3PAPISID` fallback) from the full Cookie header string.
+  * `fetchGoogleCookies()` — GETs the vault Worker `/google/cookies` with `X-Vault-Secret` (same env `CHATGPT_VAULT_URL` + `CHATGPT_VAULT_SECRET` as the Perplexity route reuses them).
+  * `buildGoogleHeaders(cookies, sapisidHash)` — full header set for the bidi POST: `Authorization: SAPISIDHASH`, `X-Goog-Api-Key: <GEMINI_API_KEY env>`, `X-Goog-AuthUser: 0`, `X-WebChannel-Content-Type: application/json+protobuf`, plus the standard `Origin/Referer/User-Agent/sec-ch-ua/Sec-Fetch-*` set.
+  * `buildBidiPayload(action, { audio, text })` — wraps the Gemini Live API request (setup / clientContent) in the Web Channel form-urlencoded envelope (`count=1&ofs=0&req0__sc=C&req0_type=bidiGenerateContent&req0_data=<JSON>`).
+  * `buildBidiUrl({ rid, gsessionid, sid, sapisidHash, apiKey, receive })` — builds the bidi URL with query params `VER=8&RID=<rid>&CVER=22&X-HTTP-Session-Id=<gsessionid>&$httpHeaders=<URL-encoded headers>&zx=<nonce>&t=1` (and `SID=<sid>` + `TYPE=xml` for receive).
+  * `sendBidi(method, url, headers, body, timeoutMs)` — two-tier transport: tries curl-impersonate (Chrome JA4 TLS) first when the binary exists, falls back to `node:https` with optional proxy list (`GEMINI_PROXY_LIST` env, tried in order).
+  * `parseBidiChunks(body)` — walks the Web Channel length-prefixed JSON array lines + the body-as-JSON case, recursing into `serverContent` / `modelTurn` / `candidates` / `parts` to collect `inlineData.data` (base64 PCM) and `text` chunks. Sets `done` on `turnComplete`/`done`.
+  * Action handlers:
+    - `handleStart`: vault fetch → extract SAPISID → compute SAPISIDHASH → POST setup message → return `{ ok, gsessionid, sid, rid, audioChunks, textChunks, done }`.
+    - `handleSend`: vault fetch → SAPISIDHASH → POST clientContent (with `audio` base64 PCM or `text`) → return parsed chunks (usually empty; AI audio comes via receive).
+    - `handleReceive`: vault fetch → SAPISIDHASH → GET long-poll (25s timeout) → return collected audioChunks + textChunks + done.
+    - `handleStop`: best-effort POST a `terminate`-type empty message (Google doesn't really need a stop — we just stop long-polling — but it's polite).
+  * Env vars consumed: `CHATGPT_VAULT_URL`, `CHATGPT_VAULT_SECRET`, `GEMINI_API_KEY`, `GEMINI_MODEL` (default `models/gemini-3.0-flash-preview`), `GEMINI_PROXY_LIST`.
+
+- MODIFIED `cloudflare-worker/jwt-vault.js` (+67 lines):
+  * New KV keys: `google_cookies`, `google_updated`.
+  * New route registrations: `GET /google/cookies` → `handleGetGoogleCookies`; `POST /google/cookies` → `handleSetGoogleCookies`.
+  * `handleGetGoogleCookies(env)` — returns `{ cookies, updatedAt, updatedAtHuman }` (404 when no cookies in KV).
+  * `handleSetGoogleCookies(request, env)` — accepts `{ cookies }`, validates non-empty string, stores it + stamps `google_updated`.
+  * Updated `/health` to also report `hasGoogleCookies`, `googleCookieLength`, `googleUpdated`, `googleUpdatedHuman`.
+  * Updated the root `/` endpoints list and the 404 fallback list to include `/google/cookies`.
+  * Preserved ALL existing ChatGPT + Perplexity logic (single-account JWT, split NextAuth cookie, multi-account pool, refresh-via-backend daemon, Perplexity cookie endpoints).
+
+- MODIFIED `tools/chrome-extension/manifest.json` (Manifest V3 version bump 1.1.0 → 1.2.0):
+  * Added `https://*.google.com/*` and `https://google.com/*` to `host_permissions`.
+  * Updated description to mention the new Google cookies refresh job.
+
+- MODIFIED `tools/chrome-extension/background.js` (+90 lines):
+  * New `refreshGoogleCookies(vault)` function:
+    - `chrome.cookies.getAll({ domain: ".google.com" })` + `chrome.cookies.getAll({ domain: "google.com" })` (dedup by name|domain|path).
+    - Build a single `name=value; name=value; ...` Cookie header string.
+    - Verify `SAPISID` (or one of its `__Secure-1PAPISID` / `__Secure-3PAPISID` variants) is present, so we surface a useful error if the user is logged out of aistudio.google.com.
+    - POST the full Cookie string to `${VAULT_URL}/google/cookies` with `X-Vault-Secret`.
+  * `refreshAll(reason)` now runs all 3 refreshes in parallel (`refreshJwt` + `refreshPerplexityCookies` + `refreshGoogleCookies`) and surfaces a 3-state badge: `OK` (all green), `OK*` (yellow — ChatGPT + Perplexity ok but Google cookies unavailable — soft failure for users who haven't visited aistudio.google.com), `ERR` (red).
+  * Top-of-file docstring updated to describe the 3rd refresh job.
+
+- MODIFIED `src/app/page.tsx` (~+500 lines):
+  * `RealtimeProvider` type extended to `"chatgpt" | "perplexity" | "gemini"`.
+  * CardDescription updated to describe both transports (WebRTC for ChatGPT/Perplexity, bidi for Gemini).
+  * Added a 3rd `ProviderButton` for Gemini in the provider radiogroup.
+  * Voice selector stays ChatGPT-only (Gemini has its own voice handling — server-side).
+  * Refactored `connect`/`teardown`/`disconnect` to dispatch:
+    - WebRTC path (existing logic moved into `connectWebRtc`): ChatGPT + Perplexity keep the SDP exchange flow with the data channel `oai-events`, `session.update` for ChatGPT voice config, hidden `<audio>` element for remote playback.
+    - Gemini bidi path (new `connectGemini`): creates a 16kHz `AudioContext`, `getUserMedia`, wires a `ScriptProcessorNode` (4096 samples at 16kHz = 256ms per callback) to push `Float32` → `Int16` PCM into a buffer, sets up:
+      1. POST `/api/gemini/connect { action: "start" }` → `{ gsessionid, sid, rid }` stored in `geminiSessionRef`.
+      2. `playPcmChunkRef.current(b64)` helper — decodes base64 PCM16 → Float32 → AudioBuffer → scheduled via `AudioBufferSourceNode` with `nextStartTime` chaining (no overlap/stutter).
+      3. `setInterval(200ms)` mic-flush loop — drains `micBufferRef` into a single base64 PCM and POSTs `/api/gemini/connect { action: "send", audio: b64, ... }`.
+      4. Recursive `pollOnce` long-poll loop — POSTs `/api/gemini/connect { action: "receive" }`, plays any `audioChunks` via `playPcmChunkRef`, logs `textChunks`, then `setTimeout(pollOnce, 100)` while `geminiSessionRef.current` is still set. `AbortController` cancels cleanly on teardown.
+    - Public `connect` dispatches to `connectWebRtc` or `connectGemini` based on `providerRef.current`.
+    - Public `disconnect` best-effort POSTs `/api/gemini/connect { action: "stop" }` for Gemini, then calls `teardown`.
+    - `teardown` cleans up BOTH the WebRTC resources (dc, pc, localStream) AND the Gemini resources (pollController abort, clearInterval, scriptNode disconnect, micStream stop, audioCtx close, geminiSession clear, micBuffer clear).
+    - `toggleMute` already works for both paths because both store the mic `MediaStream` in `localStreamRef` (the existing mute toggle just toggles `track.enabled`).
+  * New helper functions for PCM encode/decode: `float32ToInt16`, `int16ToBase64` (little-endian), `base64ToFloat32`. The Int16→base64 and base64→Float32 round-trip preserves the PCM16 sample values exactly (no resampling needed since the AudioContext is created at 16kHz; modern browsers honor the requested sample rate, and ScriptProcessor captures at the ctx rate).
+  * `webkitAudioContext` fallback included for Safari compatibility.
+
+- DEPLOYED the updated vault Worker via the Cloudflare API:
+  ```bash
+  PUT /accounts/{CF_ACCOUNT_ID}/workers/scripts/chatgpt-jwt-vault
+  multipart/form-data with metadata JSON (main_module, compatibility_date 2024-12-01, bindings: BACKEND_URL plain_text, JWT_VAULT kv_namespace id <redacted>, PROXY_SECRET secret_text <redacted>) + jwt-vault.js module part.
+  ```
+  Deployment id `<redacted>`. Edge propagation took ~20s; after that, all 4 Google endpoints responded correctly:
+  - `POST /google/cookies {"cookies":"SAPISID=TESTSAPISID; SID=TESTSID; __Secure-1PSID=TEST1PSID"}` → `{ok:true, cookieLength:58}`.
+  - `GET /google/cookies` → `{cookies, updatedAt, updatedAtHuman}`.
+  - `GET /health` now reports `hasGoogleCookies:true, googleCookieLength:58, googleUpdated:1790949659, googleUpdatedHuman:"2026-10-02T14:00:59.000Z"` (alongside the existing ChatGPT JWT + Perplexity cookies fields — no regression).
+  - `GET /` endpoints list now includes `/google/cookies`.
+  - `GET /jwt` still returns the live ChatGPT JWT (no regression).
+  - ChatGPT JWT preserved across the redeploy (the bindings stayed identical, so KV values weren't touched).
+
+- `bun run lint` → 0 errors / 0 warnings.
+- `bun run build` (timeout 120s) → ✓ compiled successfully in 12.7s. Route table now includes `ƒ /api/gemini/connect` alongside `/api/perplexity/connect` and `/api/realtime/connect`.
+- Dev server `POST /api/gemini/connect {action:"start"}` → 502 `Vault error: CHATGPT_VAULT_URL is not set` (expected locally — env not set in dev).
+- Dev server `POST /api/gemini/connect {action:"unknown"}` → 400 `Unknown action 'unknown'`. `{action:"send"}` without session → 400 `Missing 'gsessionid' or 'rid'`. `{action:"send", gsessionid, rid}` without audio/text → 400 `Send requires 'audio' or 'text'`. `{action:"stop"}` without session → 200 `{ok:true, message:"Nothing to stop."}`. All validation paths work.
+- Dev server `GET /` → 200 (page renders with all 3 provider buttons: "ChatGPT", "Perplexity", "Gemini" + "Realtime AI Voice" heading).
+
+- Committed locally as `f60268d`, rebased on top of `76ca77c` (a Perplexity-fix commit from another agent that landed while I was working — no conflicts, the rebase applied cleanly), and PUSHED to `origin/main` as `75370b4 feat: add Gemini Live as 3rd Realtime voice provider`. GitHub push succeeded this time (unlike Task 54 — the credentials from that task are now cached).
+
+Stage Summary:
+- Gemini Live added as the 3rd Realtime voice provider, end-to-end across all 4 layers:
+  1. **Backend** — new `src/app/api/gemini/connect/route.ts` (~520 lines). 4-action POST API (start/send/receive/stop) implementing Google's Web Channel bidi protocol with SAPISIDHASH auth computed fresh per request, the `$httpHeaders` URL-encoded query param, two-tier transport (curl-impersonate + node:https with optional proxy list), and permissive JSON+protobuf chunk parsing that recurses through the deeply-nested `serverContent`/`modelTurn`/`candidates`/`parts` structure.
+  2. **Vault Worker** — `cloudflare-worker/jwt-vault.js` extended with `KV_GOOGLE_COOKIES` + `KV_GOOGLE_UPDATED`, `GET/POST /google/cookies` endpoints, `/health` extension. Redeployed to production via the Cloudflare API; verified live (Google cookies stored + retrieved, ChatGPT JWT + Perplexity cookies + multi-account pool + refresh daemon all preserved, no regression).
+  3. **Chrome extension** — `tools/chrome-extension/background.js` extended with `refreshGoogleCookies()` that reads `.google.com` cookies via `chrome.cookies.getAll`, validates the SAPISID family is present, and POSTs to the vault. Triggered on install + startup + 2h alarm + toolbar click alongside the existing ChatGPT JWT + Perplexity cookie refreshes. 3-state badge (OK / OK* / ERR) reflects partial failure gracefully. `manifest.json` adds `.google.com` + `google.com` host permissions and bumps to v1.2.0.
+  4. **Frontend** — `RealtimeChat` component in `src/app/page.tsx` extended with a 3rd provider button (Gemini), a parallel bidi connect path (`connectGemini`) using a 16kHz `AudioContext` + `ScriptProcessorNode` for mic PCM16 capture + `AudioBufferSourceNode` for AI playback, a 200ms mic-flush loop that POSTs base64 PCM to `/api/gemini/connect {action:"send"}`, and a recursive long-poll loop that POSTs `{action:"receive"}` and plays the returned audio chunks. Voice selector stays ChatGPT-only (Gemini has server-side voice handling). Shared mute toggle + teardown work across both paths.
+- Lint 0/0, build ✓ (route table includes `/api/gemini/connect`), vault redeploy ✓ and verified live, GitHub push ✓ (`75370b4` on `origin/main`).
+- ⚠️ Three operational caveats the user must know:
+  1. **GEMINI_API_KEY env var NOT set on Vercel** — the Gemini route reads `process.env.GEMINI_API_KEY` to populate the `X-Goog-Api-Key` header. The user's task specified the API key `AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs`. The user needs to set this as a Vercel project env var (same way they previously set `CHATGPT_VAULT_URL` and `CHATGPT_VAULT_SECRET`). Without it, the route returns 500 `GEMINI_API_KEY is not set on the server.`
+  2. **Bidi protocol envelope is approximate** — Google's Web Channel bidi protocol is complex and I implemented the request envelope shape (`count=N&ofs=N&reqN__sc=C&reqN_type=bidiGenerateContent&reqN_data=<JSON>`) + the standard Gemini Live API payload (`setup` / `clientContent { input: { parts: [...] }, turnComplete }`). The actual Google AI Studio on-wire format may include additional Web Channel framing (specific `__sc` codes, sub-stream indices, the `WCESID` envelope, etc.) that I couldn't fully reverse-engineer from the user's network capture alone. The chunk parser is deliberately permissive (recursive walk through nested objects) so it will extract any `inlineData.data` (base64 PCM) or `text` fields regardless of the exact nesting. **First run against the live endpoint may need iteration** on the bidi payload format — but the session creation + basic structure are in place, and the user explicitly said "if the full bidi flow is too difficult, implement at minimum the session creation + basic text interaction. The audio streaming can be added later."
+  3. **Vault currently holds a TEST cookie** (`SAPISID=TESTSAPISID; SID=TESTSID; __Secure-1PSID=TEST1PSID`) that I stored to verify the endpoints. The user's Chrome extension will overwrite it with real cookies on first run (as long as they're logged in to aistudio.google.com). The test cookie's SAPISID value won't authenticate against Google (it's a fake) — the route will return 502 with the Google response body until the user's real cookies land in the vault.
+- Files created/modified: `src/app/api/gemini/connect/route.ts` (new), `cloudflare-worker/jwt-vault.js` (modified — Google cookie endpoints added + redeployed), `tools/chrome-extension/manifest.json` (modified — google.com host permissions + version bump), `tools/chrome-extension/background.js` (modified — refreshGoogleCookies added), `src/app/page.tsx` (modified — Gemini provider button + bidi connect path + PCM encode/decode helpers).
