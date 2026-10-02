@@ -66,12 +66,13 @@ model Track {
 // provider="ace", boppy.ts uses aceToken to call acem-api.acemusic.ai +
 // ai-api.acemusic.ai endpoints.
 model AppSettings {
-  id           String   @id @default("singleton")
-  relayUrl     String?
-  relaySecret  String?
-  apiBaseUrl   String?
-  fireproxUrl  String?
-  provider     String?  // "boppy" (default) | "ace"
-  aceToken     String?  // Bearer token for acemusic.ai (stored DB-only)
-  updatedAt    DateTime @updatedAt
+  id              String   @id @default("singleton")
+  relayUrl        String?
+  relaySecret     String?
+  apiBaseUrl      String?
+  fireproxUrl     String?
+  provider        String?  // "boppy" (default) | "ace"
+  aceToken        String?  // Bearer token for acemusic.ai (stored DB-only)
+  qwenAccessToken String?  // JWT access_token for chat.qwen.ai (Qwen Voice). Expires ~15min. Set via PUT /api/qwen/token.
+  updatedAt       DateTime @updatedAt
 }

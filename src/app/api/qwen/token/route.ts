@@ -32,6 +32,7 @@
  */
 
 import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -58,11 +59,38 @@ function randomUuid(): string {
     .join("")}-${h.slice(10, 16).join("")}`;
 }
 
-/** Resolve the Qwen access_token from the env (future: vault fallback). */
-function resolveAccessToken(): string | null {
+/** Decode a JWT payload (base64url) → object. Returns null on failure. */
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    // base64url → base64 (replace -_ with +/, add padding).
+    let b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4 !== 0) b64 += "=";
+    // Use Buffer (Node.js) — atob may not be available in all runtimes.
+    const json = Buffer.from(b64, "base64").toString("utf-8");
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve the Qwen access_token — DB first (set via PUT /api/qwen/token),
+ *  then env var fallback. The DB path lets the user set a fresh token
+ *  without restarting the server (the token expires every ~15 min). */
+async function resolveAccessToken(): Promise<string | null> {
+  // 1. Try the DB (AppSettings.qwenAccessToken — set via PUT /api/qwen/token).
+  try {
+    const settings = await db.appSettings.findUnique({ where: { id: "singleton" } });
+    const dbToken = (settings?.qwenAccessToken ?? "").trim();
+    if (dbToken) return dbToken;
+  } catch (err) {
+    console.warn("[qwen] DB read failed, falling back to env:", (err as Error).message);
+  }
+  // 2. Fall back to the env var.
   const envToken = (process.env.QWEN_ACCESS_TOKEN ?? "").trim();
   if (envToken) return envToken;
-  // Future: vault Worker fallback (same pattern as Inworld/Perplexity).
+  // 3. Future: vault Worker fallback (same pattern as Inworld/Perplexity).
   return null;
 }
 
@@ -85,8 +113,8 @@ export async function POST(req: Request) {
     );
   }
 
-  // 2. Resolve the Qwen access_token.
-  const accessToken = resolveAccessToken();
+  // 2. Resolve the Qwen access_token (DB first, then env var).
+  const accessToken = await resolveAccessToken();
   if (!accessToken) {
     return NextResponse.json(
       {
@@ -202,13 +230,118 @@ export async function POST(req: Request) {
 
 /** GET — quick health-check endpoint (returns the token status without
  *  exposing the token itself). Useful for the frontend to show whether
- *  Qwen is configured before the user clicks Connect. */
+ *  Qwen is configured before the user clicks Connect. Also decodes the
+ *  JWT exp to tell the user when the token expires. */
 export async function GET() {
-  const accessToken = resolveAccessToken();
+  const accessToken = await resolveAccessToken();
+  // Decode the JWT exp (if it's a valid JWT) to show the expiry time.
+  let exp: number | null = null;
+  let expired = false;
+  if (accessToken) {
+    const decoded = decodeJwtPayload(accessToken);
+    if (decoded && typeof decoded.exp === "number") {
+      exp = decoded.exp;
+      expired = Date.now() / 1000 > decoded.exp;
+    }
+  }
   return NextResponse.json({
-    ok: !!accessToken,
+    ok: !!accessToken && !expired,
     configured: !!accessToken,
-    source: "env",
+    source: accessToken ? (await db.appSettings.findUnique({ where: { id: "singleton" } }))?.qwenAccessToken ? "db" : "env" : null,
     tokenMasked: accessToken ? `${accessToken.slice(0, 12)}…${accessToken.slice(-4)}` : null,
+    exp,
+    expired,
   });
+}
+
+/** PUT — store a fresh Qwen access_token in the DB (AppSettings).
+ *  The token is a JWT that expires ~15 min after issuance. The user
+ *  can set a fresh token by calling:
+ *
+ *    curl -X PUT http://localhost:3000/api/qwen/token \
+ *      -H "Content-Type: application/json" \
+ *      -d '{"token":"eyJhbGci..."}'
+ *
+ *  No restart needed — the next POST /api/qwen/token (SDP exchange)
+ *  will pick up the new token from the DB.
+ *
+ *  Body: `{ token: string }` — the JWT from chat.qwen.ai's
+ *  `Authorization: Bearer <token>` header.
+ *
+ *  Returns: `{ ok: true, tokenMasked: string, exp: number, expired: boolean }`. */
+export async function PUT(req: Request) {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  }
+  const token =
+    typeof (body as Record<string, unknown>)?.token === "string"
+      ? ((body as Record<string, unknown>).token as string).trim()
+      : "";
+  if (!token || token.length < 50) {
+    return NextResponse.json(
+      { error: "Missing or invalid 'token' (must be a non-empty JWT string)." },
+      { status: 400 },
+    );
+  }
+
+  // Decode the JWT exp to validate + show the expiry.
+  let exp: number | null = null;
+  let expired = false;
+  const decoded = decodeJwtPayload(token);
+  if (decoded) {
+    if (decoded.type !== "access_token") {
+      return NextResponse.json(
+        { error: `Token type is "${decoded.type ?? "?"}", expected "access_token". Did you paste the refresh_token by mistake?` },
+        { status: 400 },
+      );
+    }
+    if (typeof decoded.exp === "number") {
+      exp = decoded.exp;
+      expired = Date.now() / 1000 > decoded.exp;
+    }
+  }
+  // If decodeJwtPayload returned null, the token is not a valid JWT — accept
+  // anyway (the Qwen backend will reject it if invalid).
+
+  // Upsert the token in the AppSettings singleton.
+  try {
+    await db.appSettings.upsert({
+      where: { id: "singleton" },
+      update: { qwenAccessToken: token },
+      create: { id: "singleton", qwenAccessToken: token },
+    });
+  } catch (err) {
+    return NextResponse.json(
+      { error: `Failed to store token in DB: ${(err as Error).message}` },
+      { status: 500 },
+    );
+  }
+
+  return NextResponse.json({
+    ok: !expired,
+    tokenMasked: `${token.slice(0, 12)}…${token.slice(-4)}`,
+    exp,
+    expired,
+    warning: expired
+      ? "Token is already expired. Get a fresh one from chat.qwen.ai → DevTools → Network → Authorization: Bearer."
+      : exp
+      ? `Token expires at ${new Date(exp * 1000).toISOString()} (in ${Math.round((exp - Date.now() / 1000) / 60)} min).`
+      : undefined,
+  });
+}
+
+/** DELETE — clear the stored Qwen access_token from the DB. */
+export async function DELETE() {
+  try {
+    await db.appSettings.update({
+      where: { id: "singleton" },
+      data: { qwenAccessToken: null },
+    });
+  } catch {
+    // If the singleton doesn't exist yet, there's nothing to clear.
+  }
+  return NextResponse.json({ ok: true, cleared: true });
 }
