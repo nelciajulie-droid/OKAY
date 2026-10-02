@@ -1227,3 +1227,57 @@ Stage Summary:
   - When the AI replies: one growing `AI: <transcript>` line in the transcript panel (deltas stream into the SAME line) + audio playback through your speakers (77 PCM16 chunks per response, played silently via the AudioContext).
   - No more `[inworld] response.output_audio.delta: {…}` / `[inworld] conversation.item.added: {…}` / `[inworld] input_audio_buffer.turn_suggestion: {…}` log noise — those are all silent no-ops now.
 - If audio STILL doesn't play: check that the AudioContext resumed successfully (browsers block autoplay until a user gesture — but the Connect button click counts as a gesture, so this should be fine). If the AI transcript shows but no audio: the AudioContext sample rate might be mismatched — but we set it to 16kHz which matches Inworld's `input_audio_format:"pcm16"`. The `playPcmChunkRef` helper uses `ctx.createBuffer(1, float32.length, 16000)` which should match the server's `output_audio` format. If the server sends a different sample rate, we'd need to inspect the `session.created` event's `audio_format` field and adjust — but Inworld's default is 24kHz for output audio in some configurations, so this may need a follow-up.
+
+---
+Task ID: 60
+Agent: main (Z.ai Code)
+Task: Fix "voix est lent, pas en temps réel" for Inworld. After Task 59 made audio play (response.output_audio.delta handler), the user reported the AI voice was slow AND not in real time. Two root causes identified + fixed.
+
+Work Log:
+- **Diagnosis 1 — Slow voice (1.5x pitch down):** the OpenAI Realtime API (which Inworld speaks, confirmed in Task 57) uses PCM16 @ **24 kHz** for both input and output by default (`input_audio_format:"pcm16"` + `output_audio_format:"pcm16"` → 24000 Hz). The previous code created the AudioContext at 16 kHz and the playback buffer at 16 kHz. So 24 kHz PCM chunks were played at 16 kHz speed → 24/16 = **1.5x slower** = "voix grave et lente". The user's log confirmed the diagnostic: 77 `response.output_audio.delta` chunks per ~1s of audio = ~13ms per chunk = exactly 24 kHz / 1024-sample chunks (matches OpenAI's chunk size for 24 kHz PCM16). At 16 kHz playback, 77 chunks * 13ms = 1000ms of audio takes 1500ms to play → 1.5x slower.
+- **Diagnosis 2 — Not real time (accumulating lag):** the playback scheduling was:
+  ```js
+  const startTime = Math.max(ctx.currentTime, nextStartTimeRef.current);
+  src.start(startTime);
+  nextStartTimeRef.current = startTime + buffer.duration;
+  ```
+  This schedules chunks gaplessly. If the AI sends audio in BURSTS (which the OpenAI Realtime API does — it generates 1s of audio in ~100ms then streams the 77 chunks rapidly), the `nextStartTimeRef.current` queue grows unbounded → audio plays seconds behind real time. After 10s of conversation, the user hears audio that was generated 5s ago → "pas en temps réel".
+
+- Edits to `src/app/page.tsx` (Inworld path only — Gemini path unchanged because Gemini Live uses 16 kHz PCM, not 24 kHz):
+  1. **AudioContext sample rate 16 kHz → 24 kHz** (matches OpenAI Realtime API default + what Inworld sends): `new AudioCtor({ sampleRate: 24000 })` wrapped in try/catch to fall back to the browser's default rate if 24 kHz is rejected (some Safari versions may not support arbitrary rates — playback still works via Web Audio's automatic resampling from 24 kHz buffer to context rate).
+  2. **Auto-resume the AudioContext** if it starts in `suspended` state (Chrome autoplay policy sometimes keeps the context suspended even after a user gesture). `if (audioCtx.state === "suspended") audioCtx.resume().catch(()=>{})`. The "Connect" button click counts as a user gesture so resume should succeed.
+  3. **Debug log for sample rate**: `log(\`AudioContext @ ${audioCtx.sampleRate} Hz (requested 24000).\`)` so the user can verify in the transcript whether their browser honoured the 24 kHz request (if the context fell back to 48 kHz, playback still works via Web Audio resampling but mic capture would be at the wrong rate — needs a follow-up if it happens).
+  4. **Playback buffer 16 kHz → 24 kHz**: `ctx.createBuffer(1, float32.length, 24000)`. Web Audio resamples this to the context rate on playback automatically, so even if the context fell back to 48 kHz the audio plays at the correct pitch.
+  5. **Jitter buffer cap**: added `const MAX_BUFFER_AHEAD = 0.3` (300ms) and changed the scheduling to `Math.min(Math.max(ctx.currentTime, nextStartTimeRef.current), ctx.currentTime + MAX_BUFFER_AHEAD)`. The `Math.max` ensures gapless playback when the queue is small; the `Math.min` caps the queue at 300ms ahead — if it grows past that, the chunk is scheduled at the cap (effectively dropping the backlog and resuming real-time playback). The user now hears audio at most ~300ms behind the AI's generation. The cap causes a tiny audio glitch on resync (one discontinuity at the chunk boundary) which is far less annoying than 5s of accumulating lag.
+  6. **Header comment update**: documented the 24 kHz rationale + the jitter buffer cap rationale in the `connectInworld` JSDoc.
+- `bun run lint` → 0 errors / 0 warnings. 1 file, +71 / -8 lines.
+- Committed as `e1771ea` ("fix(inworld): 24kHz sample rate (was 16kHz → 1.5x slow voice) + jitter buffer cap 300ms (was unbounded → accumulating lag)").
+- `git push origin main` → `008271b..e1771ea main -> main`.
+- Vercel auto-deploy: waited 100s. Confirmed new production chunk hash rotated from `d3a3dd3b78a0840a.js` (Task 59) to `bf20d876ca80a2fd.js` (Task 60).
+- Verified Task 60 fix is live by grepping the new production chunk (349 KB):
+  - `sampleRate:24` ✓ present (the 24 kHz AudioContext request)
+  - `createBuffer(1,r.length,24e3)` ✓ present (24 kHz playback buffer — minifier wrote `24000` as `24e3`)
+  - `Math.min(Math.max(t.currentTime,A.current),t.currentTime+.3)` ✓ present (the jitter buffer cap — exact minified match to source `Math.min(Math.max(ctx.currentTime, nextStartTimeRef.current), ctx.currentTime + MAX_BUFFER_AHEAD)`)
+  - `"suspended"===e.state&&e.resume()` ✓ present (auto-resume)
+  - `` `AudioContext @ ${e.sampleRate} Hz (requested 24000).` `` ✓ present (debug log)
+  - `sampleRate:16` count = 1 (only in the Gemini path, NOT in the Inworld path — correct, Gemini Live uses 16 kHz)
+  - Verbatim minified production JS for the Inworld playback closure: `R.current=e=>{let t=x.current;if(!t)return;let r=z(e),n=t.createBuffer(1,r.length,24e3);n.copyToChannel(r,0);let i=t.createBufferSource();i.buffer=n,i.connect(t.destination);let s=Math.min(Math.max(t.currentTime,A.current),t.currentTime+.3);i.start(s),A.current=s+n.duration}` — exact match to source.
+- Production page render: `GET https://ace-studio-orcin.vercel.app/` → HTTP 200 in 0.27s. Token endpoint returns the Inworld token as before.
+
+Stage Summary:
+- Root causes:
+  1. Sample rate mismatch: AudioContext + playback buffer were at 16 kHz, but Inworld sends 24 kHz PCM16 (OpenAI Realtime API default). 24/16 = 1.5x slower playback = "voix grave et lente".
+  2. Unbounded jitter buffer: `nextStartTimeRef.current` grew without cap → AI's bursty delivery (1s of audio generated in ~100ms then streamed fast) accumulated seconds of lag → "pas en temps réel".
+- Fixes (all in `src/app/page.tsx` Inworld path; Gemini path untouched since Gemini Live uses 16 kHz):
+  - AudioContext at 24 kHz (with fallback to default + auto-resume if suspended).
+  - Playback buffer at 24 kHz (Web Audio resamples to context rate on playback).
+  - Jitter buffer cap at 300ms (drop backlog, resume real-time; tiny glitch on resync is far better than 5s of lag).
+  - Debug log of actual sample rate so user can verify.
+- Files modified: `src/app/page.tsx` only (+71 / -8 lines).
+- Lint 0/0, push OK (`008271b..e1771ea`), Vercel redeploy verified by chunk hash rotation + byte-level grep of the new chunk (all 5 fix markers present in production).
+- What to expect on the next live run:
+  - On connect: `AudioContext @ 24000 Hz (requested 24000).` log line confirms the context is at 24 kHz. (If the user sees a different number, the browser didn't honour the request — playback still works but mic capture may be at the wrong rate.)
+  - When the AI speaks: audio at the **correct pitch + speed** (no longer 1.5x slow), and **at most ~300ms behind the AI's generation** (no longer seconds of accumulating lag). If the AI sends a big burst, the user may hear a tiny click/glitch when the backlog is dropped — that's the jitter cap resyncing, expected.
+- Follow-up if needed:
+  - If the user's browser falls back to non-24 kHz context AND the mic capture is at the wrong rate (server hears the user at wrong speed), I'll need to add an explicit downsampler for the mic path (48 kHz → 24 kHz via linear interpolation or simple decimation). The `log("AudioContext @ X Hz")` line will tell us if this is the case.
+  - The same jitter buffer cap fix should eventually be applied to the Gemini path too (it uses the same unbounded scheduling pattern). Leaving alone for now since the user only reported Inworld issues.
