@@ -418,6 +418,13 @@ function RealtimeChat() {
    *  we clear the AI's audio queue so the user can interrupt). Matches
    *  the Inworld playground's `o.current` source-tracking pattern. */
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  /** Whether we're currently in a user speech (between speech_started and
+   *  the next speech_started). Used to collapse all user transcription
+   *  deltas + completed events into ONE growing "You:" line per speech
+   *  — matches the Inworld playground's `userTranscriptItemId.current`
+   *  pattern. Reset to false on `speech_started` so the next speech
+   *  creates a fresh "You:" line. */
+  const inUserSpeechRef = useRef<boolean>(false);
   /** Clear all active audio playback (barge-in). Stops every scheduled
    *  AudioBufferSourceNode and resets `nextStartTimeRef` to "now" so the
    *  next AI response starts fresh. Used on `input_audio_buffer.speech_started`
@@ -429,6 +436,31 @@ function RealtimeChat() {
     activeSourcesRef.current.clear();
     const ctx = audioCtxRef.current;
     if (ctx) nextStartTimeRef.current = ctx.currentTime;
+  }, []);
+  /** Upsert the user's "You:" transcript line. If we're in a user speech
+   *  AND the last transcript line is a "You:" line, UPDATE it (replace the
+   *  content — each delta is the FULL current transcription, not a chunk
+   *  to append, per the OpenAI Realtime API + Inworld playground behavior).
+   *  Otherwise, create a new "You:" line + mark `inUserSpeechRef = true`.
+   *  This collapses all deltas + completed events for one speech into ONE
+   *  line (fixes the "parle en plusieurs audio" / multiple-You: bug). */
+  const upsertUserLine = useCallback((text: string) => {
+    if (!text) return;
+    const prefix = `[${new Date().toLocaleTimeString()}] You:`;
+    setTranscript((prev) => {
+      const next = [...prev];
+      const last = next[next.length - 1] ?? "";
+      if (inUserSpeechRef.current && last.includes("] You:")) {
+        // UPDATE: replace the content (delta/completed carries the full
+        // current transcription, so REPLACE not append).
+        next[next.length - 1] = `${prefix} ${text}`;
+      } else {
+        // CREATE new line + mark as in-speech.
+        next.push(`${prefix} ${text}`);
+        inUserSpeechRef.current = true;
+      }
+      return next.slice(-200);
+    });
   }, []);
 
   /** Convert a Float32 PCM buffer to PCM16 (Int16) little-endian. */
@@ -1061,14 +1093,19 @@ function RealtimeChat() {
           break;
         }
         // --- User mic transcript (server-side transcription) ---
+        // Both `.delta` and `.completed` UPDATE the same "You:" line via
+        // `upsertUserLine` (collapses all deltas + completed events for
+        // one speech into ONE growing line — fixes the multiple-You:
+        // bug the user reported in Task 62). `inUserSpeechRef` is reset
+        // on `speech_started` so the next speech creates a fresh line.
         case "conversation.item.input_audio_transcription.completed": {
           const t = (msg.transcript as string) ?? (msg.text as string) ?? "";
-          if (t) log(`You: ${t}`);
+          upsertUserLine(t);
           break;
         }
         case "conversation.item.input_audio_transcription.delta": {
           const d = (msg.delta as string) ?? "";
-          if (d) log(`You: ${d}`);
+          upsertUserLine(d);
           break;
         }
         // --- Server-side VAD (voice activity detection) state ---
@@ -1079,6 +1116,10 @@ function RealtimeChat() {
           // behavior (stops all active AudioBufferSourceNodes + resets
           // nextStartTime so the next AI response starts fresh).
           clearAudioQueue();
+          // Reset the user speech tracking so the next transcription
+          // creates a FRESH "You:" line (don't append to the previous
+          // speech's line).
+          inUserSpeechRef.current = false;
           log("[inworld] speech started");
           break;
         }
