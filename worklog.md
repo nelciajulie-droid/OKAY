@@ -1555,3 +1555,67 @@ Stage Summary:
   1. **Vault Worker `GET /qwen/token` endpoint** — let the user set the QWEN_ACCESS_TOKEN via the vault Worker (same KV store as Inworld/Perplexity) without a re-deploy. The vault Worker code (`cloudflare-worker/jwt-vault.js`) needs new `qwen_token` + `qwen_updated` KV keys + new `GET/POST /qwen/token` routes (same pattern as Inworld — Task 56). NOT implemented in this task.
   2. **Token refresh** — the Qwen access_token is a JWT that expires ~24h after issuance. The user must manually refresh it (re-login to chat.qwen.ai + capture a new token). A Chrome extension similar to the ChatGPT one could auto-refresh the token using the `refresh_token` (POST to chat.qwen.ai/api/v1/auths/refresh with the refresh_token, get a new access_token). NOT implemented in this task — the refresh_token flow is undocumented + may have rate limits.
   3. **Voice selection** — the current implementation hardcodes voice "Tina". The Qwen web client fetches the list of available voices from `GET https://chat.qwen.ai/api/v2/tts/config?omni_speakers=v1&audio_tts_speakers=v1&omni_language=v1&audio_tts_language=v1` + lets the user pick. Adding a voice selector for Qwen (similar to the ChatGPT voice selector) is a follow-up — needs a new backend route to fetch + cache the voice list (the route would forward the request to chat.qwen.ai with the Bearer token).
+
+---
+Task ID: 65
+Agent: main (Z.ai Code)
+Task: Fix "Backend 500: QWEN_ACCESS_TOKEN is not set" — the user tried Qwen Voice in the Preview Panel and got the expected 500 error because the env var wasn't set. The token the user pasted in chat was a JWT with 15-minute validity (exp: 1790963250 = 2026-10-02 17:47:30 UTC, iat: 1790962350 = 17:32:30 UTC) — already expired by the time I checked. The refresh_token (in the user's cookies) is valid for 30 days (exp: 1793554350 = Nov 1, 2026) but the refresh endpoint (`GET /api/v2/auths/refresh` with the `refresh_token` cookie) returns `{success: false, code: "not found"}` from the backend because the `acw_tc` cookie is IP-bound (same anti-bot problem as Perplexity). So I implemented a DB-stored token approach with a PUT endpoint for easy refresh without server restart.
+
+Work Log:
+- Decoded the user's access_token JWT: `{id: "d6168114-...", type: "access_token", exp: 1790963250, iat: 1790962350}` — valid for 15 minutes only. Expired 7.6 minutes before I checked.
+- Decoded the refresh_token JWT: `{id: "d6168114-...", jti: "71ef797e-...", type: "refresh_token", exp: 1793554350, iat: 1790962350}` — valid for 30 days.
+- Investigated the auto-refresh approach by fetching + analyzing the Qwen main.js bundle (1.9 MB):
+  - Found the refresh function: `cK("/auths/refresh", {baseURL: dn, method: "GET", toast: e, withCredentials: true, nonV1APi: true})`
+  - `withCredentials: true` means it sends cookies (including `refresh_token`).
+  - `nonV1APi: true` means the base URL is NOT `chat.qwen.ai/api/v1` — it's `chat.qwen.ai` directly (no `/api/v1` prefix).
+  - The response has `r.data.access_token` on success.
+- Tested the refresh endpoint from the backend:
+  - `GET https://chat.qwen.ai/api/v2/auths/refresh` with the `refresh_token` cookie → `{success: false, data: {code: "not found", details: "Not Found"}}` (HTTP 200 but the API returned "not found").
+  - `GET https://chat.qwen.ai/auths/refresh` → returned the SPA HTML (not the API).
+  - `GET https://chat.qwen.ai/api/v2/auths/refresh` with ALL the user's cookies (including `acw_tc`, `cna`, `aui`, etc.) → still `{success: false, code: "not found"}`.
+  - CONCLUSION: the `acw_tc` cookie is IP-bound (anti-bot protection) — the refresh endpoint rejects requests from IPs that didn't solve the original challenge. The auto-refresh approach won't work from the backend (same Cloudflare/anti-bot problem as Perplexity). The user would need a Chrome extension (like the ChatGPT one) that auto-refreshes from the user's browser.
+- Implemented the DB-stored token approach instead:
+  1. Added `qwenAccessToken String?` field to the `AppSettings` Prisma model.
+  2. Ran `bun run db:push` → Prisma Client regenerated with the new field.
+  3. Modified `resolveAccessToken()` in `src/app/api/qwen/token/route.ts` to read from the DB first (AppSettings.qwenAccessToken), then fall back to `process.env.QWEN_ACCESS_TOKEN`. Made it async (was sync).
+  4. Added a `PUT /api/qwen/token` endpoint that accepts `{token: string}` and upserts it into AppSettings.qwenAccessToken. No server restart needed — the next POST /api/qwen/token (SDP exchange) picks up the new token from the DB. Also decodes the JWT to validate the `type` is "access_token" (rejects refresh_token by mistake) + shows the `exp` + `expired` status.
+  5. Added a `DELETE /api/qwen/token` endpoint to clear the stored token.
+  6. Updated the `GET /api/qwen/token` health-check to decode the JWT exp + report `expired: true/false` + `source: "db" | "env" | null`.
+  7. Added a `decodeJwtPayload()` helper using `Buffer.from(b64, "base64")` (not `atob` — atob may not be available in all Node.js runtimes; Buffer is reliable).
+- Restarted the dev server to pick up the new Prisma Client (the old compiled client didn't know about `qwenAccessToken`). Killed the old process + started fresh with `nohup bun run dev > dev.log 2>&1 &`.
+- Tested locally:
+  - `PUT http://localhost:3000/api/qwen/token -d '{"token":"<expired JWT>"}'` → `{ok: false, tokenMasked: "eyJhbGciOiJI…9HuY", exp: 1790963250, expired: true, warning: "Token is already expired..."}` ✓ (token stored, expiry detected).
+  - `GET http://localhost:3000/api/qwen/token` → `{ok: false, configured: true, source: "db", tokenMasked: "eyJhbGciOiJI…9HuY", exp: 1790963250, expired: true}` ✓ (token read back from DB, expiry reported).
+  - `POST http://localhost:3000/api/qwen/token` (SDP exchange) → would return 401 from Qwen (token expired) — but the backend route now reaches Qwen instead of returning "QWEN_ACCESS_TOKEN is not set".
+- `bun run lint` → 0 errors / 0 warnings.
+- Committed as `dfeff90` ("feat(qwen): DB-stored access_token (AppSettings.qwenAccessToken) + PUT/DELETE /api/qwen/token — set/refresh token without server restart (JWT expires ~15min)") — 3 files (schema.prisma, route.ts, custom.db), +151 / -17.
+- `git push origin main` → `2586e63..dfeff90 main -> main`.
+- Vercel auto-deploy: waited 100s. Verified:
+  - `GET https://ace-studio-orcin.vercel.app/` → HTTP 200 in 0.79s ✓.
+  - `GET https://ace-studio-orcin.vercel.app/api/qwen/token` → `{ok: false, configured: false, source: null, tokenMasked: null, exp: null, expired: false}` ✓ (expected — no token set on Vercel yet. The DB on Vercel is Neon Postgres, separate from the local SQLite).
+
+Stage Summary:
+- Root cause: the user's Qwen access_token JWT was expired (15-minute validity). The auto-refresh approach from the backend fails because the `acw_tc` anti-bot cookie is IP-bound.
+- Solution: DB-stored token with a PUT endpoint for easy refresh:
+  - New `qwenAccessToken` field in the AppSettings Prisma model.
+  - `resolveAccessToken()` reads from DB first, then env var — no restart needed when the token is refreshed.
+  - `PUT /api/qwen/token {token}` — stores a fresh token. Decodes the JWT to validate `type: "access_token"` (rejects refresh_token by mistake) + reports `exp` + `expired`.
+  - `GET /api/qwen/token` — health-check with `expired: true/false` + `source: "db" | "env"`.
+  - `DELETE /api/qwen/token` — clears the token.
+- Files modified: `prisma/schema.prisma` (+1 line for `qwenAccessToken`), `src/app/api/qwen/token/route.ts` (+131 / -17 lines for DB resolution + PUT/DELETE + JWT decoding).
+- Lint 0/0, push OK (`2586e63..dfeff90`), Vercel redeploy verified by HTTP 200 + health-check returning the expected `{ok: false, configured: false}` shape.
+- What the user needs to do to test Qwen Voice:
+  1. Get a FRESH access_token from chat.qwen.ai (the one they pasted is expired):
+     - Open chat.qwen.ai in the browser (make sure you're logged in).
+     - Open DevTools → Network → find any `/api/v2/*` request.
+     - Copy the `Authorization: Bearer <token>` value (the `eyJhbGci...` part).
+  2. Set the token via curl (choose the deployment you're testing):
+     - Local dev (Preview Panel): `curl -X PUT http://localhost:3000/api/qwen/token -H "Content-Type: application/json" -d '{"token":"eyJhbGci..."}'`
+     - Vercel prod: `curl -X PUT https://ace-studio-orcin.vercel.app/api/qwen/token -H "Content-Type: application/json" -d '{"token":"eyJhbGci..."}'`
+  3. The response will show `{ok: true, exp: ..., expired: false, warning: "Token expires at ... (in ~15 min)."}`.
+  4. Click "Qwen" in the Preview Panel + "Connect" — the WebRTC SDP exchange will use the stored token.
+  5. The token expires every ~15 minutes. When it expires, repeat steps 1-2 with a fresh token. The `GET /api/qwen/token` health-check will show `expired: true` to warn the user.
+- Follow-ups:
+  1. **Chrome extension for auto-refresh** — a Manifest V3 service worker (like the ChatGPT one) that polls chat.qwen.ai from the user's browser every ~10 min, gets a fresh access_token via the `/api/v2/auths/refresh` endpoint (with the user's IP-bound cookies), and PUTs it to `/api/qwen/token`. This would make the token auto-refresh without manual intervention. NOT implemented in this task — needs the Chrome extension infrastructure (similar to `tools/chrome-extension/`).
+  2. **Settings UI for Qwen token** — a text input in the Settings dialog where the user can paste the token directly (stored via PUT /api/qwen/token). Currently the user needs to use curl. NOT implemented — the realtime providers don't have a Settings UI yet (they use env vars or the vault Worker).
+  3. **Token expiry warning in the UI** — the frontend could poll `GET /api/qwen/token` every 30s and show a "Qwen token expires in X min" warning badge when `exp - now < 5min`. NOT implemented.
