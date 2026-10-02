@@ -1494,3 +1494,64 @@ Stage Summary:
   - Inworld accepts the upgrade (Origin matches).
   - Proxy pipes frames bidirectionally → user gets audio + transcripts as before, but now the connection actually opens (no more "Origin may be rejected" error).
 - The proxy must be running for the Inworld connection to work. Start it with: `cd mini-services/inworld-proxy && bun run dev` (or `nohup bun run dev > /tmp/inworld-proxy.log 2>&1 &` for background).
+
+---
+Task ID: 64
+Agent: main (Z.ai Code)
+Task: Add Qwen Voice (qwen3.8-omni-flash-realtime) as the 5th realtime provider, alongside ChatGPT, Perplexity, Gemini, and Inworld. The user provided captured network requests from chat.qwen.ai showing the architecture: WebRTC via Aliyun Bailian + OpenAI Realtime API events over a DataChannel named "oai-events" (same as ChatGPT). Auth is `Bearer <QWEN_ACCESS_TOKEN>` (the chat.qwen.ai JWT). The token endpoint is `POST https://chat.qwen.ai/api/v2/users/user/audio_chat_token` with body `{ sdp, client_info }`, returns `{ data: { sdp_token: "<answer SDP>" } }`.
+
+Work Log:
+- SECURITY: the user pasted live Qwen credentials in the chat (access_token JWT, refresh_token JWT, session cookies). I did NOT hard-code them — the token is resolved from `process.env.QWEN_ACCESS_TOKEN` at runtime (same pattern as the other providers). Recommended the user revoke the leaked refresh_token.
+- Reverse-engineered the Qwen Voice architecture by fetching + analyzing the Qwen web client's JS bundle:
+  - `https://assets.alicdn.com/g/qwenweb/qwen-chat-fe/0.3.12/js/qwen-chat-omni-sdk-vendor-DVoDTvDO.js` (56 KB) — the Qwen Omni SDK wrapper.
+  - `https://assets.alicdn.com/g/qwenweb/qwen-chat-fe/0.3.12/js/main.js` (1.9 MB) — the Qwen web client main bundle.
+  - Found the key API: `RTCPeerConnection` + `addTransceiver("audio")` + `createDataChannel("oai-events")` + `createOffer` + `setLocalDescription` → POST to `/users/user/audio_chat_token` → `setRemoteDescription({type: "answer", sdp: sdpToken})`. The DataChannel carries OpenAI Realtime API events (session.created, input_audio_buffer.*, response.output_audio_transcript.delta, etc.).
+  - The user's captured telemetry URL confirmed the session.created payload: `{ type:"session.created", session:{ input_audio_format:"pcm", output_audio_format:"pcm", modalities:["text","audio"], model:"qwen3.8-omni-flash-realtime", voice:"Tina", turn_detection:{silence_duration_ms:800, create_response:true, type:"server_vad", interrupt_response:true, prefix_padding_ms:300, threshold:0.5}, input_audio_transcription:{model:"qwen3-asr-flash-realtime"} } }`.
+  - The SDK's `onDataChannelMsg` handler dispatches on `type`: `session.created` → `sendUpdate` (send a session.update), `input_audio_buffer.speech_started`/`response.audio_transcript.done` → Listening, `input_audio_buffer.committed` → Thinking, `response.created` → Speaking, `error` → error handling.
+  - Mic audio is sent via the WebRTC audio track (RTP/Opus 48kHz), NOT via `input_audio_buffer.append` JSON events — confirmed by the absence of `input_audio_buffer.append` in the SDK.
+  - AI audio is received via the WebRTC audio track + played via a hidden `<audio>` element.
+- KEY INSIGHT: Qwen Voice is architecturally IDENTICAL to ChatGPT Realtime (WebRTC + DataChannel "oai-events" + OpenAI Realtime API events). The only differences are the token endpoint, the auth scheme (Bearer JWT instead of OpenAI ephemeral token), and the model/voice config. So I reused the existing `connectWebRtc` path instead of writing a separate `connectQwen`.
+- Created `src/app/api/qwen/token/route.ts` (~190 lines, Node runtime, force-dynamic):
+  - `POST`: accepts `{ sdp }` from the browser, forwards it to `POST https://chat.qwen.ai/api/v2/users/user/audio_chat_token` with `Authorization: Bearer ${QWEN_ACCESS_TOKEN}` + the Qwen web client's headers (source=web, version=0.3.12, X-Request-Id, bx-v, sec-ch-ua, etc.). The request body is `{ sdp, client_info: { os_group: "pc", terminal_type: "web" } }`. Returns `{ sdp_token, sdp, type: "answer" }` on success (the frontend accepts either `sdp` or `sdp_token`). Returns `{ error }` (4xx/5xx) on failure.
+  - `GET`: quick health-check — returns `{ ok, configured, source, tokenMasked }` (no raw token). The frontend can use this to show whether Qwen is configured before the user clicks Connect.
+  - No curl-impersonate / proxy needed — Qwen uses standard TLS + accepts the bearer token directly (unlike Perplexity which is Cloudflare-fronted).
+  - Token resolution: `process.env.QWEN_ACCESS_TOKEN` (env-var first). Future: vault Worker `GET /qwen/token` fallback (same pattern as Inworld/Perplexity) — not implemented yet.
+- Edited `src/app/page.tsx`:
+  - `RealtimeProvider` type extended to include `"qwen"`.
+  - Added a 5th `ProviderButton` for Qwen in the provider radio group.
+  - Extended the `connectWebRtc` endpoint ternary: `provider === "qwen" ? "/api/qwen/token" : ...`.
+  - Extended the SDP answer extraction: `const answerSdp = data.sdp ?? data.sdp_token` (Qwen returns `sdp_token`, ChatGPT/Perplexity return `sdp`).
+  - Extended the DataChannel `onopen` to send a Qwen-specific `session.update` when `provider === "qwen"` (voice: "Tina", model defaults, server_vad with 800ms silence, input/output pcm16, input_audio_transcription model qwen3-asr-flash-realtime).
+  - Rewrote the DataChannel `onmessage` to handle BOTH standard OpenAI Realtime API event names AND the `output_`-infix variants (Qwen sends `response.output_audio_transcript.delta` like Inworld, ChatGPT sends `response.audio_transcript.delta`). Now handles: `conversation.item.input_audio_transcription.completed` (You: …), `response.audio_transcript.delta` / `response.output_audio_transcript.delta` (AI: …, append to last AI: line), `response.audio_transcript.done` / `response.output_audio_transcript.done` (AI: …, only if no streaming deltas), `session.created` ([dc] session created), `input_audio_buffer.speech_started`/`.speech_stopped`/`.committed` ([dc] speech started/stopped/audio committed), `error` (Server error: …). Other events are silently ignored.
+  - Updated the `CardDescription` to mention all 5 providers + their auth requirements.
+- Added `QWEN_ACCESS_TOKEN=` placeholder + documentation comment to `.env` (no real credentials — the user sets it via Vercel env vars or `.env.local`).
+- `bun run lint` → 0 errors / 0 warnings.
+- Committed as `2586e63` ("feat(qwen): add Qwen Voice (qwen3.8-omni-flash-realtime) as 5th realtime provider — WebRTC + OpenAI Realtime API events over Aliyun Bailian") — 3 files, +322 / -23.
+- `git push origin main` → `3e1da3f..2586e63 main -> main`.
+- Vercel auto-deploy: waited 100s. Confirmed new production chunk hash rotated from `8cfccf671c3fac43` (Task 63) to `dda4b8cdc964a911` (Task 64).
+- Verified Task 64 is live by grepping the new production chunk (351 KB):
+  - `Qwen` ✓ present (provider button label)
+  - `/api/qwen/token` ✓ present (endpoint)
+  - `qwen3.8-omni-flash-realtime` ✓ present (model name in session.update + log)
+  - `Tina` ✓ present (voice name in session.update)
+  - `sdp_token` ✓ present (Qwen response field)
+  - Verbatim minified production JS: `perplexity/connect":"qwen"===y.current?"/api/qwen/token":"/api/realtime/connect"` — exact match to source (endpoint ternary).
+  - Verbatim minified production JS: `configured (model: qwen3.8-omni-flash-realtime, voice: Tina)."))` — exact match to source (Qwen session.update log).
+- Production page render: `GET https://ace-studio-orcin.vercel.app/` → HTTP 200 in 0.27s.
+- Production health-check endpoint: `GET https://ace-studio-orcin.vercel.app/api/qwen/token` → `{ok:false, configured:false, source:"env", tokenMasked:null}` ✓ (expected — `QWEN_ACCESS_TOKEN` is not set on Vercel yet. Once the user sets it via `vercel env add QWEN_ACCESS_TOKEN`, the endpoint will return `ok:true` + the masked token).
+
+Stage Summary:
+- Added Qwen Voice (qwen3.8-omni-flash-realtime) as the 5th realtime provider, end-to-end across 2 layers:
+  1. **Backend** — new `src/app/api/qwen/token/route.ts` (~190 lines, Node runtime, force-dynamic). Single POST handler that forwards the browser's SDP offer to `POST https://chat.qwen.ai/api/v2/users/user/audio_chat_token` with `Authorization: Bearer ${QWEN_ACCESS_TOKEN}` + Qwen web client headers. Returns `{ sdp_token, sdp, type: "answer" }` on success. GET health-check returns `{ ok, configured, source, tokenMasked }`. No curl-impersonate / proxy needed (Qwen uses standard TLS). Token resolved from `process.env.QWEN_ACCESS_TOKEN` (vault Worker fallback is a follow-up).
+  2. **Frontend** — `RealtimeProvider` type extended to include `"qwen"`. Added a 5th `ProviderButton` for Qwen. Extended the existing `connectWebRtc` (NOT a separate `connectQwen`) since Qwen is architecturally identical to ChatGPT (WebRTC + DataChannel "oai-events" + OpenAI Realtime API events). The endpoint ternary now routes `provider === "qwen"` to `/api/qwen/token`. The SDP answer extraction accepts both `sdp` and `sdp_token`. The DataChannel `onopen` sends a Qwen-specific `session.update` (voice: Tina, model defaults, server_vad 800ms silence, pcm16 audio, ASR model qwen3-asr-flash-realtime). The DataChannel `onmessage` now handles BOTH standard OpenAI Realtime API event names AND the `output_`-infix variants (Qwen + Inworld use `response.output_audio_transcript.delta`, ChatGPT uses `response.audio_transcript.delta`).
+- Files created/modified: `src/app/api/qwen/token/route.ts` (new, ~190 lines), `src/app/page.tsx` (modified — +108 / -23 lines for Qwen provider button + endpoint ternary + session.update + onmessage event handling + CardDescription), `.env` (modified — +5 lines for the QWEN_ACCESS_TOKEN placeholder + documentation comment).
+- Lint 0/0, push OK (`3e1da3f..2586e63`), Vercel redeploy verified by chunk hash rotation + byte-level grep (all 5 markers present in production).
+- What the user needs to do to test Qwen Voice:
+  1. Set `QWEN_ACCESS_TOKEN` on Vercel: `vercel env add QWEN_ACCESS_TOKEN production` (paste the chat.qwen.ai JWT — the `eyJhbGci...` value from the `Authorization: Bearer` header). The token expires ~24h after issuance; refresh it by re-logging into chat.qwen.ai + capturing a new token.
+  2. OR set it locally in `.env.local` for dev testing: `QWEN_ACCESS_TOKEN=eyJhbGci...` (then `bun run dev` picks it up).
+  3. Open the Preview Panel, click the new "Qwen" provider button, click Connect.
+  4. The browser creates a WebRTC offer → POST /api/qwen/token → backend forwards to chat.qwen.ai → backend returns the answer SDP → browser applies it → DataChannel opens → session.created arrives → session.update sent → user can speak.
+- Follow-ups:
+  1. **Vault Worker `GET /qwen/token` endpoint** — let the user set the QWEN_ACCESS_TOKEN via the vault Worker (same KV store as Inworld/Perplexity) without a re-deploy. The vault Worker code (`cloudflare-worker/jwt-vault.js`) needs new `qwen_token` + `qwen_updated` KV keys + new `GET/POST /qwen/token` routes (same pattern as Inworld — Task 56). NOT implemented in this task.
+  2. **Token refresh** — the Qwen access_token is a JWT that expires ~24h after issuance. The user must manually refresh it (re-login to chat.qwen.ai + capture a new token). A Chrome extension similar to the ChatGPT one could auto-refresh the token using the `refresh_token` (POST to chat.qwen.ai/api/v1/auths/refresh with the refresh_token, get a new access_token). NOT implemented in this task — the refresh_token flow is undocumented + may have rate limits.
+  3. **Voice selection** — the current implementation hardcodes voice "Tina". The Qwen web client fetches the list of available voices from `GET https://chat.qwen.ai/api/v2/tts/config?omni_speakers=v1&audio_tts_speakers=v1&omni_language=v1&audio_tts_language=v1` + lets the user pick. Adding a voice selector for Qwen (similar to the ChatGPT voice selector) is a follow-up — needs a new backend route to fetch + cache the voice list (the route would forward the request to chat.qwen.ai with the Bearer token).
