@@ -726,10 +726,17 @@ function RealtimeChat() {
    *
    * Flow:
    *   1. GET /api/inworld/token → { token } (basic_<base64>).
-   *   2. Open WebSocket: `wss://api.inworld.ai/api/v1/realtime/session
-   *      ?protocol=realtime&key=browser-session-<ts>`, subprotocol = [token].
-   *      On open, the server sends `session.created` with the default
-   *      config (modalities:["text","audio"], turn_detection:server_vad,
+   *   2. Open WebSocket to our PROXY (NOT directly to api.inworld.ai):
+   *      `wss://<page-host>/?protocol=realtime&key=browser-session-<ts>
+   *      &XTransformPort=3003`, subprotocol = [token]. The Caddy gateway
+   *      sees `XTransformPort=3003` + forwards to our `mini-services/
+   *      inworld-proxy` (port 3003). The proxy opens the upstream
+   *      WebSocket to `wss://api.inworld.ai/api/v1/realtime/session` with
+   *      `Origin: https://platform.inworld.ai` set server-side (the
+   *      browser can't override Origin — it's a forbidden header — so
+   *      we proxy through a server-side helper). On open, the server
+   *      sends `session.created` with the default config
+   *      (modalities:["text","audio"], turn_detection:server_vad,
    *      input_audio_format:"pcm16"). No `session.update` is needed.
    *   3. AudioContext at **24 kHz** (OpenAI Realtime API default for
    *      `pcm16` audio — NOT 16 kHz, which was the previous setting and
@@ -780,10 +787,29 @@ function RealtimeChat() {
     //    <timestamp>), not the auth token — the auth lives in the
     //    `Sec-WebSocket-Protocol` header (which the browser sets from
     //    the second argument to `new WebSocket`).
+    //
+    //    PROXY PATH (Task 63 — Origin fix):
+    //    Inworld rejects WebSocket upgrades from non-platform.inworld.ai
+    //    origins. The browser can't override the `Origin` header (it's a
+    //    forbidden header), so we route the WebSocket through our own
+    //    proxy mini-service (port 3003, `mini-services/inworld-proxy`),
+    //    which sets `Origin: https://platform.inworld.ai` server-side
+    //    before forwarding to `wss://api.inworld.ai/api/v1/realtime/session`.
+    //    The browser connects to `wss://<page-host>/?XTransformPort=3003`
+    //    — the Caddy gateway sees the `XTransformPort` query + forwards
+    //    to localhost:3003 on the VPS. The proxy opens the upstream
+    //    WebSocket to Inworld with the spoofed Origin + forwards the
+    //    `Sec-WebSocket-Protocol: basic_<base64>` subprotocol (the token).
+    //
+    //    The `protocol=realtime&key=browser-session-<ts>` query params
+    //    are passed through to the proxy URL → the proxy forwards them
+    //    to Inworld's `/api/v1/realtime/session` endpoint (the `protocol`
+    //    param tells Inworld to use the realtime API; the `key` is just
+    //    a session id for logging).
+    const wsHost = window.location.host; // e.g. ace-studio-orcin.vercel.app OR sandbox-host
     const wsUrl =
-      "wss://api.inworld.ai/api/v1/realtime/session?protocol=realtime&key=browser-session-" +
-      Date.now();
-    log(`Opening Inworld WebSocket…`);
+      `wss://${wsHost}/?protocol=realtime&key=browser-session-${Date.now()}&XTransformPort=3003`;
+    log(`Opening Inworld WebSocket via proxy (XTransformPort=3003)…`);
     const ws = new WebSocket(wsUrl, [token]);
     inworldWsRef.current = ws;
 
