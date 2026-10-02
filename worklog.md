@@ -1157,3 +1157,73 @@ Stage Summary:
 - Verified at the byte level: the deployed JS bundle contains `input_audio_buffer.append` (the OpenAI Realtime API event name) and NOT the old `type:"audio",data` shape — so the `unknown_event_type:"audio"` error flood the user reported should be fixed.
 - No Vercel API token needed — the GitHub integration auto-deploys on push to `main`. Verified by diffing chunk hashes before/after the push (the chunk `8808d5a621e6c261.js` was replaced by `d0efd8ab1f2ce54b.js`).
 - User can now reconnect via the Inworld provider in the Preview Panel and the only logs they should see on connect are `[inworld] session created` + `Connected. Speak when ready.` (no more `unknown_event_type` errors).
+
+---
+Task ID: 59
+Agent: main (Z.ai Code)
+Task: Fix the Inworld "no audio plays" issue. Task 57 stopped the `unknown_event_type:"audio"` error flood by sending `input_audio_buffer.append` (the OpenAI Realtime API shape). But on the user's first live run with the Task 57 fix, the Inworld session opened cleanly and the AI started responding (we saw 77 `response.output_audio.delta` events + 31 `response.output_audio_transcript.delta` events per response in the log) — but NO audio played (user said "je n'attend pas audio") AND the AI transcript was logged as raw JSON noise (`[inworld] response.output_audio_transcript.delta: {…}` lines).
+
+Work Log:
+- Read the user-supplied log file `/home/z/my-project/upload/Pasted Content_1790956980908.txt` (43 KB). Categorised every line:
+  - 178 `[inworld] …` event-log lines (all truncated to 200 chars by the default-case slice)
+  - 22 `You: <transcript>` lines (user mic — these WORK, produced by `conversation.item.input_audio_transcription.completed` matches that don't have the `[inworld]` prefix because they go through `log(\`You: ${t}\`)`)
+  - 0 `AI: <text>` lines — confirms the AI transcript is NOT being surfaced
+  - 0 audio playback — confirms the audio fix is the gap
+- Parsed every Inworld event type from the log via Python (handling the 200-char truncation by extracting `type` from the truncated JSON). Unique types Inworld actually sends:
+  - `response.output_audio.delta` (77 per response — the AI's spoken audio, NOT being played)
+  - `response.output_audio.done` (2)
+  - `response.output_audio_transcript.delta` (31 per response — the AI's streaming text, being logged as raw JSON noise)
+  - `response.output_audio_transcript.done` (2)
+  - `response.output_text.done` (2)
+  - `response.output_item.added` (6)
+  - `response.output_item.done` (2)
+  - `response.content_part.added` (12)
+  - `response.content_part.done` (4)
+  - `conversation.item.added` (12)
+  - `conversation.item.done` (8)
+  - `input_audio_buffer.turn_suggestion` (7 — Inworld-specific turn-boundary suggestion)
+- ROOT CAUSE: Inworld's event names use the `output_` infix (`response.output_audio.delta`), NOT the standard OpenAI Realtime API names I implemented in Task 57 (`response.audio.delta`). So every audio + transcript event fell through to the `default` case which just logged `[inworld] <type>: <truncated JSON>` — the audio chunks were NEVER passed to `playPcmChunkRef`, hence "no audio plays".
+- Edits to `src/app/page.tsx` (handleInworldMsg block):
+  1. **Audio fix (THE key fix):** added `case "response.output_audio.delta":` as a fallthrough with the existing `case "response.audio.delta":` so BOTH Inworld's name AND the standard OpenAI name play audio. Marked the handler as SILENT (no log) — at 77 chunks per response, logging each one would spam the transcript.
+  2. **Audio done:** added `case "response.output_audio.done":` as fallthrough with `response.audio.done`.
+  3. **AI transcript delta:** added `case "response.output_audio_transcript.delta":` as fallthrough with `response.audio_transcript.delta`. Changed the body from `log(\`AI: ${d}\`)` (one line per delta = 31 spam lines per response) to a new `appendAiDelta(d)` helper that appends to the LAST AI: line if it exists (or creates a new one). Uses `last.includes("] AI:")` for the check — robust against second-boundary changes (the WebRTC ChatGPT handler's `last.startsWith("[time] AI:")` check is buggy across second boundaries; this fix avoids that bug).
+  4. **AI transcript done / text done:** added the `output_` infix variants as fallthroughs. Updated the body to use `setTranscript` with a guard — only log the final transcript if no AI: line was already started from the deltas (otherwise the deltas + .done would double-log the transcript).
+  5. **Lifecycle no-ops (silence the noise):** added cases for `input_audio_buffer.turn_suggestion` (Inworld-specific), `conversation.item.added`, `conversation.item.done`, `response.output_item.added`, `response.output_item.done`, `response.content_part.added`, `response.content_part.done`, `session.created`, `session.updated` — all as silent no-ops. Combined `response.created`, `response.done`, `response.cancelled`, `rate_limits.updated` into the same no-op block.
+  6. **Better debugging for unknown events:** increased the default-case log slice from 200 → 600 chars (so any future unknown event shows enough of its JSON to diagnose).
+  7. **Header comment:** rewrote the `handleInworldMsg` header to document the actual Inworld event names (with the `output_` infix) + the live frequency counts (77 audio / 31 transcript per response) + the Inworld-specific `input_audio_buffer.turn_suggestion` event.
+- `bun run lint` → 0 errors / 0 warnings.
+- Committed as `008271b` ("fix(inworld): handle response.output_audio.delta (audio) + response.output_audio_transcript.delta (transcript) — Inworld uses output_ infix") — 1 file, +119 / -47.
+- `git push origin main` → `3ec7de2..008271b main -> main`.
+- Vercel auto-deploy: waited 100s for the GitHub integration to trigger the build. Confirmed new production chunk hashes (the page chunk rotated from `d0efd8ab1f2ce54b.js` [Task 57] to `d3a3dd3b78a0840a.js` [Task 58]).
+- Verified Task 58 fix is live by grepping the new production chunk `d3a3dd3b78a0840a.js` (349 KB):
+  - `response.output_audio.delta` ✓ present (the audio fix — root cause of "no audio plays")
+  - `response.audio.delta` ✓ present (standard OpenAI name kept for forward-compat)
+  - `response.output_audio_transcript.delta` ✓ present (the transcript fix)
+  - `response.output_audio.done` ✓ present
+  - `response.output_audio_transcript.done` ✓ present
+  - `response.output_text.delta` / `.done` ✓ present
+  - `input_audio_buffer.turn_suggestion` ✓ present (Inworld-specific, now a no-op)
+  - `conversation.item.added` / `.done` ✓ present (now no-ops)
+  - `response.output_item.added` / `.done` ✓ present (now no-ops)
+  - `response.content_part.added` / `.done` ✓ present (now no-ops)
+  - `session.created` / `session.updated` ✓ present (now no-ops)
+  - `response.cancelled` / `rate_limits.updated` ✓ present (now no-ops)
+  - `input_audio_buffer.speech_started` / `.speech_stopped` / `.committed` ✓ present
+  - Verbatim minified production JS for the audio fix: `case"response.output_audio.delta":case"response.audio.delta":{let t=e.delta??e.audio??e.data;"string"==typeof t&&t.length>0&&R.current?.(t);break}` — exact match to source.
+  - Verbatim minified production JS for the append-to-last-AI-line logic: `includes("] AI:")?t[t.length-1]=n+r:t.push(\`[\${new Date().toLocaleTimeString()}] AI: ${r}\`)` — exact match to source (the `appendAiDelta` helper was inlined by the minifier, which is why a direct grep for `appendAiDelta` returned 0 hits, but the behaviour is preserved).
+- Sanity checks on production:
+  - `GET https://ace-studio-orcin.vercel.app/` → HTTP 200 in 0.26s
+  - `GET https://ace-studio-orcin.vercel.app/api/inworld/token` → `{ok:true, token:"basic_…", source:"env"}` ✓ (token endpoint unchanged)
+  - Page HTML contains "Inworld", "Realtime AI", "Provider" UI markers ✓
+
+Stage Summary:
+- Root cause: Inworld uses `response.output_audio.delta` (with `output_` infix), not the standard OpenAI `response.audio.delta`. Task 57's handler matched the OpenAI name → all audio chunks fell to the default case → never played.
+- Fix: added the `output_`-infix variants as case fallthroughs alongside the standard OpenAI names, so BOTH protocols work. Also: switched transcript deltas to the setTranscript-append pattern (one growing AI: line per response, not 31 spam lines), silenced 12 lifecycle event types as no-ops, and increased the default log slice 200 → 600 for better debugging of any future unknown events.
+- Files modified: `src/app/page.tsx` only (+119 / -47 lines).
+- Lint 0/0, push OK (`3ec7de2..008271b`), Vercel redeploy verified by chunk hash rotation + byte-level grep of the new chunk.
+- What to expect on the next live run:
+  - On connect: `Connected. Speak when ready.` (no more `[inworld] session created` log — that event is now a silent no-op).
+  - While you speak: `[inworld] speech started` → `You: <transcript>` (already worked) → `[inworld] speech stopped`.
+  - When the AI replies: one growing `AI: <transcript>` line in the transcript panel (deltas stream into the SAME line) + audio playback through your speakers (77 PCM16 chunks per response, played silently via the AudioContext).
+  - No more `[inworld] response.output_audio.delta: {…}` / `[inworld] conversation.item.added: {…}` / `[inworld] input_audio_buffer.turn_suggestion: {…}` log noise — those are all silent no-ops now.
+- If audio STILL doesn't play: check that the AudioContext resumed successfully (browsers block autoplay until a user gesture — but the Connect button click counts as a gesture, so this should be fine). If the AI transcript shows but no audio: the AudioContext sample rate might be mismatched — but we set it to 16kHz which matches Inworld's `input_audio_format:"pcm16"`. The `playPcmChunkRef` helper uses `ctx.createBuffer(1, float32.length, 16000)` which should match the server's `output_audio` format. If the server sends a different sample rate, we'd need to inspect the `session.created` event's `audio_format` field and adjust — but Inworld's default is 24kHz for output audio in some configurations, so this may need a follow-up.
