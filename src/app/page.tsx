@@ -839,29 +839,44 @@ function RealtimeChat() {
 
     /** Dispatch an incoming Inworld JSON message. Inworld's realtime
      * session endpoint (`wss://api.inworld.ai/api/v1/realtime/session`)
-     * speaks the OpenAI Realtime API event protocol — confirmed by the
-     * error response shape `{"type":"invalid_request_error","code":
-     * "unknown_event_type",...,"event_id":null}` (OpenAI-style) returned
-     * when we sent a `{type:"audio"}` event. So the server→client events
-     * we receive are OpenAI Realtime API event names:
+     * speaks a variant of the OpenAI Realtime API event protocol —
+     * confirmed by the error response shape `{"type":"invalid_request_error",
+     * "code":"unknown_event_type",...,"event_id":null}` (OpenAI-style)
+     * returned when we sent a `{type:"audio"}` event, AND by the live
+     * event stream captured on first run (Task 58):
      *
+     * Inworld's event names use the `output_` infix — e.g. it sends
+     * `response.output_audio.delta` (NOT the standard OpenAI name
+     * `response.audio.delta`), and `response.output_audio_transcript.delta`
+     * (NOT `response.audio_transcript.delta`). To support BOTH Inworld's
+     * names AND the standard OpenAI names (for forward-compat), each
+     * case below accepts both names via fallthrough.
+     *
+     * Confirmed Inworld server→client events (from the user's first live run):
      *   - `session.created` / `session.updated` — session lifecycle.
-     *   - `input_audio_buffer.speech_started` / `.speech_stopped` /
-     *     `.committed` — server-side VAD state.
-     *   - `conversation.item.input_audio_transcription.completed` —
-     *     server's transcription of the user's mic audio.
-     *   - `response.created` / `response.done` — AI response lifecycle.
-     *   - `response.audio.delta` / `.done` — base64 PCM16 chunks of the
-     *     AI's spoken reply (the `delta` field holds the base64 audio).
-     *   - `response.audio_transcript.delta` / `.done` — streaming text
-     *     transcript of the AI's spoken reply.
-     *   - `response.text.delta` / `.done` — text-only reply chunks.
-     *   - `error` — `{ type:"error", error:{type,code,message,...} }`.
-     *   - `rate_limits.updated` — can be ignored.
+     *   - `input_audio_buffer.speech_started` / `.speech_stopped` — VAD.
+     *   - `input_audio_buffer.turn_suggestion` — Inworld-specific: the
+     *     server suggests a turn boundary was detected (we treat as no-op
+     *     since server_vad auto-commits).
+     *   - `conversation.item.added` / `.done` — a conversation item (user
+     *     input OR AI output) was added / finalised.
+     *   - `conversation.item.input_audio_transcription.completed` / `.delta`
+     *     — streaming + final transcription of the user's mic audio.
+     *   - `response.output_item.added` / `.done` — AI response item lifecycle.
+     *   - `response.content_part.added` / `.done` — content part lifecycle.
+     *   - `response.output_audio.delta` (77 per response) — base64 PCM16
+     *     chunks of the AI's spoken reply. PLAY these via the AudioContext.
+     *   - `response.output_audio.done` — end of AI audio stream.
+     *   - `response.output_audio_transcript.delta` (31 per response) —
+     *     streaming text transcript of the AI's spoken reply. APPEND to
+     *     the last AI: log line (not one line per delta — that would spam).
+     *   - `response.output_audio_transcript.done` — final AI transcript.
+     *   - `response.output_text.done` — final text-only reply.
+     *   - `error` — `{type:"error", error:{type,code,message,...}}`.
      *
      * We ALSO keep the legacy generic handlers (audio / transcript /
      * text / user / state / error / default) as fallbacks in case
-     * Inworld deviates from the OpenAI shape for any event. */
+     * Inworld deviates for any event. */
     const handleInworldMsg = (msg: Record<string, unknown>) => {
       if (!msg || typeof msg !== "object") return;
       const type =
@@ -869,38 +884,88 @@ function RealtimeChat() {
         (msg.event as string) ??
         (msg.kind as string) ??
         "message";
+      // Helper: append an AI transcript delta to the last AI: log line
+      // (or create a new one if the last line isn't an AI: line). This
+      // avoids producing 31 separate "AI: <chunk>" log lines per AI
+      // response — instead we get one streaming AI: line that grows.
+      const appendAiDelta = (delta: string) => {
+        if (!delta) return;
+        setTranscript((t) => {
+          const next = [...t];
+          const last = next[next.length - 1] ?? "";
+          // Robust against second boundaries: just check the line is an
+          // AI: line, regardless of the timestamp prefix.
+          if (last.includes("] AI:")) {
+            next[next.length - 1] = last + delta;
+          } else {
+            next.push(`[${new Date().toLocaleTimeString()}] AI: ${delta}`);
+          }
+          return next.slice(-200);
+        });
+      };
       switch (type) {
-        // --- AI audio output (OpenAI Realtime API) ---
+        // --- AI audio output (THE KEY AUDIO FIX — Task 58) ---
+        // Inworld sends `response.output_audio.delta` (with the `output_`
+        // infix), NOT the standard OpenAI `response.audio.delta`. Both
+        // names are accepted here via case fallthrough so audio plays.
+        case "response.output_audio.delta":
         case "response.audio.delta": {
           // `delta` is a base64 PCM16 chunk of the AI's spoken reply.
           const b64 = (msg.delta as string) ?? (msg.audio as string) ?? (msg.data as string);
           if (typeof b64 === "string" && b64.length > 0) playPcmChunkRef.current?.(b64);
+          // SILENT handler — do NOT log (77 chunks/sec would spam the
+          // transcript). The user hears the audio; the transcript shows
+          // the AI text via the transcript.delta handler below.
           break;
         }
+        case "response.output_audio.done":
         case "response.audio.done": {
           // Final audio chunk for the response — already streamed via
           // .delta events; nothing to do here.
           break;
         }
         // --- AI transcript (streaming text of the spoken reply) ---
+        // Inworld sends `response.output_audio_transcript.delta` (with
+        // the `output_` infix). Use appendAiDelta so we get ONE growing
+        // AI: line per response, not 31 separate "AI: <chunk>" lines.
+        case "response.output_audio_transcript.delta":
         case "response.audio_transcript.delta": {
-          const d = (msg.delta as string) ?? "";
-          if (d) log(`AI: ${d}`);
+          appendAiDelta((msg.delta as string) ?? "");
           break;
         }
+        case "response.output_audio_transcript.done":
         case "response.audio_transcript.done": {
+          // The .done event carries the FINAL transcript. If we already
+          // appended deltas above, this is redundant — only log if no AI
+          // line was started (e.g. the deltas were empty / not received).
           const t = (msg.transcript as string) ?? (msg.text as string) ?? "";
-          if (t) log(`AI: ${t}`);
+          if (t) {
+            setTranscript((prev) => {
+              const last = prev[prev.length - 1] ?? "";
+              if (last.includes("] AI:")) {
+                // Already have an AI line from the deltas — skip.
+                return prev;
+              }
+              return [...prev.slice(-199), `[${new Date().toLocaleTimeString()}] AI: ${t}`];
+            });
+          }
           break;
         }
+        case "response.output_text.delta":
         case "response.text.delta": {
-          const d = (msg.delta as string) ?? "";
-          if (d) log(`AI: ${d}`);
+          appendAiDelta((msg.delta as string) ?? "");
           break;
         }
+        case "response.output_text.done":
         case "response.text.done": {
           const t = (msg.text as string) ?? "";
-          if (t) log(`AI: ${t}`);
+          if (t) {
+            setTranscript((prev) => {
+              const last = prev[prev.length - 1] ?? "";
+              if (last.includes("] AI:")) return prev;
+              return [...prev.slice(-199), `[${new Date().toLocaleTimeString()}] AI: ${t}`];
+            });
+          }
           break;
         }
         // --- User mic transcript (server-side transcription) ---
@@ -931,31 +996,38 @@ function RealtimeChat() {
           // explicit commit). A `response.created` will follow.
           break;
         }
-        // --- Session lifecycle ---
-        case "session.created": {
-          log("[inworld] session created");
+        case "input_audio_buffer.turn_suggestion": {
+          // Inworld-specific: the server suggests a turn boundary was
+          // detected (trailing silence reached the threshold). The
+          // server_vad turn detection already auto-commits, so we don't
+          // need to send `input_audio_buffer.commit` ourselves. No-op.
           break;
         }
-        case "session.updated": {
-          log("[inworld] session updated");
+        // --- Conversation item lifecycle (Inworld sends these for both
+        //     user input items AND AI output items — silent no-ops to
+        //     keep the transcript clean) ---
+        case "conversation.item.added":
+        case "conversation.item.done": {
+          // The user's input item OR the AI's output item was added /
+          // finalised. The actual content (user transcript / AI text) is
+          // delivered via the dedicated transcript events above.
           break;
         }
-        // --- Response lifecycle ---
-        case "response.created": {
-          // The AI response is starting. Nothing to log (the audio +
-          // transcript deltas will stream next).
-          break;
-        }
-        case "response.done": {
-          // The AI response finished. Nothing to do here.
-          break;
-        }
-        case "response.cancelled": {
-          // The response was cancelled (e.g. by barge-in).
-          break;
-        }
+        // --- Response item / content part lifecycle (silent no-ops) ---
+        case "session.created":
+        case "session.updated":
+        case "response.created":
+        case "response.done":
+        case "response.cancelled":
+        case "response.output_item.added":
+        case "response.output_item.done":
+        case "response.content_part.added":
+        case "response.content_part.done":
         case "rate_limits.updated": {
-          // Rate limit info — can be ignored for now.
+          // Response / output-item / content-part lifecycle. The actual
+          // audio + transcript data arrives via the .delta handlers
+          // above; these lifecycle events are noisy and carry no user
+          // -visible payload. No-op.
           break;
         }
         // --- Errors (OpenAI shape: {type:"error", error:{...}}) ---
@@ -1014,13 +1086,13 @@ function RealtimeChat() {
         case "state":
         case "status":
         case "ready": {
-          log(`[inworld] state: ${JSON.stringify(msg).slice(0, 200)}`);
+          log(`[inworld] state: ${JSON.stringify(msg).slice(0, 600)}`);
           break;
         }
         default: {
           // Unknown type — log a compact summary so the user can see
           // what Inworld is sending (and we can refine the handler).
-          log(`[inworld] ${type}: ${JSON.stringify(msg).slice(0, 200)}`);
+          log(`[inworld] ${type}: ${JSON.stringify(msg).slice(0, 600)}`);
         }
       }
     };
