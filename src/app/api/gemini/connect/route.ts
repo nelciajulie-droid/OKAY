@@ -801,12 +801,15 @@ async function handleStart(_body: GeminiRequestBody) {
     const gsessionid =
       (res.headers["x-http-session-id"] as string) ??
       extractGsessionId(res.setCookie, res.body) ??
+      // Also try to find it in the response body (some Google responses include it)
+      (res.body.match(/gsessionid=([A-Za-z0-9_\-]+)/)?.[1]) ??
+      // If all else fails, generate a UUID
       randomUuid();
     // SID: extracted from the response body (Web Channel stream format)
-    // The SID is different from the gsessionid
     const sid = extractSid(res.body) ??
       (res.headers["x-http-session-id"] as string) ??
       "";
+    console.log(`[gemini] start response: status=${res.status}, gsessionid=${gsessionid.slice(0, 30)}..., sid=${sid.slice(0, 30)}...`);
     // Surface the parsed setup response too — it may carry the first
     // server message (a greeting audio chunk, etc.).
     const parsed = parseBidiChunks(res.body);
