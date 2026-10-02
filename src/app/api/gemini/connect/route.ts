@@ -206,12 +206,11 @@ async function fetchGoogleCookies(): Promise<string> {
  * Channel convention for forwarding sensitive headers via the long-poll
  * GET.
  */
-function buildGoogleHeaders(cookies: string, sapisidHash: string): Record<string, string> {
-  return {
+function buildGoogleHeaders(cookies: string, sapisidHash: string, isGet = false): Record<string, string> {
+  const h: Record<string, string> = {
     "User-Agent": GEMINI_UA,
     Accept: "*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Content-Type": "application/x-www-form-urlencoded",
     Origin: GEMINI_ORIGIN,
     Referer: `${GEMINI_ORIGIN}/`,
     Cookie: cookies,
@@ -226,6 +225,11 @@ function buildGoogleHeaders(cookies: string, sapisidHash: string): Record<string
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Dest": "empty",
   };
+  // Only send Content-Type for POST (GET has no body)
+  if (!isGet) {
+    h["Content-Type"] = "application/x-www-form-urlencoded";
+  }
+  return h;
 }
 
 /**
@@ -926,7 +930,7 @@ async function handleReceive(body: GeminiRequestBody) {
   }
   const sapisidHash = computeSapisidHash(sapisid, GEMINI_ORIGIN);
   const url = buildBidiUrl({ rid, gsessionid, sid, sapisidHash, apiKey, receive: true });
-  const headers = buildGoogleHeaders(cookies, sapisidHash);
+  const headers = buildGoogleHeaders(cookies, sapisidHash, true); // isGet=true, no Content-Type
   // Long-poll: allow up to 25s for a chunk.
   try {
     const res = await sendBidi("GET", url, headers, null, 25_000);
