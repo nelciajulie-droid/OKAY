@@ -604,14 +604,15 @@ function extractSid(body: string): string | null {
   m = body.match(/^\[\s*\[\s*\d+\s*,\s*"([^"]+)"/);
   if (m) return m[1];
 
-  // Pattern 4: [[0,"value","c",...]] — find any quoted string after [0,
+  // Pattern 4: [0,"value","c",...] — find the quoted string right after [0,
   m = body.match(/\[\s*0\s*,\s*"([A-Za-z0-9_-]{8,})"/);
   if (m) return m[1];
 
-  // Pattern 5: any quoted string that looks like a SID (20+ chars, alphanumeric + hyphens)
-  m = body.match(/"([A-Za-z0-9_-]{20,})"/);
-  if (m && !m[1].includes(" ")) return m[1];
+  // Pattern 5: [[0,"value",...]] — same but not at the start
+  m = body.match(/\[\[\s*0\s*,\s*"([A-Za-z0-9_-]{8,})"/);
+  if (m) return m[1];
 
+  // Removed the broad pattern 6 (any 20+ char string) — too many false positives
   return null;
 }
 
