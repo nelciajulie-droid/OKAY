@@ -679,14 +679,21 @@ function RealtimeChat() {
    *      On open, the server sends `session.created` with the default
    *      config (modalities:["text","audio"], turn_detection:server_vad,
    *      input_audio_format:"pcm16"). No `session.update` is needed.
-   *   3. AudioContext (16kHz) + getUserMedia + ScriptProcessor for PCM
-   *      capture (same as Gemini).
+   *   3. AudioContext at **24 kHz** (OpenAI Realtime API default for
+   *      `pcm16` audio — NOT 16 kHz, which was the previous setting and
+   *      made the AI voice play 1.5x slower). + getUserMedia +
+   *      ScriptProcessor for PCM capture.
    *   4. setInterval(200ms) flushes mic PCM16 → base64 → JSON
    *      `{type:"input_audio_buffer.append", audio:<b64>}` → ws.send.
    *   5. ws.onmessage: text frames are JSON (handled by `handleInworldMsg`
    *      which dispatches on OpenAI Realtime API event names); binary
    *      frames are raw PCM16 → played via the AudioContext (kept as a
    *      fallback in case Inworld sends any binary audio frames).
+   *   6. Playback uses a JITTER BUFFER CAP: `nextStartTimeRef.current`
+   *      is capped at `ctx.currentTime + 0.3s` so the AI's bursty
+   *      delivery (it generates 1s of audio in ~100ms then streams it
+   *      fast) doesn't accumulate seconds of lag — the user hears audio
+   *      at most ~300ms behind the AI's generation.
    *
    * NOTE: Inworld checks the `Origin` header. The deployed Vercel origin
    * (`https://ace-studio-*.vercel.app`) is NOT `https://platform.inworld.ai`,
@@ -758,13 +765,43 @@ function RealtimeChat() {
     });
     log("Inworld WebSocket open.");
 
-    // 3. Create an AudioContext at 16kHz + get the user's mic. Same shape
-    //    as the Gemini path (the PCM encode/decode round-trip matches what
-    //    Inworld's realtime endpoint expects).
+    // 3. Create an AudioContext at 24 kHz + get the user's mic. The OpenAI
+    //    Realtime API (which Inworld speaks — confirmed in Task 57) uses
+    //    PCM16 @ **24 kHz** for BOTH input and output by default
+    //    (`input_audio_format:"pcm16"` + `output_audio_format:"pcm16"`
+    //    → 24000 Hz). The previous 16 kHz context was playing 24 kHz
+    //    chunks at 16 kHz speed → 1.5x slower = "voix grave et lente"
+    //    (Task 59 user report). 24 kHz matches what the server sends +
+    //    what it expects back.
+    //
+    //    Some older browsers may refuse a non-default sample rate; we
+    //    try 24 kHz first and fall back to the default. If the fallback
+    //    fires, the mic capture rate won't match the server's expected
+    //    24 kHz (the server would hear the mic at the wrong speed), but
+    //    playback still works because Web Audio resamples the 24 kHz
+    //    buffer to the context rate automatically on BufferSource.start.
     const AudioCtor: typeof AudioContext =
       window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const audioCtx = new AudioCtor({ sampleRate: 16000 });
+    let audioCtx: AudioContext;
+    try {
+      audioCtx = new AudioCtor({ sampleRate: 24000 });
+    } catch {
+      // Browser rejected 24 kHz — fall back to default.
+      audioCtx = new AudioCtor();
+    }
+    // Browsers can suspend the AudioContext until a user gesture (Chrome
+    // autoplay policy). The "Connect" button click counts as a gesture,
+    // but some browsers still start the context in "suspended" state —
+    // resume explicitly so playback works.
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => { /* ignore */ });
+    }
     audioCtxRef.current = audioCtx;
+    // Log the actual context sample rate so the user can verify the 24 kHz
+    // request was honoured (some browsers silently fall back to 48 kHz —
+    // playback still works via Web Audio resampling, but the mic capture
+    // would be at the wrong rate in that case).
+    log(`AudioContext @ ${audioCtx.sampleRate} Hz (requested 24000).`);
 
     const micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -790,17 +827,43 @@ function RealtimeChat() {
     mutedGain.connect(audioCtx.destination);
 
     // 5. Set up the play-PCM helper (closure over audioCtx + nextStartTime).
+    //    Two fixes vs the previous version (Task 60):
+    //    (a) Buffer sample rate = 24000 (OpenAI Realtime API default for
+    //        `output_audio_format:"pcm16"`), NOT 16000. The previous 16 kHz
+    //        made 24 kHz audio play 1.5x slower (Task 59 user report).
+    //    (b) JITTER BUFFER CAP: cap `nextStartTimeRef.current` to
+    //        `ctx.currentTime + MAX_BUFFER_AHEAD` (300ms). Without this
+    //        cap, if the AI sends audio in BURSTS (faster than real-time
+    //        delivery — the OpenAI Realtime API does this: it generates
+    //        1s of audio in ~100ms then streams the chunks rapidly), the
+    //        scheduled queue grows unbounded → audio plays seconds behind
+    //        real time → "pas en temps réel" (Task 60 user report). The
+    //        cap drops the backlog when it grows past 300ms ahead, so the
+    //        user hears audio at most ~300ms behind the AI's generation.
+    //        This causes a tiny audio glitch on resync (one discontinuity
+    //        at the chunk boundary) which is far less annoying than 5s of
+    //        accumulating lag.
+    const MAX_BUFFER_AHEAD = 0.3; // 300ms — the max audio we'll queue ahead of "now"
     nextStartTimeRef.current = audioCtx.currentTime;
     playPcmChunkRef.current = (b64: string) => {
       const ctx = audioCtxRef.current;
       if (!ctx) return;
       const float32 = base64ToFloat32(b64);
-      const buffer = ctx.createBuffer(1, float32.length, 16000);
+      // 24 kHz source rate (OpenAI Realtime API default for `pcm16`).
+      // Web Audio resamples this to the context rate on playback
+      // automatically, so even if the context fell back to 48 kHz
+      // (Safari/etc.), the audio plays at the correct pitch.
+      const buffer = ctx.createBuffer(1, float32.length, 24000);
       buffer.copyToChannel(float32, 0);
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(ctx.destination);
-      const startTime = Math.max(ctx.currentTime, nextStartTimeRef.current);
+      // Schedule gaplessly if the queue is small, OR cap at 300ms ahead
+      // to drop the backlog and resume real-time playback.
+      const startTime = Math.min(
+        Math.max(ctx.currentTime, nextStartTimeRef.current),
+        ctx.currentTime + MAX_BUFFER_AHEAD,
+      );
       src.start(startTime);
       nextStartTimeRef.current = startTime + buffer.duration;
     };
