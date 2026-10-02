@@ -35,6 +35,15 @@ const KV_PERPLEXITY_COOKIES = "perplexity_cookies";
 const KV_PERPLEXITY_ACCOUNT = "perplexity_account";
 const KV_PERPLEXITY_UPDATED = "perplexity_updated";
 
+// KV keys — Google (Gemini Live) cookies
+// `google_cookies` stores the full Cookie header value for `.google.com`
+// (SID, __Secure-1PSID, SAPISID, __Secure-1PAPISID, APISID, HSID, SSID,
+// NID, etc.). The backend `/api/gemini/connect` route reads it before
+// each bidi call, computes SAPISIDHASH from the SAPISID value, and POSTs
+// to webchannel-alkalimakersuite-pa.clients6.google.com.
+const KV_GOOGLE_COOKIES = "google_cookies";
+const KV_GOOGLE_UPDATED = "google_updated";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -65,9 +74,12 @@ export default {
     // === Perplexity Realtime voice cookie endpoints ===
     if (url.pathname === "/perplexity/cookies" && request.method === "GET") return await handleGetPerplexityCookies(env);
     if (url.pathname === "/perplexity/cookies" && request.method === "POST") return await handleSetPerplexityCookies(request, env);
-    if (url.pathname === "/") return json({ ok: true, service: "chatgpt-jwt-vault", endpoints: ["/jwt", "/jwt-update", "/cookies", "/seed", "/refresh", "/refresh-local", "/health", "/accounts", "/accounts/add", "/accounts/remove", "/accounts/rotate", "/accounts/mark-rate-limited", "/perplexity/cookies"] });
+    // === Google (Gemini Live) cookie endpoints ===
+    if (url.pathname === "/google/cookies" && request.method === "GET") return await handleGetGoogleCookies(env);
+    if (url.pathname === "/google/cookies" && request.method === "POST") return await handleSetGoogleCookies(request, env);
+    if (url.pathname === "/") return json({ ok: true, service: "chatgpt-jwt-vault", endpoints: ["/jwt", "/jwt-update", "/cookies", "/seed", "/refresh", "/refresh-local", "/health", "/accounts", "/accounts/add", "/accounts/remove", "/accounts/rotate", "/accounts/mark-rate-limited", "/perplexity/cookies", "/google/cookies"] });
 
-    return json({ error: "Not found", endpoints: ["/jwt", "/seed", "/refresh", "/health", "/perplexity/cookies"] }, 404);
+    return json({ error: "Not found", endpoints: ["/jwt", "/seed", "/refresh", "/health", "/perplexity/cookies", "/google/cookies"] }, 404);
   },
 
   async scheduled(event, env, ctx) {
@@ -238,6 +250,8 @@ async function handleHealth(env) {
   const perplexityCookies = await env.JWT_VAULT.get(KV_PERPLEXITY_COOKIES);
   const perplexityAccount = (await env.JWT_VAULT.get(KV_PERPLEXITY_ACCOUNT)) || null;
   const perplexityUpdated = parseInt((await env.JWT_VAULT.get(KV_PERPLEXITY_UPDATED)) || "0", 10);
+  const googleCookies = await env.JWT_VAULT.get(KV_GOOGLE_COOKIES);
+  const googleUpdated = parseInt((await env.JWT_VAULT.get(KV_GOOGLE_UPDATED)) || "0", 10);
   const now = Math.floor(Date.now() / 1000);
   return json({
     ok: true,
@@ -258,6 +272,13 @@ async function handleHealth(env) {
     perplexityUpdated: perplexityUpdated || null,
     perplexityUpdatedHuman: perplexityUpdated
       ? new Date(perplexityUpdated * 1000).toISOString()
+      : null,
+    // Google (Gemini Live) cookies.
+    hasGoogleCookies: Boolean(googleCookies),
+    googleCookieLength: googleCookies ? googleCookies.length : 0,
+    googleUpdated: googleUpdated || null,
+    googleUpdatedHuman: googleUpdated
+      ? new Date(googleUpdated * 1000).toISOString()
       : null,
   });
 }
@@ -602,6 +623,48 @@ async function handleSetPerplexityCookies(request, env) {
     message: "Perplexity cookies stored.",
     cookieLength: cookies.length,
     hasAccount: Boolean(account),
+  });
+}
+
+// ============================================================
+// GOOGLE (GEMINI LIVE) COOKIES
+// ============================================================
+//
+// The Chrome extension reads all cookies for `.google.com` (SID,
+// __Secure-1PSID, __Secure-3PSID, SAPISID, __Secure-1PAPISID,
+// __Secure-3PAPISID, HSID, SSID, APISID, NID, SIDCC, etc.), builds a
+// single `name=value; name=value; ...` Cookie header string, and POSTs
+// it here. The backend `/api/gemini/connect` route GETs it before each
+// bidi call to webchannel-alkalimakersuite-pa.clients6.google.com,
+// extracts the SAPISID value, and computes a fresh SAPISIDHASH.
+
+// GET /google/cookies → { cookies, updatedAt }
+async function handleGetGoogleCookies(env) {
+  const cookies = await env.JWT_VAULT.get(KV_GOOGLE_COOKIES);
+  if (!cookies) return json({ error: "No Google cookies in vault." }, 404);
+  const updatedAt = parseInt((await env.JWT_VAULT.get(KV_GOOGLE_UPDATED)) || "0", 10);
+  return json({
+    cookies,
+    updatedAt: updatedAt || null,
+    updatedAtHuman: updatedAt ? new Date(updatedAt * 1000).toISOString() : null,
+  });
+}
+
+// POST /google/cookies { cookies } → { ok }
+//   `cookies` is the full Cookie header string for .google.com.
+async function handleSetGoogleCookies(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+  const { cookies } = body;
+  if (!cookies || typeof cookies !== "string") {
+    return json({ error: "Missing 'cookies' (string) in body" }, 400);
+  }
+  await env.JWT_VAULT.put(KV_GOOGLE_COOKIES, cookies);
+  await env.JWT_VAULT.put(KV_GOOGLE_UPDATED, String(Math.floor(Date.now() / 1000)));
+  return json({
+    ok: true,
+    message: "Google cookies stored.",
+    cookieLength: cookies.length,
   });
 }
 

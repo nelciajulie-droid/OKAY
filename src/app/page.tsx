@@ -153,14 +153,14 @@ function TracksSection({
 }
 
 // ---------------------------------------------------------------------------
-// Realtime AI section — ChatGPT / Perplexity voice via WebRTC SDP exchange
+// Realtime AI section — ChatGPT / Perplexity / Gemini Live voice
 // ---------------------------------------------------------------------------
 
-type RealtimeProvider = "chatgpt" | "perplexity";
+type RealtimeProvider = "chatgpt" | "perplexity" | "gemini";
 
 // The 9 ChatGPT Realtime voices (the consumer chatgpt.com session.update
-// event accepts any of these). Perplexity has its own voice handling so we
-// don't show this selector for the Perplexity provider.
+// event accepts any of these). Perplexity and Gemini have their own voice
+// handling so we don't show this selector for those providers.
 const CHATGPT_VOICES = [
   "alloy",
   "ash",
@@ -183,13 +183,33 @@ function RealtimeChat() {
   const [error, setError] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<string[]>([]);
 
-  // Refs that don't trigger re-renders.
+  // Refs that don't trigger re-renders — shared (WebRTC + Gemini).
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const voiceRef = useRef(voice);
   const providerRef = useRef(provider);
+
+  // Refs that don't trigger re-renders — Gemini bidi only.
+  // `geminiSessionRef` holds { gsessionid, sid, rid } after start.
+  // `audioCtxRef` is the AudioContext (16kHz for PCM encode/decode).
+  // `micStreamRef` is the MediaStream for the mic (16kHz).
+  // `scriptNodeRef` is the ScriptProcessorNode for mic capture.
+  // `pollControllerRef` aborts the receive long-poll loop.
+  // `sendTimerRef` is the setInterval that flushes the mic buffer.
+  // `micBufferRef` accumulates Int16 PCM samples between flushes.
+  const geminiSessionRef = useRef<{
+    gsessionid: string;
+    sid: string;
+    rid: string;
+  } | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const scriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const pollControllerRef = useRef<AbortController | null>(null);
+  const sendTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const micBufferRef = useRef<Int16Array[]>([]);
   useEffect(() => {
     voiceRef.current = voice;
   }, [voice]);
@@ -201,8 +221,12 @@ function RealtimeChat() {
     setTranscript((t) => [...t.slice(-200), `[${new Date().toLocaleTimeString()}] ${line}`]);
   }, []);
 
-  /** Tear down the current connection + release the mic. */
+  /** Tear down the current connection + release the mic. Cleans up
+   * both the WebRTC (ChatGPT/Perplexity) resources and the Gemini bidi
+   * resources — only one set will be set at a time, so calling close()
+   * on the unset ones is a no-op. */
   const teardown = useCallback(() => {
+    // --- WebRTC resources ---
     if (dcRef.current) {
       try { dcRef.current.close(); } catch { /* ignore */ }
       dcRef.current = null;
@@ -211,6 +235,32 @@ function RealtimeChat() {
       try { pcRef.current.close(); } catch { /* ignore */ }
       pcRef.current = null;
     }
+    // --- Gemini bidi resources ---
+    // Cancel the receive long-poll loop first so we don't fire any more
+    // requests after we've started tearing down.
+    if (pollControllerRef.current) {
+      pollControllerRef.current.abort();
+      pollControllerRef.current = null;
+    }
+    if (sendTimerRef.current) {
+      clearInterval(sendTimerRef.current);
+      sendTimerRef.current = null;
+    }
+    if (scriptNodeRef.current) {
+      try { scriptNodeRef.current.disconnect(); } catch { /* ignore */ }
+      scriptNodeRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close(); } catch { /* ignore */ }
+      audioCtxRef.current = null;
+    }
+    geminiSessionRef.current = null;
+    micBufferRef.current = [];
+    // --- Shared mic ---
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
       localStreamRef.current = null;
@@ -218,117 +268,369 @@ function RealtimeChat() {
     setMuted(false);
   }, []);
 
-  /** Connect to the selected provider's realtime endpoint. */
+  // -------------------------------------------------------------------------
+  // WebRTC path — ChatGPT + Perplexity (SDP offer/answer exchange).
+  // -------------------------------------------------------------------------
+
+  /** Connect via WebRTC (ChatGPT or Perplexity). Builds an SDP offer,
+   * POSTs it to the backend, applies the SDP answer. */
+  const connectWebRtc = useCallback(async () => {
+    // 1. Get the user's mic.
+    const localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    localStreamRef.current = localStream;
+
+    // 2. Create the peer connection + add the mic track.
+    const pc = new RTCPeerConnection();
+    pcRef.current = pc;
+    localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+
+    // 3. Open the data channel BEFORE creating the offer (the OpenAI
+    //    Realtime protocol uses a data channel named "oai-events" for
+    //    conversation events). Perplexity may use its own channel —
+    //    creating one upfront is harmless; the server opens its own if it
+    //    needs a different name).
+    const dc = pc.createDataChannel("oai-events", { ordered: true });
+    dcRef.current = dc;
+    dc.onopen = () => {
+      log("Data channel open.");
+      // ChatGPT: send a session.update to set the selected voice + audio
+      // modalities. Perplexity has its own protocol so we skip this.
+      if (providerRef.current === "chatgpt") {
+        const update = {
+          type: "session.update",
+          session: {
+            modalities: ["text", "audio"],
+            voice: voiceRef.current,
+            input_audio_format: "pcm16",
+            output_audio_format: "pcm16",
+            turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 200 },
+          },
+        };
+        dc.send(JSON.stringify(update));
+        log(`Voice set to "${voiceRef.current}".`);
+      }
+    };
+    dc.onmessage = (e) => {
+      // Surface conversation events (transcripts etc.) in the transcript.
+      try {
+        const msg = JSON.parse(typeof e.data === "string" ? e.data : "");
+        if (msg.type === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
+          log(`You: ${msg.transcript}`);
+        } else if (msg.type === "response.audio_transcript.delta" && msg.delta) {
+          // Append delta to the last assistant line.
+          setTranscript((t) => {
+            const next = [...t];
+            const last = next[next.length - 1] ?? "";
+            if (last.startsWith(`[${new Date().toLocaleTimeString()}] AI:`)) {
+              next[next.length - 1] = last + msg.delta;
+            } else {
+              next.push(`[${new Date().toLocaleTimeString()}] AI: ${msg.delta}`);
+            }
+            return next;
+          });
+        } else if (msg.type === "error") {
+          log(`Server error: ${msg.error?.message ?? JSON.stringify(msg)}`);
+        }
+      } catch {
+        // Non-JSON message — ignore.
+      }
+    };
+
+    // 4. Play the remote audio track on a hidden <audio> element.
+    pc.ontrack = (event) => {
+      log("Remote audio track received.");
+      if (!audioElRef.current) {
+        audioElRef.current = new Audio();
+        audioElRef.current.autoplay = true;
+      }
+      audioElRef.current.srcObject = event.streams[0];
+      audioElRef.current.play().catch(() => { /* autoplay may need a user gesture */ });
+    };
+
+    // 5. Create the SDP offer.
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    // Wait for ICE gathering to complete (or a short timeout) so the offer
+    // contains ICE candidates — saves a round-trip.
+    await waitForIceGathering(pc, 2000);
+
+    // 6. POST the offer to the backend, which forwards it to ChatGPT or
+    //    Perplexity and returns the SDP answer.
+    const endpoint =
+      providerRef.current === "chatgpt" ? "/api/realtime/connect" : "/api/perplexity/connect";
+    log(`POST ${endpoint}…`);
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sdp: pc.localDescription?.sdp ?? offer.sdp }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Backend ${res.status}: ${text.slice(0, 300)}`);
+    }
+    const data = (await res.json()) as { sdp?: string; type?: string };
+    if (!data.sdp) throw new Error("Backend returned no SDP answer.");
+
+    // 7. Apply the remote answer.
+    await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    setStatus("connected");
+    log("Connected. Speak when ready.");
+  }, [log]);
+
+  // -------------------------------------------------------------------------
+  // Gemini bidi path — Google AI Studio Web Channel.
+  // -------------------------------------------------------------------------
+
+  /** Decode a base64 PCM16 (16kHz mono) string and play it via the
+   * AudioContext. Each chunk is scheduled right after the previous one
+   * (we keep a `nextStartTime` so chunks don't overlap or stutter). */
+  const playPcmChunkRef = useRef<((b64: string) => void) | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
+
+  /** Convert a Float32 PCM buffer to PCM16 (Int16) little-endian. */
+  const float32ToInt16 = useCallback((float32: Float32Array): Int16Array => {
+    const out = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      const clamped = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    }
+    return out;
+  }, []);
+
+  /** Encode an Int16Array to a base64 string (little-endian bytes). */
+  const int16ToBase64 = useCallback((int16: Int16Array): string => {
+    const bytes = new Uint8Array(int16.length * 2);
+    const view = new DataView(bytes.buffer);
+    for (let i = 0; i < int16.length; i++) view.setInt16(i * 2, int16[i], true);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }, []);
+
+  /** Decode a base64 PCM16 (little-endian) string → Float32Array. */
+  const base64ToFloat32 = useCallback((b64: string): Float32Array => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const view = new DataView(bytes.buffer);
+    const int16 = new Int16Array(bytes.length / 2);
+    for (let i = 0; i < int16.length; i++) int16[i] = view.getInt16(i * 2, true);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 0x8000;
+    return float32;
+  }, []);
+
+  /** Connect via the Gemini bidi (Web Channel) protocol.
+   *
+   * Flow:
+   *   1. POST /api/gemini/connect { action: "start" } → { gsessionid, sid, rid }
+   *   2. Open AudioContext (16kHz) + getUserMedia (16kHz) + ScriptProcessor
+   *   3. ScriptProcessor onaudioprocess → Float32 → Int16 → queue
+   *   4. setInterval(200ms) flushes the queued PCM as base64 → POST send
+   *   5. Concurrent long-poll loop: POST receive → audioChunks → play via AudioContext
+   */
+  const connectGemini = useCallback(async () => {
+    // 1. Create an AudioContext at 16kHz so the PCM encode/decode round-
+    //    trips match what the Gemini bidi endpoint expects.
+    const AudioCtor: typeof AudioContext =
+      window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const audioCtx = new AudioCtor({ sampleRate: 16000 });
+    audioCtxRef.current = audioCtx;
+    // Some browsers ignore the requested sample rate; we resample below
+    // by routing the mic through a ScriptProcessor at the ctx rate.
+
+    // 2. Get the user's mic (no constraints on sample rate — we'll
+    //    capture at whatever the AudioContext uses).
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    micStreamRef.current = micStream;
+    // Reuse the shared localStreamRef so the existing mute toggle works
+    // for Gemini too.
+    localStreamRef.current = micStream;
+
+    // 3. Wire the mic into the AudioContext + a ScriptProcessor for PCM
+    //    capture. 4096-sample buffer at 16kHz = 256ms per callback.
+    const source = audioCtx.createMediaStreamSource(micStream);
+    const scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    scriptNodeRef.current = scriptNode;
+    scriptNode.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      micBufferRef.current.push(float32ToInt16(new Float32Array(input)));
+    };
+    source.connect(scriptNode);
+    // ScriptProcessor needs a destination to fire — connect to a muted
+    // gain so we don't echo the mic back out the speakers.
+    const mutedGain = audioCtx.createGain();
+    mutedGain.gain.value = 0;
+    scriptNode.connect(mutedGain);
+    mutedGain.connect(audioCtx.destination);
+
+    // 4. Start the bidi session.
+    log("POST /api/gemini/connect {start}…");
+    const startRes = await fetch("/api/gemini/connect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "start" }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!startRes.ok) {
+      const text = await startRes.text().catch(() => "");
+      throw new Error(`Gemini start ${startRes.status}: ${text.slice(0, 300)}`);
+    }
+    const startData = (await startRes.json()) as {
+      ok?: boolean;
+      gsessionid?: string;
+      sid?: string;
+      rid?: string;
+      audioChunks?: string[];
+      textChunks?: string[];
+      error?: string;
+    };
+    if (!startData.ok || !startData.gsessionid || !startData.rid) {
+      throw new Error(startData.error ?? "Gemini start returned no session.");
+    }
+    geminiSessionRef.current = {
+      gsessionid: startData.gsessionid,
+      sid: startData.sid ?? "",
+      rid: startData.rid,
+    };
+    log(`Gemini session started (rid=${startData.rid}).`);
+
+    // Play any audio returned in the start response (a greeting).
+    if (startData.audioChunks && startData.audioChunks.length > 0) {
+      for (const chunk of startData.audioChunks) playPcmChunkRef.current?.(chunk);
+    }
+    if (startData.textChunks && startData.textChunks.length > 0) {
+      log(`AI: ${startData.textChunks.join("")}`);
+    }
+
+    // 5. Set up the play-PCM helper (closure over audioCtx + nextStartTime).
+    nextStartTimeRef.current = audioCtx.currentTime;
+    playPcmChunkRef.current = (b64: string) => {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const float32 = base64ToFloat32(b64);
+      const buffer = ctx.createBuffer(1, float32.length, 16000);
+      buffer.copyToChannel(float32, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      // Schedule right after the previous chunk (or now if it lapsed).
+      const startTime = Math.max(ctx.currentTime, nextStartTimeRef.current);
+      src.start(startTime);
+      nextStartTimeRef.current = startTime + buffer.duration;
+    };
+
+    // 6. Start the mic-flush loop — every 200ms, drain micBufferRef into
+    //    a single base64 PCM and POST it to /api/gemini/connect {send}.
+    sendTimerRef.current = setInterval(async () => {
+      const session = geminiSessionRef.current;
+      if (!session) return;
+      const chunks = micBufferRef.current.splice(0, micBufferRef.current.length);
+      if (chunks.length === 0) return; // nothing captured this window
+      // Concat all Int16 chunks into one.
+      let total = 0;
+      for (const c of chunks) total += c.length;
+      const merged = new Int16Array(total);
+      let off = 0;
+      for (const c of chunks) {
+        merged.set(c, off);
+        off += c.length;
+      }
+      const b64 = int16ToBase64(merged);
+      try {
+        await fetch("/api/gemini/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "send",
+            gsessionid: session.gsessionid,
+            sid: session.sid,
+            rid: session.rid,
+            audio: b64,
+          }),
+          signal: AbortSignal.timeout(30_000),
+        });
+      } catch (err) {
+        // Network blips are OK — we'll try again next tick.
+        console.warn("[gemini] send failed:", (err as Error).message);
+      }
+    }, 200);
+
+    // 7. Start the receive long-poll loop. Each call waits up to ~25s
+    //    for an AI audio chunk; the AbortController lets us stop cleanly
+    //    on disconnect.
+    const pollOnce = async () => {
+      const session = geminiSessionRef.current;
+      if (!session) return;
+      const ctrl = new AbortController();
+      pollControllerRef.current = ctrl;
+      try {
+        const res = await fetch("/api/gemini/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "receive",
+            gsessionid: session.gsessionid,
+            sid: session.sid,
+            rid: session.rid,
+          }),
+          signal: ctrl.signal,
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          log(`Gemini receive ${res.status}: ${text.slice(0, 200)}`);
+          return;
+        }
+        const data = (await res.json()) as {
+          ok?: boolean;
+          audioChunks?: string[];
+          textChunks?: string[];
+          done?: boolean;
+          error?: string;
+        };
+        if (data.audioChunks) {
+          for (const chunk of data.audioChunks) playPcmChunkRef.current?.(chunk);
+        }
+        if (data.textChunks && data.textChunks.length > 0) {
+          log(`AI: ${data.textChunks.join("")}`);
+        }
+        if (data.done) log("[gemini] turn complete.");
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return; // expected on teardown
+        log(`Gemini receive error: ${(err as Error).message}`);
+      } finally {
+        if (pollControllerRef.current === ctrl) pollControllerRef.current = null;
+      }
+      // Loop if we still have a session.
+      if (geminiSessionRef.current && !ctrl.signal.aborted) {
+        // Use setTimeout so React state updates + cleanup can interleave.
+        setTimeout(pollOnce, 100);
+      }
+    };
+    void pollOnce();
+
+    setStatus("connected");
+    log("Connected. Speak when ready.");
+  }, [base64ToFloat32, float32ToInt16, int16ToBase64, log]);
+
+  /** Connect to the selected provider's realtime endpoint. Dispatches to
+   * the WebRTC path (ChatGPT / Perplexity) or the Gemini bidi path. */
   const connect = useCallback(async () => {
     setError(null);
     setStatus("connecting");
     setTranscript([]);
     log(`Connecting to ${providerRef.current}…`);
-
     try {
-      // 1. Get the user's mic.
-      const localStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      localStreamRef.current = localStream;
-
-      // 2. Create the peer connection + add the mic track.
-      const pc = new RTCPeerConnection();
-      pcRef.current = pc;
-      localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
-
-      // 3. Open the data channel BEFORE creating the offer (the OpenAI
-      //    Realtime protocol uses a data channel named "oai-events" for
-      //    conversation events). Perplexity may use its own channel —
-      //    creating one upfront is harmless; the server opens its own if it
-      //    needs a different name).
-      const dc = pc.createDataChannel("oai-events", { ordered: true });
-      dcRef.current = dc;
-      dc.onopen = () => {
-        log("Data channel open.");
-        // ChatGPT: send a session.update to set the selected voice + audio
-        // modalities. Perplexity has its own protocol so we skip this.
-        if (providerRef.current === "chatgpt") {
-          const update = {
-            type: "session.update",
-            session: {
-              modalities: ["text", "audio"],
-              voice: voiceRef.current,
-              input_audio_format: "pcm16",
-              output_audio_format: "pcm16",
-              turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 200 },
-            },
-          };
-          dc.send(JSON.stringify(update));
-          log(`Voice set to "${voiceRef.current}".`);
-        }
-      };
-      dc.onmessage = (e) => {
-        // Surface conversation events (transcripts etc.) in the transcript.
-        try {
-          const msg = JSON.parse(typeof e.data === "string" ? e.data : "");
-          if (msg.type === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
-            log(`You: ${msg.transcript}`);
-          } else if (msg.type === "response.audio_transcript.delta" && msg.delta) {
-            // Append delta to the last assistant line.
-            setTranscript((t) => {
-              const next = [...t];
-              const last = next[next.length - 1] ?? "";
-              if (last.startsWith(`[${new Date().toLocaleTimeString()}] AI:`)) {
-                next[next.length - 1] = last + msg.delta;
-              } else {
-                next.push(`[${new Date().toLocaleTimeString()}] AI: ${msg.delta}`);
-              }
-              return next;
-            });
-          } else if (msg.type === "error") {
-            log(`Server error: ${msg.error?.message ?? JSON.stringify(msg)}`);
-          }
-        } catch {
-          // Non-JSON message — ignore.
-        }
-      };
-
-      // 4. Play the remote audio track on a hidden <audio> element.
-      pc.ontrack = (event) => {
-        log("Remote audio track received.");
-        if (!audioElRef.current) {
-          audioElRef.current = new Audio();
-          audioElRef.current.autoplay = true;
-        }
-        audioElRef.current.srcObject = event.streams[0];
-        audioElRef.current.play().catch(() => { /* autoplay may need a user gesture */ });
-      };
-
-      // 5. Create the SDP offer.
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      // Wait for ICE gathering to complete (or a short timeout) so the offer
-      // contains ICE candidates — saves a round-trip.
-      await waitForIceGathering(pc, 2000);
-
-      // 6. POST the offer to the backend, which forwards it to ChatGPT or
-      //    Perplexity and returns the SDP answer.
-      const endpoint =
-        providerRef.current === "chatgpt" ? "/api/realtime/connect" : "/api/perplexity/connect";
-      log(`POST ${endpoint}…`);
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sdp: pc.localDescription?.sdp ?? offer.sdp }),
-        signal: AbortSignal.timeout(60_000),
-      });
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(`Backend ${res.status}: ${text.slice(0, 300)}`);
+      if (providerRef.current === "gemini") {
+        await connectGemini();
+      } else {
+        await connectWebRtc();
       }
-      const data = (await res.json()) as { sdp?: string; type?: string };
-      if (!data.sdp) throw new Error("Backend returned no SDP answer.");
-
-      // 7. Apply the remote answer.
-      await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
-      setStatus("connected");
-      log("Connected. Speak when ready.");
     } catch (err) {
       const message = (err as Error).message ?? String(err);
       setError(message);
@@ -336,9 +638,11 @@ function RealtimeChat() {
       log(`Error: ${message}`);
       teardown();
     }
-  }, [log, teardown]);
+  }, [connectGemini, connectWebRtc, log, teardown]);
 
-  /** Toggle the mic on/off (mutes the local audio track). */
+  /** Toggle the mic on/off (mutes the local audio track). Works for both
+   * the WebRTC path (localStream) and the Gemini path (micStream) since
+   * both store the MediaStream in localStreamRef. */
   const toggleMute = useCallback(() => {
     const stream = localStreamRef.current;
     if (!stream) return;
@@ -350,6 +654,22 @@ function RealtimeChat() {
 
   /** Disconnect from the provider. */
   const disconnect = useCallback(() => {
+    // Best-effort stop call for Gemini (the server doesn't really need a
+    // stop — we just stop long-polling — but it's polite).
+    const session = geminiSessionRef.current;
+    if (session) {
+      void fetch("/api/gemini/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "stop",
+          gsessionid: session.gsessionid,
+          sid: session.sid,
+          rid: session.rid,
+        }),
+        signal: AbortSignal.timeout(5_000),
+      }).catch(() => { /* best-effort */ });
+    }
     teardown();
     setStatus("idle");
     log("Disconnected.");
@@ -385,8 +705,10 @@ function RealtimeChat() {
           </Badge>
         </div>
         <CardDescription className="text-zinc-500">
-          Talk to a realtime AI model over WebRTC. ChatGPT needs a JWT in the
-          vault; Perplexity needs its session cookies there.
+          Talk to a realtime AI model. ChatGPT and Perplexity use WebRTC;
+          Gemini Live uses Google's bidi (Web Channel) protocol. ChatGPT
+          needs a JWT in the vault; Perplexity + Gemini need their session
+          cookies there (refreshed by the Chrome extension).
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -413,6 +735,13 @@ function RealtimeChat() {
               disabled={connected || status === "connecting"}
             >
               Perplexity
+            </ProviderButton>
+            <ProviderButton
+              active={provider === "gemini"}
+              onClick={() => setProvider("gemini")}
+              disabled={connected || status === "connecting"}
+            >
+              Gemini
             </ProviderButton>
           </div>
 

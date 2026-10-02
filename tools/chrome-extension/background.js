@@ -1,7 +1,7 @@
 /**
  * ACE Studio Vault Refresher — background service worker (Manifest V3).
  *
- * Two jobs, both run on install, on startup, and every 2 hours (via
+ * Three jobs, all run on install, on startup, and every 2 hours (via
  * chrome.alarms) and on action click:
  *
  *   1. refreshJwt() — ChatGPT Realtime JWT.
@@ -17,6 +17,16 @@
  *      extracts the active account UUID from __Host-pplx-last-active-account,
  *      and POSTs both to the vault Worker at /perplexity/cookies. The backend
  *      /api/perplexity/connect route GETs them before each SDP exchange.
+ *
+ *   3. refreshGoogleCookies() — Google (Gemini Live) cookies.
+ *      Reads all cookies for .google.com via chrome.cookies.getAll, builds a
+ *      single `name=value; name=value; ...` Cookie header string, and POSTs
+ *      it to the vault Worker at /google/cookies. The backend
+ *      /api/gemini/connect route GETs them before each bidi call, extracts
+ *      the SAPISID value, and computes a fresh SAPISIDHASH. (The route
+ *      doesn't need us to compute SAPISIDHASH — the SAPISID cookie value
+ *      alone is enough; the backend rehashes with a fresh timestamp per
+ *      request.)
  *
  * The vault URL + secret are configurable via chrome.storage.local
  * (VAULT_URL / VAULT_SECRET keys); defaults are baked in below.
@@ -185,6 +195,90 @@ async function refreshPerplexityCookies(vault) {
 }
 
 // ---------------------------------------------------------------------------
+// Google (Gemini Live) cookies refresh
+// ---------------------------------------------------------------------------
+
+/**
+ * Get all cookies for .google.com and build a Cookie header string.
+ *
+ * Google sets session cookies on `.google.com` (SID, __Secure-1PSID,
+ * __Secure-3PSID, SAPISID, __Secure-1PAPISID, __Secure-3PAPISID, HSID,
+ * SSID, APISID, NID, SIDCC, __Secure-1PSIDCC, __Secure-3PSIDCC,
+ * __Secure-1PSIDTS, __Secure-3PSIDTS, AEC, SEARCH_SAMESITE, __Secure-STRP,
+ * etc.). The `SAPISID` value (or one of its __Secure- variants) is what
+ * the backend needs to compute the SAPISIDHASH auth header. We just send
+ * the whole cookie string here — the backend extracts SAPISID itself
+ * (avoids duplicating the extraction logic between extension + backend
+ * and keeps the SAPISID value out of the storage.local logs).
+ */
+async function getGoogleCookieData() {
+  // `domain: ".google.com"` returns cookies scoped to the apex + all
+  // subdomains. The bare `google.com` is included as a redundancy —
+  // chrome.cookies de-dupes by (name, domain, path).
+  const all = await Promise.all([
+    chrome.cookies.getAll({ domain: ".google.com" }),
+    chrome.cookies.getAll({ domain: "google.com" }),
+  ]);
+  const seen = new Set();
+  const cookies = [];
+  for (const list of all) {
+    for (const c of list) {
+      const key = `${c.name}|${c.domain}|${c.path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cookies.push(c);
+    }
+  }
+  if (cookies.length === 0) return { cookies: "", hasSapisid: false };
+  cookies.sort((a, b) => a.name.localeCompare(b.name));
+  const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+  // The backend needs SAPISID (or one of its __Secure- variants). We
+  // check it here so we can surface a useful error if the user is
+  // logged out of google.com.
+  const hasSapisid = cookies.some(
+    (c) =>
+      c.name === "SAPISID" ||
+      c.name === "__Secure-1PAPISID" ||
+      c.name === "__Secure-3PAPISID",
+  );
+  return { cookies: cookieHeader, hasSapisid };
+}
+
+/** POST the Google cookies to the vault Worker. */
+async function pushGoogleCookiesToVault(cookies, vault) {
+  const url = `${vault.url.replace(/\/+$/, "")}/google/cookies`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Vault-Secret": vault.secret,
+    },
+    body: JSON.stringify({ cookies }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`vault /google/cookies returned ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+/** Full Google cookies refresh — read cookies → push to vault. */
+async function refreshGoogleCookies(vault) {
+  const { cookies, hasSapisid } = await getGoogleCookieData();
+  if (!cookies) {
+    return { ok: false, error: "No google.com cookies found — is the user logged in?" };
+  }
+  if (!hasSapisid) {
+    return {
+      ok: false,
+      error: "No SAPISID cookie found — the user may not be signed in to aistudio.google.com.",
+    };
+  }
+  const result = await pushGoogleCookiesToVault(cookies, vault);
+  return { ok: true, cookieLength: cookies.length, result };
+}
+
+// ---------------------------------------------------------------------------
 // Orchestrator — runs both refreshes, logs the result.
 // ---------------------------------------------------------------------------
 
@@ -192,26 +286,33 @@ async function refreshAll(reason) {
   const vault = await getVaultConfig();
   console.log(`[vault-refresher] running (${reason})…`);
 
-  // Run both in parallel — they touch different sites.
-  const [jwtResult, pplxResult] = await Promise.allSettled([
+  // Run all three in parallel — they touch different sites.
+  const [jwtResult, pplxResult, googleResult] = await Promise.allSettled([
     refreshJwt(vault),
     refreshPerplexityCookies(vault),
+    refreshGoogleCookies(vault),
   ]);
 
   const jwt = jwtResult.status === "fulfilled" ? jwtResult.value : { ok: false, error: jwtResult.reason?.message };
   const pplx = pplxResult.status === "fulfilled" ? pplxResult.value : { ok: false, error: pplxResult.reason?.message };
+  const google = googleResult.status === "fulfilled" ? googleResult.value : { ok: false, error: googleResult.reason?.message };
 
   console.log(`[vault-refresher] ChatGPT JWT:`, jwt);
   console.log(`[vault-refresher] Perplexity cookies:`, pplx);
+  console.log(`[vault-refresher] Google cookies:`, google);
 
   // Surface a badge on the toolbar icon so the user can see the status.
-  const bothOk = jwt.ok && pplx.ok;
-  await chrome.action.setBadgeText({ text: bothOk ? "OK" : "ERR" });
+  // OK only when all enabled refreshes succeed. (Google cookies may not
+  // be available if the user hasn't visited aistudio.google.com — we
+  // count that as a soft failure: yellow badge with GG-ERR, not red.)
+  const allOk = jwt.ok && pplx.ok && google.ok;
+  const partial = jwt.ok && pplx.ok && !google.ok;
+  await chrome.action.setBadgeText({ text: allOk ? "OK" : partial ? "OK*" : "ERR" });
   await chrome.action.setBadgeBackgroundColor({
-    color: bothOk ? "#16a34a" : "#dc2626",
+    color: allOk ? "#16a34a" : partial ? "#ca8a04" : "#dc2626",
   });
 
-  return { jwt, pplx };
+  return { jwt, pplx, google };
 }
 
 // ---------------------------------------------------------------------------

@@ -1,13 +1,15 @@
 {
   "manifest_version": 3,
   "name": "ACE Studio Vault Refresher",
-  "version": "1.1.0",
-  "description": "Refreshes the ChatGPT JWT and Perplexity Realtime cookies into the ACE Studio vault Worker (for the Realtime voice feature).",
+  "version": "1.2.0",
+  "description": "Refreshes the ChatGPT JWT, Perplexity Realtime cookies, and Google (Gemini Live) cookies into the ACE Studio vault Worker (for the Realtime voice feature).",
   "permissions": ["cookies", "alarms", "storage"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://*.chatgpt.com/*",
     "https://www.perplexity.ai/*",
+    "https://*.google.com/*",
+    "https://google.com/*",
     "https://chatgpt-jwt-vault.nelciajulie.workers.dev/*"
   ],
   "background": {
