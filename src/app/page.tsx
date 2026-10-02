@@ -153,10 +153,10 @@ function TracksSection({
 }
 
 // ---------------------------------------------------------------------------
-// Realtime AI section — ChatGPT / Perplexity / Gemini / Inworld voice
+// Realtime AI section — ChatGPT / Perplexity / Gemini / Inworld / Qwen voice
 // ---------------------------------------------------------------------------
 
-type RealtimeProvider = "chatgpt" | "perplexity" | "gemini" | "inworld";
+type RealtimeProvider = "chatgpt" | "perplexity" | "gemini" | "inworld" | "qwen";
 
 // The 9 ChatGPT Realtime voices (the consumer chatgpt.com session.update
 // event accepts any of these). Perplexity, Gemini, and Inworld have their
@@ -320,6 +320,11 @@ function RealtimeChat() {
       log("Data channel open.");
       // ChatGPT: send a session.update to set the selected voice + audio
       // modalities. Perplexity has its own protocol so we skip this.
+      // Qwen: send a session.update matching the Qwen Omni SDK's config
+      // (model qwen3.8-omni-flash-realtime, voice Tina, server_vad with
+      // 800ms silence, input/output pcm16). Qwen's session.created already
+      // configures these defaults, but sending an explicit update is
+      // harmless + matches the playground's `sendUpdate` behavior.
       if (providerRef.current === "chatgpt") {
         const update = {
           type: "session.update",
@@ -333,29 +338,90 @@ function RealtimeChat() {
         };
         dc.send(JSON.stringify(update));
         log(`Voice set to "${voiceRef.current}".`);
+      } else if (providerRef.current === "qwen") {
+        // Qwen Voice session.update — matches the SDK's sendUpdateOptions
+        // pattern. The server's session.created already set sensible
+        // defaults (model qwen3.8-omni-flash-realtime, voice Tina,
+        // server_vad 800ms silence, pcm16 audio), but we send an explicit
+        // update to be safe + match the Qwen web client.
+        const update = {
+          type: "session.update",
+          session: {
+            modalities: ["text", "audio"],
+            voice: "Tina",
+            input_audio_format: "pcm16",
+            output_audio_format: "pcm16",
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 800,
+              create_response: true,
+              interrupt_response: true,
+            },
+            input_audio_transcription: { model: "qwen3-asr-flash-realtime" },
+          },
+        };
+        dc.send(JSON.stringify(update));
+        log(`Qwen session configured (model: qwen3.8-omni-flash-realtime, voice: Tina).`);
       }
     };
     dc.onmessage = (e) => {
       // Surface conversation events (transcripts etc.) in the transcript.
+      // Handles both standard OpenAI Realtime API event names (ChatGPT) AND
+      // the `output_`-infix variants used by Inworld + Qwen
+      // (`response.output_audio_transcript.delta` instead of
+      // `response.audio_transcript.delta`).
       try {
         const msg = JSON.parse(typeof e.data === "string" ? e.data : "");
-        if (msg.type === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
+        const t = msg.type as string | undefined;
+        if (!t) return;
+        // User mic transcript (final) — collapse duplicates per speech.
+        if (t === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
           log(`You: ${msg.transcript}`);
-        } else if (msg.type === "response.audio_transcript.delta" && msg.delta) {
-          // Append delta to the last assistant line.
-          setTranscript((t) => {
-            const next = [...t];
+        }
+        // AI transcript (streaming) — both standard + output_ variants.
+        else if ((t === "response.audio_transcript.delta" || t === "response.output_audio_transcript.delta") && msg.delta) {
+          setTranscript((prev) => {
+            const next = [...prev];
             const last = next[next.length - 1] ?? "";
-            if (last.startsWith(`[${new Date().toLocaleTimeString()}] AI:`)) {
+            if (last.includes("] AI:")) {
               next[next.length - 1] = last + msg.delta;
             } else {
               next.push(`[${new Date().toLocaleTimeString()}] AI: ${msg.delta}`);
             }
-            return next;
+            return next.slice(-200);
           });
-        } else if (msg.type === "error") {
-          log(`Server error: ${msg.error?.message ?? JSON.stringify(msg)}`);
         }
+        // AI transcript (final) — only log if no streaming deltas were received.
+        else if ((t === "response.audio_transcript.done" || t === "response.output_audio_transcript.done") && msg.transcript) {
+          setTranscript((prev) => {
+            const last = prev[prev.length - 1] ?? "";
+            if (last.includes("] AI:")) return prev; // already have streaming text
+            return [...prev.slice(-199), `[${new Date().toLocaleTimeString()}] AI: ${msg.transcript}`];
+          });
+        }
+        // Session lifecycle (Qwen sends session.created on connect).
+        else if (t === "session.created") {
+          log(`[dc] session created`);
+        }
+        // Server VAD state (user speech start/stop).
+        else if (t === "input_audio_buffer.speech_started") {
+          log(`[dc] speech started`);
+        }
+        else if (t === "input_audio_buffer.speech_stopped") {
+          log(`[dc] speech stopped`);
+        }
+        else if (t === "input_audio_buffer.committed") {
+          log(`[dc] audio committed`);
+        }
+        // Errors.
+        else if (t === "error") {
+          const errMsg = msg.error?.message ?? msg.error?.code ?? JSON.stringify(msg);
+          log(`Server error: ${errMsg}`);
+        }
+        // Other events are silently ignored (response.created, response.done,
+        // rate_limits.updated, etc. — they don't carry user-visible payload).
       } catch {
         // Non-JSON message — ignore.
       }
@@ -379,10 +445,13 @@ function RealtimeChat() {
     // contains ICE candidates — saves a round-trip.
     await waitForIceGathering(pc, 2000);
 
-    // 6. POST the offer to the backend, which forwards it to ChatGPT or
-    //    Perplexity and returns the SDP answer.
+    // 6. POST the offer to the backend, which forwards it to ChatGPT,
+    //    Perplexity, or Qwen and returns the SDP answer.
     const endpoint =
-      providerRef.current === "chatgpt" ? "/api/realtime/connect" : "/api/perplexity/connect";
+      providerRef.current === "chatgpt" ? "/api/realtime/connect"
+      : providerRef.current === "perplexity" ? "/api/perplexity/connect"
+      : providerRef.current === "qwen" ? "/api/qwen/token"
+      : "/api/realtime/connect";
     log(`POST ${endpoint}…`);
     const res = await fetch(endpoint, {
       method: "POST",
@@ -394,11 +463,14 @@ function RealtimeChat() {
       const text = await res.text().catch(() => "");
       throw new Error(`Backend ${res.status}: ${text.slice(0, 300)}`);
     }
-    const data = (await res.json()) as { sdp?: string; type?: string };
-    if (!data.sdp) throw new Error("Backend returned no SDP answer.");
+    const data = (await res.json()) as { sdp?: string; sdp_token?: string; type?: string };
+    // Qwen's backend returns the answer SDP in `sdp_token`; ChatGPT/Perplexity
+    // return it in `sdp`. Accept either.
+    const answerSdp = data.sdp ?? data.sdp_token;
+    if (!answerSdp) throw new Error("Backend returned no SDP answer.");
 
     // 7. Apply the remote answer.
-    await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
     setStatus("connected");
     log("Connected. Speak when ready.");
   }, [log]);
@@ -1429,12 +1501,13 @@ function RealtimeChat() {
           </Badge>
         </div>
         <CardDescription className="text-zinc-500">
-          Talk to a realtime AI model. ChatGPT and Perplexity use WebRTC;
-          Gemini Live uses Google's bidi (Web Channel) protocol; Inworld
-          uses a direct browser WebSocket to api.inworld.ai. ChatGPT needs
-          a JWT in the vault; Perplexity + Gemini need their session cookies
-          there (refreshed by the Chrome extension); Inworld just needs an
-          `INWORLD_TOKEN` env var (or a token in the vault).
+          Talk to a realtime AI model. ChatGPT, Perplexity, and Qwen use
+          WebRTC; Gemini Live uses Google's bidi (Web Channel) protocol;
+          Inworld uses a direct browser WebSocket to api.inworld.ai. ChatGPT
+          needs a JWT in the vault; Perplexity + Gemini need their session
+          cookies there (refreshed by the Chrome extension); Inworld needs
+          an `INWORLD_TOKEN` env var (or a token in the vault); Qwen needs
+          a `QWEN_ACCESS_TOKEN` env var (the chat.qwen.ai JWT).
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -1475,6 +1548,13 @@ function RealtimeChat() {
               disabled={connected || status === "connecting"}
             >
               Inworld
+            </ProviderButton>
+            <ProviderButton
+              active={provider === "qwen"}
+              onClick={() => setProvider("qwen")}
+              disabled={connected || status === "connecting"}
+            >
+              Qwen
             </ProviderButton>
           </div>
 
