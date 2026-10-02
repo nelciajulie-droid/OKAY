@@ -650,17 +650,43 @@ function RealtimeChat() {
    * fetched from `/api/inworld/token` (which reads INWORLD_TOKEN from the
    * env, falling back to the vault).
    *
+   * PROTOCOL (confirmed by first-run testing — Task 57):
+   * Inworld's realtime session endpoint speaks the **OpenAI Realtime API
+   * event protocol**, NOT a custom `{type:"audio",data,...}` shape. The
+   * telltale is the error response shape
+   * `{"type":"invalid_request_error","code":"unknown_event_type",...,
+   *  "event_id":null}` (OpenAI-style) returned when the client sends an
+   * unknown event type. So:
+   *
+   *   - Client→server audio: `input_audio_buffer.append` with an `audio`
+   *     field (base64 PCM16, 16kHz mono). NOT `{type:"audio",data,...}`.
+   *   - Server→client AI audio: `response.audio.delta` with a `delta`
+   *     field (base64 PCM16). Play via the AudioContext.
+   *   - Server→client AI transcript: `response.audio_transcript.delta` /
+   *     `.done` (streaming text of the AI's spoken reply).
+   *   - Server→client user transcript: `conversation.item.input_audio_
+   *     transcription.completed` (server's transcription of the user mic).
+   *   - Server-side VAD: `input_audio_buffer.speech_started` / `.stopped`
+   *     / `.committed` — the server auto-commits + triggers a response
+   *     when it detects end-of-speech (default `turn_detection: server_vad`).
+   *   - Session lifecycle: `session.created` / `session.updated`.
+   *   - Errors: `{type:"error", error:{type,code,message,...}}`.
+   *
    * Flow:
    *   1. GET /api/inworld/token → { token } (basic_<base64>).
    *   2. Open WebSocket: `wss://api.inworld.ai/api/v1/realtime/session
    *      ?protocol=realtime&key=browser-session-<ts>`, subprotocol = [token].
+   *      On open, the server sends `session.created` with the default
+   *      config (modalities:["text","audio"], turn_detection:server_vad,
+   *      input_audio_format:"pcm16"). No `session.update` is needed.
    *   3. AudioContext (16kHz) + getUserMedia + ScriptProcessor for PCM
    *      capture (same as Gemini).
    *   4. setInterval(200ms) flushes mic PCM16 → base64 → JSON
-   *      { type:"audio", data:<b64>, sampleRate:16000, encoding:"linear16" }
-   *      → ws.send.
-   *   5. ws.onmessage: text frames are JSON (handled by `handleInworldMsg`);
-   *      binary frames are raw PCM16 → played via the AudioContext.
+   *      `{type:"input_audio_buffer.append", audio:<b64>}` → ws.send.
+   *   5. ws.onmessage: text frames are JSON (handled by `handleInworldMsg`
+   *      which dispatches on OpenAI Realtime API event names); binary
+   *      frames are raw PCM16 → played via the AudioContext (kept as a
+   *      fallback in case Inworld sends any binary audio frames).
    *
    * NOTE: Inworld checks the `Origin` header. The deployed Vercel origin
    * (`https://ace-studio-*.vercel.app`) is NOT `https://platform.inworld.ai`,
@@ -811,10 +837,31 @@ function RealtimeChat() {
       }
     };
 
-    /** Dispatch an incoming Inworld JSON message. The exact protocol is
-     * under-documented; this handler is deliberately permissive (looks
-     * for the message type under several common keys, handles audio +
-     * transcripts + state + errors, and logs anything unknown). */
+    /** Dispatch an incoming Inworld JSON message. Inworld's realtime
+     * session endpoint (`wss://api.inworld.ai/api/v1/realtime/session`)
+     * speaks the OpenAI Realtime API event protocol — confirmed by the
+     * error response shape `{"type":"invalid_request_error","code":
+     * "unknown_event_type",...,"event_id":null}` (OpenAI-style) returned
+     * when we sent a `{type:"audio"}` event. So the server→client events
+     * we receive are OpenAI Realtime API event names:
+     *
+     *   - `session.created` / `session.updated` — session lifecycle.
+     *   - `input_audio_buffer.speech_started` / `.speech_stopped` /
+     *     `.committed` — server-side VAD state.
+     *   - `conversation.item.input_audio_transcription.completed` —
+     *     server's transcription of the user's mic audio.
+     *   - `response.created` / `response.done` — AI response lifecycle.
+     *   - `response.audio.delta` / `.done` — base64 PCM16 chunks of the
+     *     AI's spoken reply (the `delta` field holds the base64 audio).
+     *   - `response.audio_transcript.delta` / `.done` — streaming text
+     *     transcript of the AI's spoken reply.
+     *   - `response.text.delta` / `.done` — text-only reply chunks.
+     *   - `error` — `{ type:"error", error:{type,code,message,...} }`.
+     *   - `rate_limits.updated` — can be ignored.
+     *
+     * We ALSO keep the legacy generic handlers (audio / transcript /
+     * text / user / state / error / default) as fallbacks in case
+     * Inworld deviates from the OpenAI shape for any event. */
     const handleInworldMsg = (msg: Record<string, unknown>) => {
       if (!msg || typeof msg !== "object") return;
       const type =
@@ -823,26 +870,132 @@ function RealtimeChat() {
         (msg.kind as string) ??
         "message";
       switch (type) {
+        // --- AI audio output (OpenAI Realtime API) ---
+        case "response.audio.delta": {
+          // `delta` is a base64 PCM16 chunk of the AI's spoken reply.
+          const b64 = (msg.delta as string) ?? (msg.audio as string) ?? (msg.data as string);
+          if (typeof b64 === "string" && b64.length > 0) playPcmChunkRef.current?.(b64);
+          break;
+        }
+        case "response.audio.done": {
+          // Final audio chunk for the response — already streamed via
+          // .delta events; nothing to do here.
+          break;
+        }
+        // --- AI transcript (streaming text of the spoken reply) ---
+        case "response.audio_transcript.delta": {
+          const d = (msg.delta as string) ?? "";
+          if (d) log(`AI: ${d}`);
+          break;
+        }
+        case "response.audio_transcript.done": {
+          const t = (msg.transcript as string) ?? (msg.text as string) ?? "";
+          if (t) log(`AI: ${t}`);
+          break;
+        }
+        case "response.text.delta": {
+          const d = (msg.delta as string) ?? "";
+          if (d) log(`AI: ${d}`);
+          break;
+        }
+        case "response.text.done": {
+          const t = (msg.text as string) ?? "";
+          if (t) log(`AI: ${t}`);
+          break;
+        }
+        // --- User mic transcript (server-side transcription) ---
+        case "conversation.item.input_audio_transcription.completed": {
+          const t = (msg.transcript as string) ?? (msg.text as string) ?? "";
+          if (t) log(`You: ${t}`);
+          break;
+        }
+        case "conversation.item.input_audio_transcription.delta": {
+          const d = (msg.delta as string) ?? "";
+          if (d) log(`You: ${d}`);
+          break;
+        }
+        // --- Server-side VAD (voice activity detection) state ---
+        case "input_audio_buffer.speech_started": {
+          // The server detected the start of user speech. We can use
+          // this to interrupt the AI's current playback (barge-in),
+          // but for now just log it so the user sees the turn boundary.
+          log("[inworld] speech started");
+          break;
+        }
+        case "input_audio_buffer.speech_stopped": {
+          log("[inworld] speech stopped");
+          break;
+        }
+        case "input_audio_buffer.committed": {
+          // The audio buffer was committed (either by VAD or by an
+          // explicit commit). A `response.created` will follow.
+          break;
+        }
+        // --- Session lifecycle ---
+        case "session.created": {
+          log("[inworld] session created");
+          break;
+        }
+        case "session.updated": {
+          log("[inworld] session updated");
+          break;
+        }
+        // --- Response lifecycle ---
+        case "response.created": {
+          // The AI response is starting. Nothing to log (the audio +
+          // transcript deltas will stream next).
+          break;
+        }
+        case "response.done": {
+          // The AI response finished. Nothing to do here.
+          break;
+        }
+        case "response.cancelled": {
+          // The response was cancelled (e.g. by barge-in).
+          break;
+        }
+        case "rate_limits.updated": {
+          // Rate limit info — can be ignored for now.
+          break;
+        }
+        // --- Errors (OpenAI shape: {type:"error", error:{...}}) ---
+        case "error": {
+          const errObj = msg.error as Record<string, unknown> | undefined;
+          const errMsg =
+            (typeof errObj === "object" && errObj
+              ? ((errObj.message as string) ??
+                (errObj.code as string) ??
+                (errObj.type as string))
+              : undefined) ??
+            (msg.message as string) ??
+            JSON.stringify(msg);
+          const errStr = typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg);
+          log(`[inworld] error: ${errStr}`);
+          break;
+        }
+        // --- Legacy / generic fallbacks (kept in case Inworld deviates
+        //     for any event) ---
         case "audio":
         case "audio_chunk":
         case "audioChunk": {
           const b64 =
             (msg.data as string) ??
             ((msg.audio as Record<string, unknown> | undefined)?.data as string) ??
-            (msg.payload as string);
-          if (typeof b64 === "string") playPcmChunkRef.current?.(b64);
+            (msg.payload as string) ??
+            (msg.delta as string);
+          if (typeof b64 === "string" && b64.length > 0) playPcmChunkRef.current?.(b64);
           break;
         }
         case "transcript":
         case "text":
         case "utterance":
-        case "response":
         case "answer": {
           const text =
             (msg.text as string) ??
             (msg.transcript as string) ??
             (msg.data as string) ??
-            (msg.content as string);
+            (msg.content as string) ??
+            (msg.delta as string);
           if (typeof text === "string" && text.length > 0) log(`AI: ${text}`);
           break;
         }
@@ -853,7 +1006,8 @@ function RealtimeChat() {
           const text =
             (msg.text as string) ??
             (msg.transcript as string) ??
-            (msg.data as string);
+            (msg.data as string) ??
+            (msg.delta as string);
           if (typeof text === "string" && text.length > 0) log(`You: ${text}`);
           break;
         }
@@ -863,19 +1017,9 @@ function RealtimeChat() {
           log(`[inworld] state: ${JSON.stringify(msg).slice(0, 200)}`);
           break;
         }
-        case "error": {
-          const errMsg =
-            (msg.error as string) ??
-            (msg.message as string) ??
-            JSON.stringify(msg);
-          // Ensure it's a string (avoid [object Object])
-          const errStr = typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg);
-          log(`[inworld] error: ${errStr}`);
-          break;
-        }
         default: {
-          // Unknown type — log a compact summary so the user can see what
-          // Inworld is sending (and we can refine the handler later).
+          // Unknown type — log a compact summary so the user can see
+          // what Inworld is sending (and we can refine the handler).
           log(`[inworld] ${type}: ${JSON.stringify(msg).slice(0, 200)}`);
         }
       }
@@ -917,9 +1061,14 @@ function RealtimeChat() {
     };
 
     // 7. Start the mic-flush loop — every 200ms, drain micBufferRef into
-    //    a single base64 PCM and send it as a JSON audio message. This
-    //    mirrors the Gemini flush loop, just over a WebSocket instead of
-    //    a long-poll HTTP POST.
+    //    a single base64 PCM and send it as an OpenAI-Realtime-API-style
+    //    `input_audio_buffer.append` event. Inworld's realtime session
+    //    endpoint (`wss://api.inworld.ai/api/v1/realtime/session`) speaks
+    //    the OpenAI Realtime API event protocol (confirmed by the error
+    //    response shape `{"type":"invalid_request_error","code":
+    //    "unknown_event_type",...,"event_id":null}`), so the client→server
+    //    audio event is `input_audio_buffer.append` with an `audio` field
+    //    (base64 PCM16) — NOT a custom `{type:"audio",data,...}` shape.
     sendTimerRef.current = setInterval(() => {
       const sock = inworldWsRef.current;
       if (!sock || sock.readyState !== WebSocket.OPEN) return;
@@ -935,12 +1084,13 @@ function RealtimeChat() {
       }
       const b64 = int16ToBase64(merged);
       try {
+        // OpenAI Realtime API: `input_audio_buffer.append` with an `audio`
+        // field containing base64-encoded PCM16. The session's input
+        // audio format is `pcm16` (16kHz mono) by default for Inworld.
         sock.send(
           JSON.stringify({
-            type: "audio",
-            data: b64,
-            sampleRate: 16000,
-            encoding: "linear16",
+            type: "input_audio_buffer.append",
+            audio: b64,
           }),
         );
       } catch (err) {
