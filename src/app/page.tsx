@@ -267,6 +267,8 @@ function RealtimeChat() {
       clearInterval(sendTimerRef.current);
       sendTimerRef.current = null;
     }
+    // Stop all active AI audio playback (barge-in / teardown cleanup).
+    clearAudioQueue();
     if (scriptNodeRef.current) {
       try { scriptNodeRef.current.disconnect(); } catch { /* ignore */ }
       scriptNodeRef.current = null;
@@ -410,6 +412,24 @@ function RealtimeChat() {
    * (we keep a `nextStartTime` so chunks don't overlap or stutter). */
   const playPcmChunkRef = useRef<((b64: string) => void) | null>(null);
   const nextStartTimeRef = useRef<number>(0);
+  /** Active AudioBufferSourceNodes currently scheduled/playing. Used to
+   *  stop all playback immediately on barge-in (when the user starts
+   *  speaking, the server sends `input_audio_buffer.speech_started` and
+   *  we clear the AI's audio queue so the user can interrupt). Matches
+   *  the Inworld playground's `o.current` source-tracking pattern. */
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  /** Clear all active audio playback (barge-in). Stops every scheduled
+   *  AudioBufferSourceNode and resets `nextStartTimeRef` to "now" so the
+   *  next AI response starts fresh. Used on `input_audio_buffer.speech_started`
+   *  + on disconnect/teardown. */
+  const clearAudioQueue = useCallback(() => {
+    for (const src of activeSourcesRef.current) {
+      try { src.stop(); } catch { /* already ended */ }
+    }
+    activeSourcesRef.current.clear();
+    const ctx = audioCtxRef.current;
+    if (ctx) nextStartTimeRef.current = ctx.currentTime;
+  }, []);
 
   /** Convert a Float32 PCM buffer to PCM16 (Int16) little-endian. */
   const float32ToInt16 = useCallback((float32: Float32Array): Int16Array => {
@@ -689,11 +709,12 @@ function RealtimeChat() {
    *      which dispatches on OpenAI Realtime API event names); binary
    *      frames are raw PCM16 → played via the AudioContext (kept as a
    *      fallback in case Inworld sends any binary audio frames).
-   *   6. Playback uses a JITTER BUFFER CAP: `nextStartTimeRef.current`
-   *      is capped at `ctx.currentTime + 0.3s` so the AI's bursty
-   *      delivery (it generates 1s of audio in ~100ms then streams it
-   *      fast) doesn't accumulate seconds of lag — the user hears audio
-   *      at most ~300ms behind the AI's generation.
+   *   6. Playback uses GAPLESS scheduling (matches the Inworld playground's
+   *      `scheduleChunk` — confirmed by reading the playground's minified
+   *      JS bundle in Task 61): `Math.max(ctx.currentTime, nextStartTime)`
+   *      with NO jitter cap. Active sources are tracked in
+   *      `activeSourcesRef` for barge-in (stop all AI audio when the user
+   *      starts speaking → `input_audio_buffer.speech_started`).
    *
    * NOTE: Inworld checks the `Origin` header. The deployed Vercel origin
    * (`https://ace-studio-*.vercel.app`) is NOT `https://platform.inworld.ai`,
@@ -827,24 +848,29 @@ function RealtimeChat() {
     mutedGain.connect(audioCtx.destination);
 
     // 5. Set up the play-PCM helper (closure over audioCtx + nextStartTime).
-    //    Two fixes vs the previous version (Task 60):
-    //    (a) Buffer sample rate = 24000 (OpenAI Realtime API default for
-    //        `output_audio_format:"pcm16"`), NOT 16000. The previous 16 kHz
-    //        made 24 kHz audio play 1.5x slower (Task 59 user report).
-    //    (b) JITTER BUFFER CAP: cap `nextStartTimeRef.current` to
-    //        `ctx.currentTime + MAX_BUFFER_AHEAD` (300ms). Without this
-    //        cap, if the AI sends audio in BURSTS (faster than real-time
-    //        delivery — the OpenAI Realtime API does this: it generates
-    //        1s of audio in ~100ms then streams the chunks rapidly), the
-    //        scheduled queue grows unbounded → audio plays seconds behind
-    //        real time → "pas en temps réel" (Task 60 user report). The
-    //        cap drops the backlog when it grows past 300ms ahead, so the
-    //        user hears audio at most ~300ms behind the AI's generation.
-    //        This causes a tiny audio glitch on resync (one discontinuity
-    //        at the chunk boundary) which is far less annoying than 5s of
-    //        accumulating lag.
-    const MAX_BUFFER_AHEAD = 0.3; // 300ms — the max audio we'll queue ahead of "now"
+    //    Matches the Inworld playground's `scheduleChunk` implementation
+    //    (extracted from the playground's minified JS bundle — Task 61):
+    //      const A = Math.max(l.current, h.currentTime);  // gapless, NO cap
+    //      C.start(A);
+    //      l.current = A + m.duration;
+    //      o.current.push(C);  // track for barge-in
+    //
+    //    KEY FIX (Task 61): the previous Task 60 jitter buffer cap
+    //    (`Math.min(..., ctx.currentTime + 0.3)`) caused chunks to OVERLAP
+    //    when the queue grew past 300ms ahead — multiple chunks got
+    //    scheduled at the same `ctx.currentTime + 0.3` timestamp, playing
+    //    simultaneously → garbled "parle en plusieurs audio". The playground
+    //    uses pure gapless scheduling with NO cap. At 24 kHz, gapless IS
+    //    real-time because the sample rate matches the server's output
+    //    format (the lag the user reported in Task 59 was caused by the
+    //    16 kHz mismatch, which the 24 kHz fix in Task 60 already solved).
+    //
+    //    We also track active sources in `activeSourcesRef` so the
+    //    `clearAudioQueue` helper can stop all playback on barge-in (when
+    //    the user starts speaking → `input_audio_buffer.speech_started` →
+    //    stop the AI's current audio so the user can interrupt).
     nextStartTimeRef.current = audioCtx.currentTime;
+    activeSourcesRef.current = new Set();
     playPcmChunkRef.current = (b64: string) => {
       const ctx = audioCtxRef.current;
       if (!ctx) return;
@@ -858,14 +884,17 @@ function RealtimeChat() {
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(ctx.destination);
-      // Schedule gaplessly if the queue is small, OR cap at 300ms ahead
-      // to drop the backlog and resume real-time playback.
-      const startTime = Math.min(
-        Math.max(ctx.currentTime, nextStartTimeRef.current),
-        ctx.currentTime + MAX_BUFFER_AHEAD,
-      );
+      // Gapless scheduling: play right after the previous chunk, or
+      // "now" if the queue has lapsed. NO jitter cap (matches the
+      // Inworld playground — at 24 kHz, gapless IS real-time).
+      const startTime = Math.max(ctx.currentTime, nextStartTimeRef.current);
       src.start(startTime);
       nextStartTimeRef.current = startTime + buffer.duration;
+      // Track for barge-in + auto-remove on end.
+      activeSourcesRef.current.add(src);
+      src.onended = () => {
+        activeSourcesRef.current.delete(src);
+      };
     };
 
     // 6. Handle incoming messages. Inworld's realtime protocol sends both
@@ -1044,9 +1073,12 @@ function RealtimeChat() {
         }
         // --- Server-side VAD (voice activity detection) state ---
         case "input_audio_buffer.speech_started": {
-          // The server detected the start of user speech. We can use
-          // this to interrupt the AI's current playback (barge-in),
-          // but for now just log it so the user sees the turn boundary.
+          // The server detected the start of user speech → BARGE-IN:
+          // stop the AI's current audio playback so the user can
+          // interrupt. Matches the Inworld playground's `clearQueue`
+          // behavior (stops all active AudioBufferSourceNodes + resets
+          // nextStartTime so the next AI response starts fresh).
+          clearAudioQueue();
           log("[inworld] speech started");
           break;
         }
