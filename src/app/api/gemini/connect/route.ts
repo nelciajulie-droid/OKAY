@@ -592,27 +592,30 @@ function extractGsessionId(setCookie: string[], body: string): string | null {
  *   [[0,"SID_value","c",...]]
  */
 function extractSid(body: string): string | null {
-  // Pattern 1: "SID":"value" (JSON key-value)
-  let m = body.match(/"SID"\s*[:=]\s*"([^"]+)"/);
+  // Google's actual Web Channel response format:
+  //   51\n[[0,["c","SID_VALUE","",8,15,30000]]]
+  // The SID is the quoted string after "c", inside [[0,[...
+  
+  // Pattern 1: [[0,["c","value",...]]] — the REAL Google format
+  let m = body.match(/\[\[0,\["c","([^"]+)"/);
   if (m) return m[1];
 
-  // Pattern 2: [0,"value",...] (array starting with number + string)
+  // Pattern 2: [0,["c","value",...]] — without outer brackets
+  m = body.match(/\[0,\["c","([^"]+)"/);
+  if (m) return m[1];
+
+  // Pattern 3: "c","value",... — just find "c","something"
+  m = body.match(/"c","([A-Za-z0-9_-]{8,})"/);
+  if (m) return m[1];
+
+  // Pattern 4: "SID":"value" (JSON key-value, less common)
+  m = body.match(/"SID"\s*[:=]\s*"([^"]+)"/);
+  if (m) return m[1];
+
+  // Pattern 5: [0,"value",...] (older format)
   m = body.match(/^\[\s*\d+\s*,\s*"([^"]+)"/);
   if (m) return m[1];
 
-  // Pattern 3: [[0,"value",...]] (nested array)
-  m = body.match(/^\[\s*\[\s*\d+\s*,\s*"([^"]+)"/);
-  if (m) return m[1];
-
-  // Pattern 4: [0,"value","c",...] — find the quoted string right after [0,
-  m = body.match(/\[\s*0\s*,\s*"([A-Za-z0-9_-]{8,})"/);
-  if (m) return m[1];
-
-  // Pattern 5: [[0,"value",...]] — same but not at the start
-  m = body.match(/\[\[\s*0\s*,\s*"([A-Za-z0-9_-]{8,})"/);
-  if (m) return m[1];
-
-  // Removed the broad pattern 6 (any 20+ char string) — too many false positives
   return null;
 }
 
