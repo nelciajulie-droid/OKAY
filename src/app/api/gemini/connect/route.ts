@@ -772,10 +772,11 @@ async function handleStart(_body: GeminiRequestBody) {
       (res.headers["x-http-session-id"] as string) ??
       randomUuid();
     // SID: check the response body first, then the headers
+    // Google's Web Channel body starts with [0,"SID_value",...]
+    // If no SID found, use the gsessionid (some implementations use the same value)
     const sid = extractSid(res.body) ??
       (res.headers["x-http-session-id"] as string) ??
-      // Also check if it's in the response body as part of a Web Channel stream
-      (res.body.match(/\["([^"]{10,})"\]/)?.[1]) ??
+      gsessionid ??
       "";
     // Surface the parsed setup response too — it may carry the first
     // server message (a greeting audio chunk, etc.).
