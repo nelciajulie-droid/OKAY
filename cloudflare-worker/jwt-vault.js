@@ -44,6 +44,18 @@ const KV_PERPLEXITY_UPDATED = "perplexity_updated";
 const KV_GOOGLE_COOKIES = "google_cookies";
 const KV_GOOGLE_UPDATED = "google_updated";
 
+// KV keys — Inworld AI Realtime voice token
+// `inworld_token` stores the static base64 token used as the WebSocket
+// subprotocol when the browser opens a realtime session to
+// `wss://api.inworld.ai/api/v1/realtime/session?protocol=realtime&key=…`.
+// The token has the form `basic_<base64>` (the decoded payload is
+// `API_KEY:SECRET`). It does NOT expire like a JWT, so we only store it
+// once. The backend `/api/inworld/token` route GETs it and hands it to
+// the browser; the browser then opens the WebSocket directly (no
+// backend audio proxy — Inworld is the simplest of the 4 providers).
+const KV_INWORLD_TOKEN = "inworld_token";
+const KV_INWORLD_UPDATED = "inworld_updated";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -77,9 +89,12 @@ export default {
     // === Google (Gemini Live) cookie endpoints ===
     if (url.pathname === "/google/cookies" && request.method === "GET") return await handleGetGoogleCookies(env);
     if (url.pathname === "/google/cookies" && request.method === "POST") return await handleSetGoogleCookies(request, env);
-    if (url.pathname === "/") return json({ ok: true, service: "chatgpt-jwt-vault", endpoints: ["/jwt", "/jwt-update", "/cookies", "/seed", "/refresh", "/refresh-local", "/health", "/accounts", "/accounts/add", "/accounts/remove", "/accounts/rotate", "/accounts/mark-rate-limited", "/perplexity/cookies", "/google/cookies"] });
+    // === Inworld AI Realtime voice token endpoints ===
+    if (url.pathname === "/inworld/token" && request.method === "GET") return await handleGetInworldToken(env);
+    if (url.pathname === "/inworld/token" && request.method === "POST") return await handleSetInworldToken(request, env);
+    if (url.pathname === "/") return json({ ok: true, service: "chatgpt-jwt-vault", endpoints: ["/jwt", "/jwt-update", "/cookies", "/seed", "/refresh", "/refresh-local", "/health", "/accounts", "/accounts/add", "/accounts/remove", "/accounts/rotate", "/accounts/mark-rate-limited", "/perplexity/cookies", "/google/cookies", "/inworld/token"] });
 
-    return json({ error: "Not found", endpoints: ["/jwt", "/seed", "/refresh", "/health", "/perplexity/cookies", "/google/cookies"] }, 404);
+    return json({ error: "Not found", endpoints: ["/jwt", "/seed", "/refresh", "/health", "/perplexity/cookies", "/google/cookies", "/inworld/token"] }, 404);
   },
 
   async scheduled(event, env, ctx) {
@@ -252,6 +267,8 @@ async function handleHealth(env) {
   const perplexityUpdated = parseInt((await env.JWT_VAULT.get(KV_PERPLEXITY_UPDATED)) || "0", 10);
   const googleCookies = await env.JWT_VAULT.get(KV_GOOGLE_COOKIES);
   const googleUpdated = parseInt((await env.JWT_VAULT.get(KV_GOOGLE_UPDATED)) || "0", 10);
+  const inworldToken = await env.JWT_VAULT.get(KV_INWORLD_TOKEN);
+  const inworldUpdated = parseInt((await env.JWT_VAULT.get(KV_INWORLD_UPDATED)) || "0", 10);
   const now = Math.floor(Date.now() / 1000);
   return json({
     ok: true,
@@ -279,6 +296,13 @@ async function handleHealth(env) {
     googleUpdated: googleUpdated || null,
     googleUpdatedHuman: googleUpdated
       ? new Date(googleUpdated * 1000).toISOString()
+      : null,
+    // Inworld AI Realtime voice token.
+    hasInworldToken: Boolean(inworldToken),
+    inworldTokenLength: inworldToken ? inworldToken.length : 0,
+    inworldUpdated: inworldUpdated || null,
+    inworldUpdatedHuman: inworldUpdated
+      ? new Date(inworldUpdated * 1000).toISOString()
       : null,
   });
 }
@@ -665,6 +689,61 @@ async function handleSetGoogleCookies(request, env) {
     ok: true,
     message: "Google cookies stored.",
     cookieLength: cookies.length,
+  });
+}
+
+// ============================================================
+// INWORLD AI REALTIME VOICE TOKEN
+// ============================================================
+//
+// Inworld (platform.inworld.ai) is the simplest of the 4 realtime voice
+// providers in the app: the browser opens a WebSocket DIRECTLY to
+// `wss://api.inworld.ai/api/v1/realtime/session?protocol=realtime&key=…`
+// with the Inworld API token as the WebSocket subprotocol. There's NO
+// backend audio proxy. The backend `/api/inworld/token` route GETs the
+// token from here and hands it to the browser; the browser then opens
+// the WebSocket directly.
+//
+// The token is a static base64 string of the form `basic_<base64>` (the
+// decoded payload is `API_KEY:SECRET`). It does NOT expire like a JWT,
+// so we only store it once.
+
+// GET /inworld/token → { token, updatedAt }
+async function handleGetInworldToken(env) {
+  const token = await env.JWT_VAULT.get(KV_INWORLD_TOKEN);
+  if (!token) return json({ error: "No Inworld token in vault." }, 404);
+  const updatedAt = parseInt((await env.JWT_VAULT.get(KV_INWORLD_UPDATED)) || "0", 10);
+  return json({
+    token,
+    updatedAt: updatedAt || null,
+    updatedAtHuman: updatedAt ? new Date(updatedAt * 1000).toISOString() : null,
+  });
+}
+
+// POST /inworld/token { token } → { ok }
+//   `token` is the static base64 Inworld API token (form `basic_<b64>`).
+//   It's used as the WebSocket subprotocol (`sec-websocket-protocol`)
+//   when the browser opens the realtime session.
+async function handleSetInworldToken(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+  const { token } = body;
+  if (!token || typeof token !== "string") {
+    return json({ error: "Missing 'token' (string) in body" }, 400);
+  }
+  // Basic shape check — Inworld tokens are `basic_<base64>` (no colons,
+  // no whitespace). Reject obviously bad inputs but stay permissive.
+  if (!/^basic_[A-Za-z0-9+/_=-]+$/.test(token)) {
+    return json({
+      error: "Token doesn't look like an Inworld token (expected `basic_<base64>`).",
+    }, 400);
+  }
+  await env.JWT_VAULT.put(KV_INWORLD_TOKEN, token);
+  await env.JWT_VAULT.put(KV_INWORLD_UPDATED, String(Math.floor(Date.now() / 1000)));
+  return json({
+    ok: true,
+    message: "Inworld token stored.",
+    tokenLength: token.length,
   });
 }
 
