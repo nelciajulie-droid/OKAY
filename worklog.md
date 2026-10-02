@@ -1128,3 +1128,32 @@ Stage Summary:
 - Lint 0/0, page compiles + renders.
 - What to expect on the next live run: the `unknown_event_type` flood should stop; instead the user should see `[inworld] session created` on connect, `[inworld] speech started` / `speech stopped` turn boundaries, `You: <transcript>` for the user's mic, and `AI: <transcript>` + audio playback for the AI's reply. If any of those don't appear (e.g. Inworld uses slightly different event names, or sends binary PCM frames instead of `response.audio.delta`), the `default` case in the switch will log `[inworld] <type>: <compact JSON>` so we can refine the handler further. The binary-frame path in `ws.onmessage` (Blob / ArrayBuffer → base64 → `playPcmChunkRef`) is preserved as a fallback.
 - No git commit / Vercel deploy / GitHub push performed in this task — those should happen as part of the next batched deploy (the change is a single-file client-side edit, low-risk, can ride along with the next push to `origin/main`).
+
+---
+Task ID: 58
+Agent: main (Z.ai Code)
+Task: Push Task 57 fix (Inworld OpenAI Realtime API protocol) to GitHub + redeploy to Vercel production.
+
+Work Log:
+- `git status` → working tree clean (Task 57 edits auto-committed by the sandbox hook as commit `3ec7de2` with message `73d811d8-f0b6-4a55-b7b7-ab2cb6d19952`). 1 commit ahead of `origin/main`.
+- `git push origin main` → `cb85110..3ec7de2 main -> main` (push succeeded).
+- Vercel project is configured with GitHub integration on `nelciajulie-droid/OKAY` main (per Task 56 worklog) → the push auto-triggered a production build (no Vercel API token needed in this env).
+- Waited for auto-deploy to complete (~90s build, then CDN cache propagation). Verified live by re-fetching `https://ace-studio-orcin.vercel.app/` with cache-bust and diffing the chunk hash list:
+  - BEFORE push (old Task 56 build): included chunk `8808d5a621e6c261.js` (returned 404 — stale).
+  - AFTER push (new Task 57 build): chunk `8808d5a621e6c261.js` GONE, replaced by `d0efd8ab1f2ce54b.js` (348 KB, the page component bundle). Build ID changed (chunk hashes all rotated).
+- Verified the Task 57 fix is live in production by grepping the deployed `d0efd8ab1f2ce54b.js`:
+  - `input_audio_buffer.append` ✓ present (the outgoing audio fix — root cause of the `unknown_event_type:"audio"` error flood)
+  - `response.audio.delta` ✓ present (incoming AI audio dispatcher)
+  - `session.created` ✓ present (session lifecycle handler)
+  - `speech_started` ✓ present (server VAD handler)
+  - `conversation.item` ✓ present (user transcript handler)
+  - `inworld` ✓ present
+  - Verbatim JS line in production: `e.send(JSON.stringify({type:"input_audio_buffer.append",audio:s}))` + `console.warn("[inworld] send failed:",e.message)` — exact match to Task 57 source.
+  - OLD broken `{type:"audio",data:…}` pattern: **0 hits** (confirmed gone from production).
+- `GET https://ace-studio-orcin.vercel.app/api/inworld/token` → HTTP 200, `{ok:true, token:"basic_…", source:"env"}` ✓ (the token endpoint still serves the static Inworld token from the Vercel env var set in Task 56).
+
+Stage Summary:
+- Push + redeploy complete. Task 57 fix is live in production at `https://ace-studio-orcin.vercel.app/`.
+- Verified at the byte level: the deployed JS bundle contains `input_audio_buffer.append` (the OpenAI Realtime API event name) and NOT the old `type:"audio",data` shape — so the `unknown_event_type:"audio"` error flood the user reported should be fixed.
+- No Vercel API token needed — the GitHub integration auto-deploys on push to `main`. Verified by diffing chunk hashes before/after the push (the chunk `8808d5a621e6c261.js` was replaced by `d0efd8ab1f2ce54b.js`).
+- User can now reconnect via the Inworld provider in the Preview Panel and the only logs they should see on connect are `[inworld] session created` + `Connected. Speak when ready.` (no more `unknown_event_type` errors).
