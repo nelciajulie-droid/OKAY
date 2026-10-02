@@ -353,6 +353,8 @@ function buildBidiUrl(opts: {
     // Clear the $httpHeaders param — for GET long-poll, headers go as real HTTP headers
     u.searchParams.delete("$httpHeaders");
     u.searchParams.delete("X-HTTP-Session-Id");
+    // Remove CVER for receive (Google's real URL doesn't have it on GET)
+    u.searchParams.delete("CVER");
     // Set gsessionid as a query param (not as X-HTTP-Session-Id)
     if (opts.gsessionid) {
       u.searchParams.set("gsessionid", opts.gsessionid);
