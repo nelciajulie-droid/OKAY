@@ -768,8 +768,15 @@ async function handleStart(_body: GeminiRequestBody) {
       );
     }
     const gsessionid =
-      extractGsessionId(res.setCookie, res.body) ?? randomUuid();
-    const sid = extractSid(res.body) ?? "";
+      extractGsessionId(res.setCookie, res.body) ??
+      (res.headers["x-http-session-id"] as string) ??
+      randomUuid();
+    // SID: check the response body first, then the headers
+    const sid = extractSid(res.body) ??
+      (res.headers["x-http-session-id"] as string) ??
+      // Also check if it's in the response body as part of a Web Channel stream
+      (res.body.match(/\["([^"]{10,})"\]/)?.[1]) ??
+      "";
     // Surface the parsed setup response too — it may carry the first
     // server message (a greeting audio chunk, etc.).
     const parsed = parseBidiChunks(res.body);
