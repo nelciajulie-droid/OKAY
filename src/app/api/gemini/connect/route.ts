@@ -580,15 +580,34 @@ function extractGsessionId(setCookie: string[], body: string): string | null {
   return null;
 }
 
-/** Extract the SID (stream id) from a Web Channel response body. */
+/** Extract the SID (stream id) from a Web Channel response body.
+ * Google's Web Channel response body format varies — try multiple patterns:
+ *   [0,"SID_value",...]
+ *   [["SID_value",...]]
+ *   "SID":"SID_value"
+ *   [[0,"SID_value","c",...]]
+ */
 function extractSid(body: string): string | null {
-  // Google's Web Channel emits the SID early in the response as part of
-  // a numeric stream header. We look for a quoted SID-like token.
-  const sidMatch = body.match(/"SID"\s*[:=]\s*"([^"]+)"/);
-  if (sidMatch) return sidMatch[1];
-  // The body may also start with a digit + a number ("[0,12345,...]").
-  const arrMatch = body.match(/^\[\s*\d+\s*,\s*"([^"]+)"/);
-  if (arrMatch) return arrMatch[1];
+  // Pattern 1: "SID":"value" (JSON key-value)
+  let m = body.match(/"SID"\s*[:=]\s*"([^"]+)"/);
+  if (m) return m[1];
+
+  // Pattern 2: [0,"value",...] (array starting with number + string)
+  m = body.match(/^\[\s*\d+\s*,\s*"([^"]+)"/);
+  if (m) return m[1];
+
+  // Pattern 3: [[0,"value",...]] (nested array)
+  m = body.match(/^\[\s*\[\s*\d+\s*,\s*"([^"]+)"/);
+  if (m) return m[1];
+
+  // Pattern 4: [[0,"value","c",...]] — find any quoted string after [0,
+  m = body.match(/\[\s*0\s*,\s*"([A-Za-z0-9_-]{8,})"/);
+  if (m) return m[1];
+
+  // Pattern 5: any quoted string that looks like a SID (20+ chars, alphanumeric + hyphens)
+  m = body.match(/"([A-Za-z0-9_-]{20,})"/);
+  if (m && !m[1].includes(" ")) return m[1];
+
   return null;
 }
 
