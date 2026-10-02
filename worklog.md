@@ -1714,3 +1714,109 @@ Stage Summary:
 - Files modified: `src/app/page.tsx` only (+115 / -1 lines).
 - Lint 0/0, push OK (`fdbce34..f6a24a0`), Vercel redeploy verified by chunk hash rotation + byte-level grep.
 - Follow-up: implement the Aliyun RTC SDK integration on the frontend (load the 242 KB SDK from alicdn + join the channel + handle OpenAI Realtime API events). This is a significant implementation effort that requires either an importmap or bundling the SDK locally.
+
+---
+Task ID: 68
+Agent: full-stack-developer
+Task: Implement the `connectQwen` function in `src/app/page.tsx` using the Aliyun RTC SDK (`aliyun-rtc-sdk@7.3.7`). Qwen Voice (chat.qwen.ai) uses Aliyun Bailian RTC — a proprietary WebRTC SDK, NOT standard WebRTC SDP exchange like ChatGPT. The backend route `POST /api/qwen/token` (from Tasks 64-66) already returns Aliyun RTC credentials (`rtc_token`, `rtc_channel`, `rtc_app_id`, `rtc_gslb`, `rtc_user_id_client`, `rtc_user_id_voicechat`). Task 67 added a placeholder `connectQwen` that fetches the credentials + shows a "coming soon" message. This task replaces the placeholder with the full Aliyun RTC SDK integration (dynamic import → joinChannel → publish local mic → subscribe to remote AI audio → handle OpenAI Realtime API events on the data channel → teardown on disconnect).
+
+Work Log:
+- Read the full worklog (Tasks 56-67) to understand the realtime voice architecture. Tasks 64-67 specifically document the Qwen architecture: WebRTC via Aliyun Bailian RTC SDK + OpenAI Realtime API events over a data channel. Task 66 confirmed `sdp_token` is always null (Qwen doesn't do SDP exchange — it returns RTC channel credentials). Task 67 added a `connectQwen` stub that fetches the credentials + throws "coming soon".
+- Inspected the Aliyun RTC SDK TypeScript types at `node_modules/aliyun-rtc-sdk/dist/types/index.d.ts` (7288 lines). Confirmed the API surface:
+  - `AliRtcEngine.createInstance()` (static factory) → engine instance.
+  - `engine.joinChannel(authInfo: AliRtcAuthInfo, userName?: string)` → Promise<void>. AliRtcAuthInfo = `{ channelId, userId, appId, nonce?, timestamp, token, sessionId?, role? }`.
+  - `engine.publishLocalAudioStream(enabled: boolean)` → Promise<void>. The SDK handles `getUserMedia` internally — no need to call `navigator.mediaDevices.getUserMedia` ourselves.
+  - `engine.subscribeAllRemoteAudioStreams(sub: boolean)` → void (sync).
+  - `engine.getAudioTrack(userId?: string)` → Promise<MediaStreamTrack | undefined>.
+  - `engine.sendDataChannelMessage(msg: AliRtcDataChannelMsg)` → void. `AliRtcDataChannelMsg` constructor: `new AliRtcDataChannelMsg(data: ArrayBuffer, type?: AliRtcDataMsgType, networkTime?: number, progress?: number)`.
+  - `engine.on(event, listener)` — inherited from `eventemitter3`. Key events: `dataChannelMsg: (uid, message: AliRtcDataChannelMsg) => void`, `remoteTrackAvailableNotify: (uid, audioTrack, videoTrack) => void`, `connectionStatusChange`, `occurError`, `bye`.
+  - `engine.leaveChannel()` → Promise<void>. `engine.destroy()` → Promise<void>. `engine.muteLocalMic(mute?: boolean)` → void.
+  - The SDK's default export is `WrappedAliRtcEngine` (alias for `AliRtcEngine_2`). `AliRtcDataChannelMsg` is a named export.
+- Added `qwenEngineRef` ref at line 217 (after `inworldWsRef`): `useRef<any>(null)`. Loose `any` type because the SDK is dynamically imported (its types are not reachable at the ref declaration site without making the whole component async-aware). ESLint config has `@typescript-eslint/no-explicit-any: "off"` so this is lint-clean.
+- Updated the shared `teardown` function (line 296-310) to also destroy the Qwen engine: clears `qwenEngineRef.current` first, then fire-and-forgets `engine.publishLocalAudioStream(false)`, `engine.leaveChannel()`, `engine.destroy()` (each wrapped in `try/catch` + `.catch(() => {})` so a rejected Promise doesn't crash the React app). Placed BEFORE the shared-mic cleanup since the Aliyun SDK owns its own getUserMedia stream (but `localStreamRef.current` is null for Qwen anyway, so the order is a no-op safety net).
+- Replaced the `connectQwen` function (was lines 1440-1521, ~85 lines stub; now lines 1440-1859, ~420 lines full implementation). New flow:
+  1. Health-check `GET /api/qwen/token` — preserved from Task 67. Bails with clear curl command if token missing, or with refresh instructions if expired.
+  2. Fetch Aliyun RTC credentials `POST /api/qwen/token` — replaced the broken `sdp: "placeholder"` body with a minimal valid `v=0` SDP (`v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\na=rtpmap:0 PCMU/8000\r\n`). The backend's validation check requires `sdp.startsWith("v=0")`; the SDP content is not actually used by chat.qwen.ai (it just creates a new RTC channel + returns credentials regardless).
+  3. **Dynamic import `aliyun-rtc-sdk`**: `const mod = await import("aliyun-rtc-sdk"); AliRtcEngine = mod.default; AliRtcDataChannelMsg = mod.AliRtcDataChannelMsg;`. This is MANDATORY — the SDK uses browser-only APIs (`navigator.mediaDevices`, `RTCPeerConnection`, `MediaStream`, `MediaStreamTrack`) that don't exist during Next.js SSR. Importing at module top-level would crash the build. Dynamic import also keeps the 242 KB SDK out of the main bundle — it loads as a separate chunk only when the user clicks Connect with Qwen selected.
+  4. `AliRtcEngine.createInstance()` → store in `qwenEngineRef.current` so `teardown` can destroy it. Safety net: if `qwenEngineRef.current` is already set (duplicate connect call), destroy the old engine first.
+  5. Listen for `connectionStatusChange`, `occurError`, `bye` events — informational logs to the transcript so the user can see the channel lifecycle + any errors.
+  6. Build `AliRtcAuthInfo` from the backend response: `{ channelId: rtc_channel, userId: rtc_user_id_client, appId: rtc_app_id, nonce: "", timestamp: Date.now(), token: rtc_token }`. Qwen doesn't use the nonce field — pass empty string (matches the Qwen Omni SDK).
+  7. `engine.joinChannel(authInfo, "rtc-user-client")` — wrapped in try/catch with a clear error message if the join fails (token expired, channel full, etc.).
+  8. `engine.publishLocalAudioStream(true)` — publishes local mic audio. The SDK handles `getUserMedia` internally. Wrapped in try/catch with a clear error if mic permission denied.
+  9. `engine.subscribeAllRemoteAudioStreams(true)` — subscribes to all remote audio (the AI's voice).
+  10. Listen for `remoteTrackAvailableNotify` — when the AI's audio track becomes available (uid === `rtc_user_id_voicechat` AND audioTrack !== 0), call `engine.getAudioTrack(voiceChatUid)` → wrap in `new MediaStream([track])` → play via the shared `audioElRef.current` (`new Audio(); audioEl.srcObject = remoteStream; audioEl.play()`). Reuses the existing `audioElRef` so teardown can stop playback by setting srcObject = null.
+  11. Define a local `appendAiDelta` helper (matches the Inworld pattern — gives ONE growing AI: line per response instead of N separate "AI: <chunk>" lines).
+  12. Listen for `dataChannelMsg` events — decode the ArrayBuffer as JSON via `new TextDecoder().decode(message.data)` + `JSON.parse(text)`. Dispatch on `msg.type`:
+      - `session.created` → log + send a `session.update` event via `engine.sendDataChannelMessage(new AliRtcDataChannelMsg(data.buffer, 1))`. The session config matches the Qwen Omni SDK's `sendUpdate` behavior + the Qwen web client's session config (Task 64 reverse-engineering): voice "Tina", modalities ["text", "audio"], input/output "pcm16", server_vad (threshold 0.5, prefix_padding_ms 300, silence_duration_ms 800, create_response true, interrupt_response true), input_audio_transcription model "qwen3-asr-flash-realtime".
+      - `input_audio_buffer.speech_started` → log + `clearAudioQueue()` (barge-in — same as Inworld; for Qwen the AI's audio is via MediaStreamTrack not WebAudio so this is effectively a no-op, but the server's `interrupt_response: true` already stops the AI's audio at the source) + reset `inUserSpeechRef.current = false` so the next transcription creates a fresh "You:" line.
+      - `input_audio_buffer.speech_stopped` → log.
+      - `conversation.item.input_audio_transcription.completed` → `upsertUserLine(msg.transcript)` (collapses all user transcripts into one You: line per speech).
+      - `conversation.item.input_audio_transcription.delta` → `upsertUserLine(msg.delta)` (streaming user transcript — also collapses).
+      - `response.output_audio_transcript.delta` / `response.audio_transcript.delta` → `appendAiDelta(msg.delta)` (one growing AI: line per response).
+      - `response.output_audio_transcript.done` / `response.audio_transcript.done` → only log the final transcript if no streaming deltas were received (matches Inworld).
+      - `error` → log `Server error: ${msg.error?.message}`.
+      - Other events (`response.created`, `response.done`, `conversation.item.added`, `rate_limits.updated`, etc.) → silent no-ops (matches Inworld).
+  13. `setStatus("connected")` + `log("Connected. Speak when ready.")` at the very end (matches the Inworld pattern).
+  - Deps array: `[clearAudioQueue, log, upsertUserLine]` (all three are `useCallback`s — `clearAudioQueue` and `upsertUserLine` are top-level helpers, `log` is the transcript logger).
+- Updated `toggleMute` to handle Qwen: if `qwenEngineRef.current` is set, call `engine.muteLocalMic(next)` instead of toggling `localStreamRef.current.getAudioTracks()` (the Aliyun SDK owns the mic stream — `localStreamRef.current` is null for Qwen). Falls through to the existing path for ChatGPT/Perplexity/Gemini/Inworld.
+- Did NOT touch the other 4 providers (ChatGPT, Perplexity, Gemini, Inworld) — only modified the `connectQwen` function, the `teardown` function (to add Qwen cleanup), the `toggleMute` function (to add the Qwen branch), and added the `qwenEngineRef` ref. The `connect` dispatcher already routes `provider === "qwen"` to `connectQwen` (from Task 67).
+- Did NOT modify the backend route `/api/qwen/token` (already works from Tasks 64-66).
+- Did NOT install new npm packages — `aliyun-rtc-sdk@7.3.7` was already installed before this task (in the working tree, not yet committed). The `package.json` + `bun.lock` changes were committed as part of this task since they're necessary for the implementation (without `aliyun-rtc-sdk` in `package.json`, the dynamic import would fail).
+- Did NOT modify the Prisma schema or DB.
+- `bun run lint` → 0 errors / 0 warnings (exit code 0).
+- Local dev server verification:
+  - `GET http://localhost:3000/` → HTTP 200, 50 KB, 50ms render. Page contains "Qwen" (3 occurrences) + "aliyun" (6 occurrences) markers.
+  - Dev-mode Turbopack correctly splits the SDK into a separate chunk: `_next/static/chunks/node_modules_aliyun-rtc-sdk_dist_aliyun-rtc-sdk_es_1eb3cee6.js` (761-byte loader chunk → loads the 1.65 MB actual SDK chunk `node_modules_aliyun-rtc-sdk_dist_aliyun-rtc-sdk_es_01315e23.js`). Confirms the SDK is NOT in the main bundle (only loaded when the user clicks Connect with Qwen).
+- Committed as `957c7cf` ("feat(qwen): integrate Aliyun RTC SDK for Qwen Voice — joinChannel + audio publish/subscribe + OpenAI Realtime API event handling") — 3 files, +534 / -41.
+- `git push origin main` → `f6a24a0..957c7cf main -> main`.
+- Vercel auto-deploy: waited 100s. Verified:
+  - `GET https://ace-studio-orcin.vercel.app/` → HTTP 200, 36 KB, 0.81s.
+  - Production page chunk `bcb19578ea011d22.js` (357 KB) contains all the connectQwen implementation markers:
+    - `aliyun-rtc-sdk` × 3 (the dynamic import string + 2 error messages).
+    - `joinChannel` × 1 (`await l.joinChannel(c, "rtc-user-client")`).
+    - `rtc_token` × 2 (response field references).
+    - `createInstance` × 2 (the SDK factory call + the validation check).
+    - `publishLocalAudioStream` × 2 (publish + teardown).
+    - `subscribeAllRemoteAudioStreams` × 1.
+    - `getAudioTrack` × 2.
+    - `leaveChannel` × 1 (teardown).
+    - `sendDataChannelMessage` × 1.
+    - `dataChannelMsg` × 1 (event listener).
+    - `remoteTrackAvailableNotify` × 1.
+    - `muteLocalMic` × 1 (toggleMute Qwen path).
+    - `session.update` × 7 (the session config + log messages).
+    - `Aliyun RTC` × 8 (log messages + comments).
+  - `AliRtcEngine` × 0 in the main chunk (the dynamic import's default export is bound to a minified variable like `t` — `t.createInstance()` — so the class name doesn't appear in the main chunk; it appears in the SDK's own chunk).
+  - The Aliyun RTC SDK is in a separate dynamically-loaded chunk `08f439290b3e0050.js` (1.04 MB) — only downloaded when the user clicks Connect with Qwen. Verified by following the Turbopack loader chain: `d961c819d839f83d.js` (218 bytes, the loader) → `08f439290b3e0050.js` (1.04 MB, the SDK). The SDK chunk contains `AliRtcEngine` × 5, `joinChannel` × 6, `publishLocalAudioStream` × 14, `subscribeAllRemoteAudioStreams` × 3, `sendDataChannelMessage` × 7.
+  - Task's exact verification command: `grep -c "aliyun-rtc-sdk\|AliRtcEngine\|joinChannel\|rtc_token" /tmp/chunk68.js` → `1` (returns 1 because the minified chunk is a single line; `grep -c` counts lines, not occurrences). Per-marker breakdown via `grep -o`: `aliyun-rtc-sdk` × 3, `AliRtcEngine` × 0, `joinChannel` × 1, `rtc_token` × 2 — total 6 occurrences of the markers in the main page chunk.
+- Task's exact verification command result interpretation:
+  - The task asked for `grep -c "aliyun-rtc-sdk\|AliRtcEngine\|joinChannel\|rtc_token"` to confirm "the new chunk contains the Aliyun RTC markers". The result is `1` (the chunk contains the markers on one minified line). Confirmed ✓.
+  - `AliRtcEngine` is 0 in the main chunk because the dynamic import compiles the class reference through the module's `default` export (`const t = (await import("aliyun-rtc-sdk")).default; t.createInstance()`), so the class name is only in the SDK's own chunk. This is the EXPECTED behavior for a dynamically-imported SDK — the class name appears in the SDK chunk, not the main chunk. Confirmed ✓ via the SDK chunk `08f439290b3e0050.js` which contains `AliRtcEngine` × 5.
+
+Stage Summary:
+- Qwen Voice is now fully integrated end-to-end across 2 layers:
+  1. **Backend** (unchanged from Tasks 64-66): `src/app/api/qwen/token/route.ts` returns Aliyun RTC credentials (`rtc_token`, `rtc_channel`, `rtc_app_id`, `rtc_gslb`, `rtc_user_id_client`, `rtc_user_id_voicechat`, `chat_id`, `times_left`, `audio_timeout`). The `POST /api/qwen/token` requires the SDP body to start with `v=0` (validation check); the SDP content is not used by chat.qwen.ai — it just creates a new RTC channel + returns credentials. `GET /api/qwen/token` health-check returns `{ ok, configured, source, tokenMasked, exp, expired }`. `PUT /api/qwen/token` stores a fresh JWT in the DB. `DELETE /api/qwen/token` clears it.
+  2. **Frontend** (this task): `src/app/page.tsx` `connectQwen` function (~420 lines):
+     - Health-checks the token (clear errors if missing/expired with actionable curl commands).
+     - Fetches the Aliyun RTC credentials (POST with a minimal valid `v=0` SDP).
+     - Dynamically imports `aliyun-rtc-sdk` (242 KB, browser-only APIs — MUST be dynamic import to avoid Next.js SSR crash; also keeps the SDK out of the main bundle).
+     - Creates an `AliRtcEngine` instance + joins the channel with the credentials.
+     - Publishes local mic audio (SDK handles `getUserMedia` internally).
+     - Subscribes to all remote audio + plays the AI's audio track via a hidden `<audio>` element (reuses the shared `audioElRef`).
+     - Listens for OpenAI Realtime API events on the data channel — handles `session.created` (sends a `session.update` with voice Tina + server_vad 800ms silence + pcm16 + ASR model qwen3-asr-flash-realtime), `input_audio_buffer.speech_started` (barge-in), `input_audio_buffer.speech_stopped`, `conversation.item.input_audio_transcription.completed`/`.delta` (user transcripts via `upsertUserLine`), `response.output_audio_transcript.delta`/`.done` (AI transcripts via local `appendAiDelta`), `error`. Other events are silent no-ops.
+     - Teardown (via the shared `teardown` function): `engine.publishLocalAudioStream(false)`, `engine.leaveChannel()`, `engine.destroy()` — fire-and-forget with `.catch(() => {})`.
+     - Mic mute toggle: `engine.muteLocalMic(next)` (the Aliyun SDK owns the mic stream — `localStreamRef.current` is null for Qwen, so the existing `toggleMute` path is bypassed via a `qwenEngineRef.current` check).
+- Files modified: `src/app/page.tsx` (+427 / -41 lines for the full `connectQwen` implementation + `qwenEngineRef` ref + `teardown` Qwen cleanup + `toggleMute` Qwen branch), `package.json` (+1 line for `aliyun-rtc-sdk`), `bun.lock` (lockfile update for the SDK + its transitive deps — `@aliyun-sls/web-*`, `@tensorflow/tfjs`, `aliyun-queen-engine`, `axios`, `crypto-js`, `eventemitter3`, `fflate`, `media-device`, `sdp-transform`, `ua-parser-js`, `uuid`, `webrtc-adapter`).
+- Lint 0/0, push OK (`f6a24a0..957c7cf`), Vercel redeploy verified by HTTP 200 + main page chunk `bcb19578ea011d22.js` (357 KB) containing all the connectQwen implementation markers (6 occurrences of `aliyun-rtc-sdk|AliRtcEngine|joinChannel|rtc_token`) + the SDK in a separate dynamically-loaded chunk `08f439290b3e0050.js` (1.04 MB) containing `AliRtcEngine` × 5 + all the SDK API methods.
+- What the user needs to do to test Qwen Voice end-to-end:
+  1. Set a fresh `QWEN_ACCESS_TOKEN` (the chat.qwen.ai JWT — expires every ~15 min): `curl -X PUT https://ace-studio-orcin.vercel.app/api/qwen/token -H 'Content-Type: application/json' -d '{"token":"<eyJhbGci... JWT>"}'` (or against `http://localhost:3000` for dev). The JWT is the value from chat.qwen.ai → DevTools → Network → Authorization: Bearer header.
+  2. Open the Preview Panel, click the "Qwen" provider button, click Connect.
+  3. The browser will: (a) GET /api/qwen/token (health-check), (b) POST /api/qwen/token (fetch RTC credentials), (c) dynamically load the 242 KB Aliyun RTC SDK, (d) join the Aliyun RTC channel, (e) publish local mic audio, (f) subscribe to remote AI audio, (g) on `session.created` send a `session.update` with voice Tina + server_vad. The user can then speak + hear the AI's reply. Transcripts appear in the transcript panel (You: … for user speech, AI: … for AI replies).
+  4. Click Disconnect to tear down the engine (publishLocalAudioStream(false) + leaveChannel + destroy).
+- The other 4 providers (ChatGPT, Perplexity, Gemini, Inworld) are UNAFFECTED — only the `provider === "qwen"` branch in `connect` dispatches to the new `connectQwen`. The `connectWebRtc`, `connectGemini`, `connectInworld` functions are unchanged. The shared `teardown` and `toggleMute` functions check `qwenEngineRef.current` first (Qwen path) and fall through to the existing path for the other providers.
+- Follow-ups:
+  1. **Live end-to-end test with a fresh token** — the implementation is verified to compile + deploy, but I could not test the actual voice call (the token the user pasted in earlier tasks is expired + the `acw_tc` anti-bot cookie is IP-bound so the backend can't auto-refresh it). The user needs to set a fresh JWT via `PUT /api/qwen/token` + click Qwen → Connect in the Preview Panel to verify the audio works end-to-end. If the Aliyun RTC SDK's `joinChannel` rejects the credentials, the error message will be clear (e.g. "Failed to join Aliyun RTC channel: <reason>").
+  2. **Token auto-refresh Chrome extension** — the JWT expires every ~15 min. A Chrome extension (like the ChatGPT one) that polls chat.qwen.ai + PUTs a fresh token would make this seamless. NOT implemented — same follow-up as Task 65.
+  3. **Voice selection** — the current implementation hardcodes voice "Tina" in the `session.update`. The Qwen web client fetches the list of available voices from `GET https://chat.qwen.ai/api/v2/tts/config?omni_speakers=v1&...`. Adding a voice selector for Qwen (similar to the ChatGPT voice selector) is a follow-up — needs a new backend route to fetch + cache the voice list with the Bearer token. Same follow-up as Task 64.
+  4. **Settings UI for Qwen token** — a text input in the Settings dialog where the user can paste the token directly (stored via PUT /api/qwen/token). Currently the user needs to use curl. Same follow-up as Task 65.
+  5. **The `aliyun-rtc-sdk` package size** — the dynamically-loaded chunk is 1.04 MB (the SDK + its transitive deps including `@tensorflow/tfjs` for the queen-engine beauty plugin, `axios`, `webrtc-adapter`, etc.). This is acceptable since it only loads on-demand, but a lighter-weight alternative would be to implement the OpenAI Realtime API event handling directly on a standard `RTCPeerConnection` (skipping the Aliyun SDK) — but that would require reverse-engineering the Aliyun RTC channel protocol (the SDK does its own proprietary handshake, not standard SDP). NOT recommended.
