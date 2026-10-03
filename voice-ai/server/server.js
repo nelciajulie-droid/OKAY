@@ -250,6 +250,7 @@ wss.on("connection", (ws, req) => {
     child.stdout.on("data", (chunk) => {
       if (closed || aiCancelled) return;
       const text = chunk.toString("utf8");
+      console.log(`[voice-ai] AI stdout: ${text.length} bytes: ${text.slice(0, 80)}`);
       textBuffer += text;
 
       // Send each token/chunk to the client as "ai_text" for display.
