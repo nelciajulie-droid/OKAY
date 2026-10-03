@@ -34,6 +34,10 @@ const KV_ACTIVE_ACCOUNT = "chatgpt_active_account";
 const KV_PERPLEXITY_COOKIES = "perplexity_cookies";
 const KV_PERPLEXITY_ACCOUNT = "perplexity_account";
 const KV_PERPLEXITY_UPDATED = "perplexity_updated";
+const KV_PPLX_SDP_OFFER = "pplx_sdp_offer";
+const KV_PPLX_SDP_ANSWER = "pplx_sdp_answer";
+const KV_PPLX_SDP_OFFER_TS = "pplx_sdp_offer_ts";
+const KV_PPLX_SDP_ANSWER_TS = "pplx_sdp_answer_ts";
 
 // KV keys — Google (Gemini Live) cookies
 // `google_cookies` stores the full Cookie header value for `.google.com`
@@ -87,15 +91,20 @@ export default {
     // === Perplexity Realtime voice cookie endpoints ===
     if (url.pathname === "/perplexity/cookies" && request.method === "GET") return await handleGetPerplexityCookies(env);
     if (url.pathname === "/perplexity/cookies" && request.method === "POST") return await handleSetPerplexityCookies(request, env);
+    // === Perplexity SDP relay (Chrome extension relay) ===
+    if (url.pathname === "/perplexity/sdp-offer" && request.method === "POST") return await handleSetPerplexitySdpOffer(request, env);
+    if (url.pathname === "/perplexity/sdp-offer" && request.method === "GET") return await handleGetPerplexitySdpOffer(env);
+    if (url.pathname === "/perplexity/sdp-answer" && request.method === "POST") return await handleSetPerplexitySdpAnswer(request, env);
+    if (url.pathname === "/perplexity/sdp-answer" && request.method === "GET") return await handleGetPerplexitySdpAnswer(env);
     // === Google (Gemini Live) cookie endpoints ===
     if (url.pathname === "/google/cookies" && request.method === "GET") return await handleGetGoogleCookies(env);
     if (url.pathname === "/google/cookies" && request.method === "POST") return await handleSetGoogleCookies(request, env);
     // === Inworld AI Realtime voice token endpoints ===
     if (url.pathname === "/inworld/token" && request.method === "GET") return await handleGetInworldToken(env);
     if (url.pathname === "/inworld/token" && request.method === "POST") return await handleSetInworldToken(request, env);
-    if (url.pathname === "/") return json({ ok: true, service: "chatgpt-jwt-vault", endpoints: ["/jwt", "/jwt-update", "/cookies", "/seed", "/refresh", "/refresh-local", "/health", "/accounts", "/accounts/add", "/accounts/remove", "/accounts/rotate", "/accounts/mark-rate-limited", "/perplexity/cookies", "/google/cookies", "/inworld/token"] });
+    if (url.pathname === "/") return json({ ok: true, service: "chatgpt-jwt-vault", endpoints: ["/jwt", "/jwt-update", "/cookies", "/seed", "/refresh", "/refresh-local", "/health", "/accounts", "/accounts/add", "/accounts/remove", "/accounts/rotate", "/accounts/mark-rate-limited", "/perplexity/cookies", "/perplexity/sdp-offer", "/perplexity/sdp-answer", "/google/cookies", "/inworld/token"] });
 
-    return json({ error: "Not found", endpoints: ["/jwt", "/seed", "/refresh", "/health", "/perplexity/cookies", "/google/cookies", "/inworld/token"] }, 404);
+    return json({ error: "Not found", endpoints: ["/jwt", "/seed", "/refresh", "/health", "/perplexity/cookies", "/perplexity/sdp-offer", "/perplexity/sdp-answer", "/google/cookies", "/inworld/token"] }, 404);
   },
 
   async scheduled(event, env, ctx) {
@@ -652,6 +661,66 @@ async function handleSetPerplexityCookies(request, env) {
     cookieLength: cookies.length,
     hasAccount: Boolean(account),
   });
+}
+
+// ============================================================
+// PERPLEXITY SDP RELAY (Chrome extension relay)
+// ============================================================
+// The backend stores an SDP offer in the vault. The Chrome extension
+// polls the vault, picks up the offer, does the fetch to perplexity.ai
+// (from the user's real browser IP — no proxy needed), and stores the
+// SDP answer back in the vault. The backend polls for the answer and
+// returns it to the browser.
+
+// POST /perplexity/sdp-offer { sdp } → { ok }
+async function handleSetPerplexitySdpOffer(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+  const { sdp } = body;
+  if (!sdp || typeof sdp !== "string") {
+    return json({ error: "Missing 'sdp' (string) in body" }, 400);
+  }
+  await env.JWT_VAULT.put(KV_PPLX_SDP_OFFER, sdp);
+  await env.JWT_VAULT.put(KV_PPLX_SDP_OFFER_TS, String(Date.now()));
+  // Clear any stale answer from a previous exchange.
+  await env.JWT_VAULT.delete(KV_PPLX_SDP_ANSWER);
+  await env.JWT_VAULT.delete(KV_PPLX_SDP_ANSWER_TS);
+  return json({ ok: true, message: "SDP offer stored." });
+}
+
+// GET /perplexity/sdp-offer → { sdp, ts } or { sdp: null }
+async function handleGetPerplexitySdpOffer(env) {
+  const sdp = await env.JWT_VAULT.get(KV_PPLX_SDP_OFFER);
+  const ts = parseInt((await env.JWT_VAULT.get(KV_PPLX_SDP_OFFER_TS)) || "0", 10);
+  if (!sdp) return json({ sdp: null, ts: null });
+  return json({ sdp, ts });
+}
+
+// POST /perplexity/sdp-answer { sdp, error? } → { ok }
+async function handleSetPerplexitySdpAnswer(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+  const { sdp, error } = body;
+  if (sdp && typeof sdp === "string") {
+    await env.JWT_VAULT.put(KV_PPLX_SDP_ANSWER, sdp);
+  } else if (error && typeof error === "string") {
+    await env.JWT_VAULT.put(KV_PPLX_SDP_ANSWER, JSON.stringify({ error }));
+  } else {
+    return json({ error: "Missing 'sdp' or 'error' (string) in body" }, 400);
+  }
+  await env.JWT_VAULT.put(KV_PPLX_SDP_ANSWER_TS, String(Date.now()));
+  // Clear the offer (the exchange is complete).
+  await env.JWT_VAULT.delete(KV_PPLX_SDP_OFFER);
+  await env.JWT_VAULT.delete(KV_PPLX_SDP_OFFER_TS);
+  return json({ ok: true, message: "SDP answer stored." });
+}
+
+// GET /perplexity/sdp-answer → { sdp, ts } or { sdp: null }
+async function handleGetPerplexitySdpAnswer(env) {
+  const sdp = await env.JWT_VAULT.get(KV_PPLX_SDP_ANSWER);
+  const ts = parseInt((await env.JWT_VAULT.get(KV_PPLX_SDP_ANSWER_TS)) || "0", 10);
+  if (!sdp) return json({ sdp: null, ts: null });
+  return json({ sdp, ts });
 }
 
 // ============================================================

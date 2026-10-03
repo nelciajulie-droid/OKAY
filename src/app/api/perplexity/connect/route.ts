@@ -338,6 +338,66 @@ function makeProxyAgent(proxyUrl: string): unknown {
   return null;
 }
 
+/** Chrome extension relay — stores the SDP offer in the vault, polls for
+ *  the SDP answer. The Chrome extension (running in the user's browser with
+ *  the real IP) picks up the offer, does the fetch to perplexity.ai, and
+ *  stores the answer. Timeout: 60s (the extension polls every 2s). */
+async function exchangeSdpViaExtensionRelay(sdp: string): Promise<string | null> {
+  const vaultUrl = (process.env.CHATGPT_VAULT_URL ?? "").trim();
+  const vaultSecret = (process.env.CHATGPT_VAULT_SECRET ?? "").trim();
+  if (!vaultUrl) return null;
+
+  const baseUrl = vaultUrl.replace(/\/+$/, "");
+  const headers = { "X-Vault-Secret": vaultSecret, "Content-Type": "application/json" };
+
+  // 1. Store the SDP offer in the vault.
+  const offerRes = await fetch(`${baseUrl}/perplexity/sdp-offer`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ sdp }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!offerRes.ok) {
+    throw new Error(`Vault SDP offer store failed: ${offerRes.status}`);
+  }
+  console.log("[perplexity] SDP offer stored in vault, waiting for extension relay…");
+
+  // 2. Poll for the SDP answer (up to 60s, every 1s).
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      const answerRes = await fetch(`${baseUrl}/perplexity/sdp-answer`, {
+        headers: { "X-Vault-Secret": vaultSecret },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!answerRes.ok) continue;
+      const data = (await answerRes.json()) as { sdp?: string | null; ts?: number | null };
+      if (data.sdp) {
+        console.log("[perplexity] SDP answer received from extension relay!");
+        // Check if it's an error response.
+        if (data.sdp.startsWith("{")) {
+          try {
+            const errObj = JSON.parse(data.sdp) as { error?: string };
+            if (errObj.error) {
+              throw new Error(errObj.error);
+            }
+          } catch (e) {
+            if (e instanceof SyntaxError) {
+              // Not JSON — it's a real SDP answer.
+              return data.sdp;
+            }
+            throw e;
+          }
+        }
+        return data.sdp;
+      }
+    } catch {
+      // Continue polling.
+    }
+  }
+  throw new Error("Extension relay timeout — the Chrome extension didn't pick up the SDP offer within 60s. Make sure the extension is running.");
+}
+
 export async function POST(req: Request) {
   // 1. Parse the browser's SDP offer.
   let body: unknown;
@@ -410,13 +470,28 @@ export async function POST(req: Request) {
     });
   }
 
+  // 3b. If all direct/proxy paths failed, try the Chrome extension relay.
+  // The extension polls the vault for pending SDP offers, does the fetch
+  // to perplexity.ai from the user's real browser IP (no Cloudflare block,
+  // no rate limit), and stores the SDP answer in the vault.
+  if (!rawResponse) {
+    console.log("[perplexity] all direct/proxy paths failed, trying Chrome extension relay…");
+    try {
+      const answer = await exchangeSdpViaExtensionRelay(sdp);
+      if (answer) {
+        return NextResponse.json({ sdp: answer, type: "answer" });
+      }
+    } catch (err) {
+      console.warn("[perplexity] extension relay failed:", (err as Error).message);
+    }
+  }
+
   if (!rawResponse) {
     return NextResponse.json(
       {
         error:
-          "Perplexity session request failed. The cf_clearance cookie may be IP-bound — " +
-          "configure PERPLEXITY_PROXY_LIST with a proxy that matches the cookie's IP, " +
-          "or run the route on a host with curl-impersonate installed.",
+          "Perplexity session request failed. All paths exhausted (direct, proxy, extension relay). " +
+          "Make sure the Chrome extension is running + the user is logged in to perplexity.ai.",
       },
       { status: 502 },
     );
