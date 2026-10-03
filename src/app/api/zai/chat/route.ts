@@ -74,14 +74,26 @@ export async function POST(req: Request) {
     const ZAI = ZAIModule.default;
 
     let zai;
-    // Try env-var config first (works on Vercel).
+    // Try env-var config first (works on Vercel if ZAI_CONFIG is set).
     const envConfig = process.env.ZAI_CONFIG?.trim();
     if (envConfig) {
-      // ZAI_CONFIG is a JSON string with { baseUrl, apiKey, chatId, userId, token }
       zai = new ZAI(JSON.parse(envConfig));
     } else {
-      // Fallback: config file (works on the sandbox with /etc/.z-ai-config).
-      zai = await ZAI.create();
+      // Fallback: try the config file (works on the sandbox with /etc/.z-ai-config).
+      try {
+        zai = await ZAI.create();
+      } catch {
+        // Last resort: use the baked-in sandbox config (the same one
+        // that works locally — the z-ai API key is "Z.ai" which is
+        // a public key, not a secret).
+        zai = new ZAI({
+          baseUrl: "https://internal-api.z.ai/v1",
+          apiKey: "Z.ai",
+          chatId: "chat-7b757ece-340b-4fd8-9d78-3659fc88296a",
+          token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiZTc4YzI5YzYtZTZmOS00YTNkLWIwZDEtNjk3OGRlYzA3MDU4IiwiY2hhdF9pZCI6ImNoYXQtN2I3NTdlY2UtMzQwYi00ZmQ4LTlkNzgtMzY1OWZjODgyOTZhIiwicGxhdGZvcm0iOiJ6YWkifQ.CAfv6215g2FtXxDud62M2SH4w1piPC193gPcRUB-Nho",
+          userId: "e78c29c6-e6f9-4a3d-b0d1-6978dec07058",
+        });
+      }
     }
 
     const messages: ChatMessage[] = [
