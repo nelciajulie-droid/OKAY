@@ -327,7 +327,11 @@ function buildBidiUrl(opts: {
   u.searchParams.set("CVER", WC_CVER);
   u.searchParams.set("zx", randomZx());
   u.searchParams.set("t", "1");
-  if (opts.sid) u.searchParams.set("SID", opts.sid);
+  // SID: Google's SID cookie value is `alkali-makersuite=<value>` — the
+  // `=` in the value is LITERAL (not a separator). URL.searchParams.set
+  // encodes `=` as %3D, which causes a 400. Fix: append the SID directly
+  // to the search string without encoding. We set it AFTER all other
+  // params so the order is preserved.
   if (opts.gsessionid) {
     u.searchParams.set("X-HTTP-Session-Id", opts.gsessionid);
   }
@@ -381,6 +385,12 @@ function buildBidiUrl(opts: {
       u.searchParams.delete("SID");
       const sep = u.searchParams.toString().length > 0 ? "&" : "?";
       // Build the search string with the raw SID value (unencoded =).
+      u.search += `${sep}SID=${opts.sid}`;
+    }
+  } else {
+    // For start/send (POST): also append the SID unencoded at the end.
+    if (opts.sid) {
+      const sep = u.searchParams.toString().length > 0 ? "&" : "?";
       u.search += `${sep}SID=${opts.sid}`;
     }
   }
@@ -931,9 +941,12 @@ async function handleSend(body: GeminiRequestBody) {
     );
   }
   const sapisidHash = computeSapisidHash(sapisid, GEMINI_ORIGIN);
+  console.log(`[gemini] send inputs: rid=${rid}, gsessionid=${gsessionid}, sid=${sid ? sid.slice(0, 40) + "..." : "MISSING"}`);
   const url = buildBidiUrl({ rid, gsessionid, sid, sapisidHash, apiKey });
+  console.log(`[gemini] send URL: ${url}`);
   const headers = buildGoogleHeaders(cookies, sapisidHash);
   const payload = buildBidiPayload("clientContent", { audio, text });
+  console.log(`[gemini] send payload: ${payload.slice(0, 300)}`);
 
   try {
     const res = await sendBidi("POST", url, headers, payload, 30_000);
