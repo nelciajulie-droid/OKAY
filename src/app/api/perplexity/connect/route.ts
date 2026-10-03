@@ -203,9 +203,8 @@ async function connectViaCurlImpersonate(
     PERPLEXITY_SESSION_URL,
     "--data-binary",
     "@-", // read body from stdin
-    // Chrome 131 impersonation flags (same set the ChatGPT route uses).
-    "--impersonate",
-    "chrome131",
+    // NOTE: this curl-impersonate binary (8.1.1, BoringSSL) has the Chrome
+    // TLS fingerprint BUILT-IN — no `--impersonate chrome131` flag needed.
     "--http2",
     "--compressed",
   ];
