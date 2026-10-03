@@ -1621,6 +1621,30 @@ function RealtimeChat() {
       log(`[qwen] kicked from channel (code: ${code}).`);
     });
 
+    // DEBUG: log ALL remote user events to understand the channel lifecycle.
+    // The AI user (rtc_user_id_voicechat = "rtc-user-voiceChat") should join
+    // the channel after we do — that's when the data channel opens.
+    engine.on("remoteUserOnLineNotify", (uid: string) => {
+      log(`[qwen] remote user online: ${uid}`);
+    });
+    engine.on("remoteUserOffLineNotify", (uid: string) => {
+      log(`[qwen] remote user offline: ${uid}`);
+    });
+    engine.on("remoteUserSubscribedDataChannel", (uid: string) => {
+      log(`[qwen] remote user subscribed data channel: ${uid}`);
+    });
+    engine.on("dataSubscribeStateChanged", (state: unknown) => {
+      log(`[qwen] data subscribe state: ${JSON.stringify(state).slice(0, 200)}`);
+    });
+    engine.on("dataPublishStateChanged", (state: unknown) => {
+      log(`[qwen] data publish state: ${JSON.stringify(state).slice(0, 200)}`);
+    });
+    // Also listen for the alternative event name (some SDK versions use
+    // `remoteDataChannelMessage` instead of `dataChannelMsg`).
+    engine.on("remoteDataChannelMessage", (uid: string, message: unknown) => {
+      log(`[qwen] remoteDataChannelMessage from ${uid}: ${JSON.stringify(message).slice(0, 200)}`);
+    });
+
     // 6. Join the Aliyun RTC channel. The auth info matches the
     //    AliRtcAuthInfo shape from the SDK types (channelId, userId,
     //    appId, nonce, timestamp, token). CRITICAL: the `timestamp` and
