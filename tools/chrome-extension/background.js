@@ -335,19 +335,22 @@ async function refreshAll(reason) {
   console.log(`[vault-refresher] Google cookies:`, google);
 
   // Surface a badge on the toolbar icon so the user can see the status.
-  // OK only when all enabled refreshes succeed. (Google cookies may not
-  // be available if the user hasn't visited aistudio.google.com — we
-  // count that as a soft failure: yellow badge with OK*, not red.)
-  const allOk = jwt.ok && pplx.ok && google.ok;
-  const partial = jwt.ok && pplx.ok && !google.ok;
+  // The badge color reflects the overall status:
+  //   "OK" (green) — all three providers refreshed successfully
+  //   "OK*" (yellow) — some providers failed (e.g. user not logged in to
+  //     chatgpt.com or perplexity.ai — that's OK, those are optional)
+  //   "ERR" (red) — ALL providers failed (network issue or vault unreachable)
+  const successCount = [jwt.ok, pplx.ok, google.ok].filter(Boolean).length;
+  const allOk = successCount === 3;
+  const someOk = successCount > 0;
+  const badgeText = allOk ? "OK" : someOk ? "OK*" : "ERR";
+  const badgeColor = allOk ? "#16a34a" : someOk ? "#ca8a04" : "#dc2626";
   // Wrap badge calls in try/catch — chrome.action.setBadgeText can fail
   // if the extension action has no default_icon (which is OK for our
   // text-only badge, but Chrome sometimes throws).
   try {
-    await chrome.action.setBadgeText({ text: allOk ? "OK" : partial ? "OK*" : "ERR" });
-    await chrome.action.setBadgeBackgroundColor({
-      color: allOk ? "#16a34a" : partial ? "#ca8a04" : "#dc2626",
-    });
+    await chrome.action.setBadgeText({ text: badgeText });
+    await chrome.action.setBadgeBackgroundColor({ color: badgeColor });
   } catch (e) {
     console.warn("[vault-refresher] badge update failed:", e);
   }
