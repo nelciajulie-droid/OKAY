@@ -877,6 +877,7 @@ async function handleStart(_body: GeminiRequestBody) {
     console.log(`[gemini] start: headerGsid=${headerGsid ? headerGsid.slice(0, 30) + "..." : "no"}, cookieSid=${cookieSid ? cookieSid.slice(0, 30) + "..." : "no"}, bodyGsessionid=${bodyGsessionid ? bodyGsessionid.slice(0, 30) + "..." : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
     console.log(`[gemini] start: raw body (first 1000 chars):\n${res.body.slice(0, 1000)}`);
     console.log(`[gemini] start: set-cookie:`, JSON.stringify(res.setCookie).slice(0, 500));
+    console.log(`[gemini] start: ALL response headers:`, JSON.stringify(res.headers).slice(0, 1000));
     // Surface the parsed setup response too — it may carry the first
     // server message (a greeting audio chunk, etc.).
     const parsed = parseBidiChunks(res.body);
@@ -1011,9 +1012,12 @@ async function handleReceive(body: GeminiRequestBody) {
   console.log(`[gemini] receive URL: ${url.slice(0, 300)}`);
   console.log(`[gemini] receive: gsessionid=${gsessionid}, sid=${sid.slice(0, 40)}..., rid=${rid}`);
   const headers = buildGoogleHeaders(cookies, sapisidHash, true); // isGet=true, no Content-Type
-  // Long-poll: allow up to 25s for a chunk.
+  // Long-poll: allow up to 55s for a chunk (Google's Web Channel keeps
+  // the connection open for up to ~60s before closing + expecting a
+  // new long-poll). 25s was too short — the AI takes time to process
+  // the audio + generate a response.
   try {
-    const res = await sendBidi("GET", url, headers, null, 25_000);
+    const res = await sendBidi("GET", url, headers, null, 55_000);
     if (res.status >= 400) {
       return NextResponse.json(
         {
