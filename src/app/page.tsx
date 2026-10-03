@@ -1548,6 +1548,10 @@ function RealtimeChat() {
       rtc_gslb?: string;
       rtc_user_id_client?: string;
       rtc_user_id_voicechat?: string;
+      // CRITICAL — timestamp + nonce are cryptographically bound to the
+      // token. Must be passed through from Qwen's response (not Date.now()).
+      rtc_timestamp?: number;
+      rtc_nonce?: string;
       chat_id?: string;
       times_left?: number | null;
       audio_timeout?: number | null;
@@ -1619,18 +1623,20 @@ function RealtimeChat() {
 
     // 6. Join the Aliyun RTC channel. The auth info matches the
     //    AliRtcAuthInfo shape from the SDK types (channelId, userId,
-    //    appId, nonce, timestamp, token). Qwen doesn't use the nonce
-    //    field — we pass an empty string (the Qwen Omni SDK does the
-    //    same). The timestamp is the current time in milliseconds.
+    //    appId, nonce, timestamp, token). CRITICAL: the `timestamp` and
+    //    `nonce` MUST be the values Qwen returned (the token is
+    //    cryptographically bound to them). Using `Date.now()` →
+    //    "Signaling connect failed" (the SDK rejects the token because
+    //    the timestamp doesn't match the one the token was issued for).
     const authInfo = {
       channelId: rtc.rtc_channel ?? "",
       userId: rtc.rtc_user_id_client ?? "",
       appId: rtc.rtc_app_id ?? "",
-      nonce: "",
-      timestamp: Date.now(),
+      nonce: rtc.rtc_nonce ?? "",
+      timestamp: rtc.rtc_timestamp ?? 0,
       token: rtc.rtc_token ?? "",
     };
-    log(`Joining Aliyun RTC channel ${authInfo.channelId.slice(0, 24)}…`);
+    log(`Joining Aliyun RTC channel ${authInfo.channelId.slice(0, 24)} (timestamp: ${authInfo.timestamp})…`);
     try {
       await engine.joinChannel(authInfo, "rtc-user-client");
     } catch (err) {
