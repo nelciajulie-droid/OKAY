@@ -207,6 +207,10 @@ function RealtimeChat() {
     gsessionid: string;
     sid: string;
     rid: string;
+    // The RID must be INCREMENTAL for each POST (start uses rid, send uses
+    // rid+1, rid+2, ...). The receive uses RID=rpc (fixed). Verified from
+    // the real AI Studio capture: start RID=3054, send RID=3055, etc.
+    nextRid: number;
   } | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -663,10 +667,12 @@ function RealtimeChat() {
     if (!startData.ok || !startData.gsessionid || !startData.rid) {
       throw new Error(startData.error ?? "Gemini start returned no session.");
     }
+    const startRidNum = parseInt(startData.rid, 10) || 0;
     geminiSessionRef.current = {
       gsessionid: startData.gsessionid,
       sid: startData.sid ?? "",
       rid: startData.rid,
+      nextRid: startRidNum + 1, // the next send POST will use startRid + 1
     };
     log(`Gemini session started (rid=${startData.rid}).`);
 
@@ -712,6 +718,10 @@ function RealtimeChat() {
         off += c.length;
       }
       const b64 = int16ToBase64(merged);
+      // Use the INCREMENTAL RID — each send POST gets a new RID (the start
+      // used startRid, the first send uses startRid+1, the second startRid+2,
+      // etc.). Verified from the real AI Studio capture.
+      const sendRid = String(session.nextRid++);
       try {
         await fetch("/api/gemini/connect", {
           method: "POST",
@@ -720,7 +730,7 @@ function RealtimeChat() {
             action: "send",
             gsessionid: session.gsessionid,
             sid: session.sid,
-            rid: session.rid,
+            rid: sendRid, // incremental RID (not the start RID)
             audio: b64,
           }),
           signal: AbortSignal.timeout(30_000),

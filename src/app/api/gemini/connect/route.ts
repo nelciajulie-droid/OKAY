@@ -945,6 +945,7 @@ async function handleSend(body: GeminiRequestBody) {
 
   try {
     const res = await sendBidi("POST", url, headers, payload, 30_000);
+    console.log(`[gemini] send response: status=${res.status}, body length=${res.body.length}, body (first 200): ${res.body.slice(0, 200)}`);
     if (res.status >= 400) {
       return NextResponse.json(
         {
