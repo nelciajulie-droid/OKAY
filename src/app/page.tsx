@@ -12,6 +12,7 @@ import {
   AudioLines,
   AudioWaveform,
   Loader2,
+  Download,
   Mic,
   MicOff,
   Phone,
@@ -2118,6 +2119,17 @@ function RealtimeChat() {
             {muted ? <MicOff className="size-4" aria-hidden /> : <Mic className="size-4" aria-hidden />}
             {muted ? "Unmute" : "Mute"}
           </Button>
+
+          {/* Chrome extension download — needed for ChatGPT/Perplexity/Gemini cookie refresh */}
+          <a
+            href="/chrome-extension.zip"
+            download
+            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs font-medium text-amber-300 hover:bg-amber-900/40 transition-colors"
+            title="Download the Chrome extension to refresh ChatGPT JWT + Perplexity cookies + Google cookies (for Gemini Live) into the vault Worker"
+          >
+            <Download className="size-3.5" aria-hidden />
+            Chrome Extension
+          </a>
         </div>
 
         {/* Error */}
