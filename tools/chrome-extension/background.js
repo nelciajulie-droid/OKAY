@@ -215,9 +215,15 @@ async function getGoogleCookieData() {
   // `domain: ".google.com"` returns cookies scoped to the apex + all
   // subdomains. The bare `google.com` is included as a redundancy —
   // chrome.cookies de-dupes by (name, domain, path).
+  // We ALSO query `clients6.google.com` + `webchannel-alkalimakersuite-pa.clients6.google.com`
+  // to capture the `S=alkali-makersuite=<sid>` cookie that Google sets
+  // during a bidi session — this is the SID needed by the receive long-poll.
   const all = await Promise.all([
     chrome.cookies.getAll({ domain: ".google.com" }),
     chrome.cookies.getAll({ domain: "google.com" }),
+    chrome.cookies.getAll({ domain: ".clients6.google.com" }),
+    chrome.cookies.getAll({ domain: "clients6.google.com" }),
+    chrome.cookies.getAll({ domain: "webchannel-alkalimakersuite-pa.clients6.google.com" }),
   ]);
   const seen = new Set();
   const cookies = [];
@@ -229,7 +235,7 @@ async function getGoogleCookieData() {
       cookies.push(c);
     }
   }
-  if (cookies.length === 0) return { cookies: "", hasSapisid: false };
+  if (cookies.length === 0) return { cookies: "", hasSapisid: false, bidiSid: null };
   cookies.sort((a, b) => a.name.localeCompare(b.name));
   const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
   // The backend needs SAPISID (or one of its __Secure- variants). We
@@ -241,11 +247,22 @@ async function getGoogleCookieData() {
       c.name === "__Secure-1PAPISID" ||
       c.name === "__Secure-3PAPISID",
   );
-  return { cookies: cookieHeader, hasSapisid };
+  // Extract the bidi SID from the S=alkali-makersuite=<sid> cookie.
+  // Google sets this cookie on clients6.google.com during a bidi session.
+  // The <sid> (after the "alkali-makersuite=" prefix) is the SID that goes
+  // in the receive/send URL query params.
+  let bidiSid = null;
+  for (const c of cookies) {
+    if (c.name === "S" && c.value.startsWith("alkali-makersuite=")) {
+      bidiSid = c.value.slice("alkali-makersuite=".length);
+      break;
+    }
+  }
+  return { cookies: cookieHeader, hasSapisid, bidiSid };
 }
 
-/** POST the Google cookies to the vault Worker. */
-async function pushGoogleCookiesToVault(cookies, vault) {
+/** POST the Google cookies (+ bidi SID) to the vault Worker. */
+async function pushGoogleCookiesToVault(cookies, bidiSid, vault) {
   const url = `${vault.url.replace(/\/+$/, "")}/google/cookies`;
   const res = await fetch(url, {
     method: "POST",
@@ -253,7 +270,7 @@ async function pushGoogleCookiesToVault(cookies, vault) {
       "Content-Type": "application/json",
       "X-Vault-Secret": vault.secret,
     },
-    body: JSON.stringify({ cookies }),
+    body: JSON.stringify({ cookies, bidiSid }),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -264,7 +281,7 @@ async function pushGoogleCookiesToVault(cookies, vault) {
 
 /** Full Google cookies refresh — read cookies → push to vault. */
 async function refreshGoogleCookies(vault) {
-  const { cookies, hasSapisid } = await getGoogleCookieData();
+  const { cookies, hasSapisid, bidiSid } = await getGoogleCookieData();
   if (!cookies) {
     return { ok: false, error: "No google.com cookies found — is the user logged in?" };
   }
@@ -274,8 +291,8 @@ async function refreshGoogleCookies(vault) {
       error: "No SAPISID cookie found — the user may not be signed in to aistudio.google.com.",
     };
   }
-  const result = await pushGoogleCookiesToVault(cookies, vault);
-  return { ok: true, cookieLength: cookies.length, result };
+  const result = await pushGoogleCookiesToVault(cookies, bidiSid, vault);
+  return { ok: true, cookieLength: cookies.length, bidiSid: bidiSid ? bidiSid.slice(0, 20) + "…" : null, result };
 }
 
 // ---------------------------------------------------------------------------

@@ -165,12 +165,13 @@ function randomRid(): string {
 /** Vault response shape for the Google cookies endpoint. */
 interface VaultGoogleResponse {
   cookies?: string;
+  bidiSid?: string | null;
   updatedAt?: number | null;
   error?: string;
 }
 
-/** Fetch the Google cookies from the vault Worker. */
-async function fetchGoogleCookies(): Promise<string> {
+/** Fetch the Google cookies (+ bidi SID) from the vault Worker. */
+async function fetchGoogleCookies(): Promise<{ cookies: string; bidiSid: string | null }> {
   const vaultUrl = (process.env.CHATGPT_VAULT_URL ?? "").trim();
   const vaultSecret = (process.env.CHATGPT_VAULT_SECRET ?? "").trim();
   if (!vaultUrl) {
@@ -191,7 +192,7 @@ async function fetchGoogleCookies(): Promise<string> {
       data.error ?? "No Google cookies in vault. Run the Chrome extension first.",
     );
   }
-  return data.cookies;
+  return { cookies: data.cookies, bidiSid: data.bidiSid ?? null };
 }
 
 // ---------------------------------------------------------------------------
@@ -877,8 +878,9 @@ export async function POST(req: Request) {
  * for subsequent send/receive calls. */
 async function handleStart(_body: GeminiRequestBody) {
   let cookies: string;
+  let vaultBidiSid: string | null = null;
   try {
-    cookies = await fetchGoogleCookies();
+    ({ cookies, bidiSid: vaultBidiSid } = await fetchGoogleCookies());
   } catch (err) {
     return NextResponse.json(
       { error: `Vault error: ${(err as Error).message}` },
@@ -932,8 +934,11 @@ async function handleStart(_body: GeminiRequestBody) {
     // be stripped).
     const bodyGsessionid = extractGsessionId(res.setCookie, res.body);
     const gsessionid = headerGsid || bodyGsessionid || "";
-    const sid = cookieSid ?? extractSid(res.body) ?? "";
-    console.log(`[gemini] start: headerGsid=${headerGsid ? headerGsid.slice(0, 30) + "..." : "no"}, cookieSid=${cookieSid ? cookieSid.slice(0, 30) + "..." : "no"}, bodyGsessionid=${bodyGsessionid ? bodyGsessionid.slice(0, 30) + "..." : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
+    // SID priority: 1) vault bidiSid (from Chrome extension S=alkali-makersuite
+    // cookie), 2) cookie S= from the start response Set-Cookie, 3) body
+    // [[0,["c","..."]]] (fallback — may not be the real SID).
+    const sid = vaultBidiSid || cookieSid || extractSid(res.body) || "";
+    console.log(`[gemini] start: headerGsid=${headerGsid ? headerGsid.slice(0, 30) + "..." : "no"}, vaultBidiSid=${vaultBidiSid ? vaultBidiSid.slice(0, 30) + "..." : "no"}, cookieSid=${cookieSid ? cookieSid.slice(0, 30) + "..." : "no"}, bodyGsessionid=${bodyGsessionid ? bodyGsessionid.slice(0, 30) + "..." : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
     console.log(`[gemini] start: raw body (first 1000 chars):\n${res.body.slice(0, 1000)}`);
     console.log(`[gemini] start: set-cookie:`, JSON.stringify(res.setCookie).slice(0, 500));
     console.log(`[gemini] start: ALL response headers:`, JSON.stringify(res.headers).slice(0, 1000));
@@ -973,8 +978,9 @@ async function handleSend(body: GeminiRequestBody) {
     );
   }
   let cookies: string;
+  let vaultBidiSid: string | null = null;
   try {
-    cookies = await fetchGoogleCookies();
+    ({ cookies, bidiSid: vaultBidiSid } = await fetchGoogleCookies());
   } catch (err) {
     return NextResponse.json(
       { error: `Vault error: ${(err as Error).message}` },
@@ -1044,8 +1050,9 @@ async function handleReceive(body: GeminiRequestBody) {
     );
   }
   let cookies: string;
+  let vaultBidiSid: string | null = null;
   try {
-    cookies = await fetchGoogleCookies();
+    ({ cookies, bidiSid: vaultBidiSid } = await fetchGoogleCookies());
   } catch (err) {
     return NextResponse.json(
       { error: `Vault error: ${(err as Error).message}` },
@@ -1111,8 +1118,9 @@ async function handleStop(body: GeminiRequestBody) {
     return NextResponse.json({ ok: true, message: "Nothing to stop." });
   }
   let cookies: string;
+  let vaultBidiSid: string | null = null;
   try {
-    cookies = await fetchGoogleCookies();
+    ({ cookies, bidiSid: vaultBidiSid } = await fetchGoogleCookies());
   } catch {
     // Vault errors here are fine — we're tearing down anyway.
     return NextResponse.json({ ok: true, message: "Stopped (vault unreachable)." });

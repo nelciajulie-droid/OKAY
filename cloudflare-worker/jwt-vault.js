@@ -43,6 +43,7 @@ const KV_PERPLEXITY_UPDATED = "perplexity_updated";
 // to webchannel-alkalimakersuite-pa.clients6.google.com.
 const KV_GOOGLE_COOKIES = "google_cookies";
 const KV_GOOGLE_UPDATED = "google_updated";
+const KV_GOOGLE_BIDI_SID = "google_bidi_sid";
 
 // KV keys — Inworld AI Realtime voice token
 // `inworld_token` stores the static base64 token used as the WebSocket
@@ -267,6 +268,7 @@ async function handleHealth(env) {
   const perplexityUpdated = parseInt((await env.JWT_VAULT.get(KV_PERPLEXITY_UPDATED)) || "0", 10);
   const googleCookies = await env.JWT_VAULT.get(KV_GOOGLE_COOKIES);
   const googleUpdated = parseInt((await env.JWT_VAULT.get(KV_GOOGLE_UPDATED)) || "0", 10);
+  const googleBidiSid = await env.JWT_VAULT.get(KV_GOOGLE_BIDI_SID);
   const inworldToken = await env.JWT_VAULT.get(KV_INWORLD_TOKEN);
   const inworldUpdated = parseInt((await env.JWT_VAULT.get(KV_INWORLD_UPDATED)) || "0", 10);
   const now = Math.floor(Date.now() / 1000);
@@ -297,6 +299,8 @@ async function handleHealth(env) {
     googleUpdatedHuman: googleUpdated
       ? new Date(googleUpdated * 1000).toISOString()
       : null,
+    hasGoogleBidiSid: Boolean(googleBidiSid),
+    googleBidiSid: googleBidiSid ? googleBidiSid.slice(0, 20) + "…" : null,
     // Inworld AI Realtime voice token.
     hasInworldToken: Boolean(inworldToken),
     inworldTokenLength: inworldToken ? inworldToken.length : 0,
@@ -662,33 +666,40 @@ async function handleSetPerplexityCookies(request, env) {
 // bidi call to webchannel-alkalimakersuite-pa.clients6.google.com,
 // extracts the SAPISID value, and computes a fresh SAPISIDHASH.
 
-// GET /google/cookies → { cookies, updatedAt }
+// GET /google/cookies → { cookies, bidiSid, updatedAt }
 async function handleGetGoogleCookies(env) {
   const cookies = await env.JWT_VAULT.get(KV_GOOGLE_COOKIES);
   if (!cookies) return json({ error: "No Google cookies in vault." }, 404);
   const updatedAt = parseInt((await env.JWT_VAULT.get(KV_GOOGLE_UPDATED)) || "0", 10);
+  const bidiSid = await env.JWT_VAULT.get(KV_GOOGLE_BIDI_SID);
   return json({
     cookies,
+    bidiSid: bidiSid || null,
     updatedAt: updatedAt || null,
     updatedAtHuman: updatedAt ? new Date(updatedAt * 1000).toISOString() : null,
   });
 }
 
-// POST /google/cookies { cookies } → { ok }
+// POST /google/cookies { cookies, bidiSid? } → { ok }
 //   `cookies` is the full Cookie header string for .google.com.
+//   `bidiSid` is the SID from the S=alkali-makersuite=<sid> cookie (optional).
 async function handleSetGoogleCookies(request, env) {
   let body;
   try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
-  const { cookies } = body;
+  const { cookies, bidiSid } = body;
   if (!cookies || typeof cookies !== "string") {
     return json({ error: "Missing 'cookies' (string) in body" }, 400);
   }
   await env.JWT_VAULT.put(KV_GOOGLE_COOKIES, cookies);
   await env.JWT_VAULT.put(KV_GOOGLE_UPDATED, String(Math.floor(Date.now() / 1000)));
+  if (bidiSid && typeof bidiSid === "string") {
+    await env.JWT_VAULT.put(KV_GOOGLE_BIDI_SID, bidiSid);
+  }
   return json({
     ok: true,
     message: "Google cookies stored.",
     cookieLength: cookies.length,
+    bidiSid: bidiSid ? bidiSid.slice(0, 20) + "…" : null,
   });
 }
 
