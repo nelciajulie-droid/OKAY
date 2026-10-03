@@ -188,6 +188,7 @@ async function connectViaCurlImpersonate(
   cookies: string,
   account: string | null,
   sdp: string,
+  proxy?: string | null,
 ): Promise<string> {
   const body = buildPerplexityBody(sdp);
   const headers = buildPerplexityHeaders(cookies, account);
@@ -208,6 +209,17 @@ async function connectViaCurlImpersonate(
     "--http2",
     "--compressed",
   ];
+  // If a proxy is provided, add it to the curl args. curl-impersonate
+  // supports --socks5, --socks4, and -x (HTTP proxy) flags.
+  if (proxy) {
+    if (proxy.startsWith("socks5://")) {
+      args.push("--socks5", proxy.replace("socks5://", ""));
+    } else if (proxy.startsWith("socks4://")) {
+      args.push("--socks4", proxy.replace("socks4://", ""));
+    } else {
+      args.push("-x", proxy);
+    }
+  }
   for (const [k, v] of Object.entries(headers)) {
     args.push("-H", `${k}: ${v}`);
   }
@@ -357,19 +369,46 @@ export async function POST(req: Request) {
     );
   }
 
-  // 3. Try curl-impersonate first (the only path that reliably passes
-  //    Cloudflare's TLS check), then fall back to the pure-JS proxy path.
-  const rawResponse =
-    (existsSync(CURL_IMPERSONATE_BIN)
-      ? await connectViaCurlImpersonate(cookies, account, sdp).catch((err) => {
-          console.warn("[perplexity] curl-impersonate failed:", err.message);
+  // 3. Try curl-impersonate (with proxies if configured), then fall back to
+  //    the pure-JS proxy path. curl-impersonate has the Chrome TLS fingerprint
+  //    built-in, so it can pass Cloudflare's TLS check. If proxies are
+  //    configured, we try curl-impersonate through each proxy first.
+  const proxyList = (process.env.PERPLEXITY_PROXY_LIST ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  let rawResponse: string | null = null;
+
+  if (existsSync(CURL_IMPERSONATE_BIN)) {
+    // Try direct first (no proxy) — works if the sandbox IP isn't blocked.
+    rawResponse = await connectViaCurlImpersonate(cookies, account, sdp, null).catch((err) => {
+      console.warn("[perplexity] curl-impersonate direct failed:", err.message);
+      return null;
+    });
+
+    // If direct failed, try each proxy with curl-impersonate (Chrome TLS + proxy).
+    if (!rawResponse && proxyList.length > 0) {
+      for (const proxy of proxyList) {
+        rawResponse = await connectViaCurlImpersonate(cookies, account, sdp, proxy).catch((err) => {
+          console.warn(`[perplexity] curl-impersonate via ${proxy} failed:`, err.message);
           return null;
-        })
-      : null) ??
-    (await connectViaProxies(cookies, account, sdp).catch((err) => {
+        });
+        if (rawResponse) {
+          console.log(`[perplexity] success via curl-impersonate + proxy ${proxy}`);
+          break;
+        }
+      }
+    }
+  }
+
+  // Fall back to pure-JS proxy path if curl-impersonate didn't work.
+  if (!rawResponse) {
+    rawResponse = await connectViaProxies(cookies, account, sdp).catch((err) => {
       console.warn("[perplexity] proxy fallback failed:", err.message);
       return null;
-    }));
+    });
+  }
 
   if (!rawResponse) {
     return NextResponse.json(
