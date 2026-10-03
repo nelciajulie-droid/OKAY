@@ -551,7 +551,7 @@ async function sendViaCurlImpersonate(
         reject(new Error(`curl-impersonate exited ${code}: ${stderr.slice(0, 400)}`));
         // Cleanup temp files on error too.
         try { unlinkSync(tmpHeaderFile); } catch { /* ignore */ }
-        if (tmpBodyFile) { try { unlinkSync(tmpBodyFile); } catch { /* ignore */ }
+        if (tmpBodyFile) { try { unlinkSync(tmpBodyFile); } catch { /* ignore */ } }
         return;
       }
       // Read body from stdout, headers from the temp file
