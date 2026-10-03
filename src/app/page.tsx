@@ -2504,9 +2504,21 @@ function RealtimeChat() {
           break;
         }
         case "ai_text": {
-          // Streaming AI text — append to the last AI: line (same
-          // pattern as appendAiDelta for Inworld/Gemini).
-          appendAiDelta(msg.text || "");
+          // Streaming AI text — append to the last AI: line.
+          // Define inline because appendAiDelta from connectInworld
+          // is not in scope (separate useCallback closure).
+          const delta = msg.text || "";
+          if (!delta) break;
+          setTranscript((t) => {
+            const next = [...t];
+            const last = next[next.length - 1] ?? "";
+            if (last.includes("] AI:")) {
+              next[next.length - 1] = last + delta;
+            } else {
+              next.push(`[${new Date().toLocaleTimeString()}] AI: ${delta}`);
+            }
+            return next.slice(-200);
+          });
           break;
         }
         case "ai_end": {
