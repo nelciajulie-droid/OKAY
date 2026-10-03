@@ -24,9 +24,30 @@
 "use strict";
 
 const path = require("path");
+const fs = require("fs");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
 const vosk = require("vosk");
+
+// --- Load .env file (for NVIDIA_API_KEY) --------------------------------
+const envPath = path.join(__dirname, "..", "..", ".env");
+if (fs.existsSync(envPath)) {
+  const envContent = fs.readFileSync(envPath, "utf8");
+  for (const line of envContent.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx > 0) {
+      const key = trimmed.slice(0, eqIdx).trim();
+      const val = trimmed.slice(eqIdx + 1).trim();
+      if (!process.env[key]) {
+        process.env[key] = val;
+      }
+    }
+  }
+  console.log(`[voice-ai] loaded .env from ${envPath}`);
+  console.log(`[voice-ai] NVIDIA_API_KEY: ${process.env.NVIDIA_API_KEY ? "set ✓" : "NOT SET ✗"}`);
+}
 
 // --- Config -------------------------------------------------------------
 const PORT = 3005;
@@ -229,7 +250,7 @@ wss.on("connection", (ws, req) => {
     aiSegmentQueue = [];
     aiTtsRunning = false;
 
-    console.log(`[voice-ai] AI pipeline starting for: ${userText.slice(0, 80)}`);
+    console.log(`[voice-ai] AI pipeline starting for: ${userText.slice(0, 80)} (NVIDIA_API_KEY: ${process.env.NVIDIA_API_KEY ? "set" : "MISSING"})`);
     sendJson({ type: "ai_start", text: userText });
 
     // Spawn the Python NVIDIA streaming script.
@@ -237,10 +258,11 @@ wss.on("connection", (ws, req) => {
       path.join(__dirname, "ai_stream.py"),
       userText,
     ], {
+      cwd: __dirname,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { PYTHONUNBUFFERED: "1",
+      env: {
+        PYTHONUNBUFFERED: "1",
         ...process.env,
-        // NVIDIA_API_KEY must be set in the environment.
       },
     });
     aiProcess = child;
