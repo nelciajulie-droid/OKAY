@@ -206,7 +206,37 @@ async function fetchGoogleCookies(): Promise<string> {
  * Channel convention for forwarding sensitive headers via the long-poll
  * GET.
  */
+/** Filter the Google cookies to only the essential ones for the bidi API.
+ *  The full cookie string can be 10KB+ (with __Host-*, __Secure-*, NID,
+ *  LSID, etc.) which causes curl-impersonate to exit 55 ("Failed sending
+ *  HTTP POST request") due to header size limits. The bidi API only needs
+ *  the auth cookies: SID, __Secure-1PSID, SAPISID, HSID, SSID, APISID,
+ *  __Secure-1PAPISID, __Secure-3PAPISID. */
+function filterEssentialCookies(cookies: string): string {
+  const essentialNames = [
+    "SID", "__Secure-1PSID", "SAPISID", "HSID", "SSID", "APISID",
+    "__Secure-1PAPISID", "__Secure-3PAPISID", "__Secure-3PSID",
+  ];
+  const cookieMap: Record<string, string> = {};
+  for (const pair of cookies.split("; ")) {
+    const eqIdx = pair.indexOf("=");
+    if (eqIdx > 0) {
+      const name = pair.slice(0, eqIdx);
+      const value = pair.slice(eqIdx + 1);
+      cookieMap[name] = value;
+    }
+  }
+  const essential: string[] = [];
+  for (const name of essentialNames) {
+    if (cookieMap[name]) essential.push(`${name}=${cookieMap[name]}`);
+  }
+  return essential.join("; ");
+}
+
 function buildGoogleHeaders(cookies: string, sapisidHash: string, isGet = false): Record<string, string> {
+  // Filter to essential cookies only — the full 10KB cookie string causes
+  // curl-impersonate to exit 55 (header too large).
+  const essentialCookies = filterEssentialCookies(cookies);
   const h: Record<string, string> = {
     "User-Agent": GEMINI_UA,
     Accept: "*/*",
@@ -214,7 +244,7 @@ function buildGoogleHeaders(cookies: string, sapisidHash: string, isGet = false)
     "Accept-Encoding": "identity", // prevent gzip — we need to parse the body
     Origin: GEMINI_ORIGIN,
     Referer: `${GEMINI_ORIGIN}/`,
-    Cookie: cookies,
+    Cookie: essentialCookies,
     Authorization: sapisidHash,
     "X-Goog-Api-Key": process.env.GEMINI_API_KEY ?? "",
     "X-Goog-AuthUser": "0",
@@ -548,6 +578,9 @@ async function sendViaCurlImpersonate(
     );
     child.on("close", (code) => {
       if (code !== 0) {
+        console.error(`[gemini] curl-impersonate exited ${code}: ${stderr.slice(0, 400)}`);
+        console.error(`[gemini] curl-impersonate args: ${args.join(" ").slice(0, 500)}`);
+        console.error(`[gemini] curl-impersonate headers count: ${Object.keys(headers).length}, cookie length: ${(headers["Cookie"] ?? "").length}`);
         reject(new Error(`curl-impersonate exited ${code}: ${stderr.slice(0, 400)}`));
         // Cleanup temp files on error too.
         try { unlinkSync(tmpHeaderFile); } catch { /* ignore */ }
