@@ -48,6 +48,15 @@ const ALARM_PERIOD_MIN = 120;
 // otherwise fall back to the baked-in defaults above.
 // ---------------------------------------------------------------------------
 
+// Global error handler — catch any uncaught error so the service worker
+// doesn't crash (which shows as the "ERR" icon on the extension).
+self.addEventListener("error", (e) => {
+  console.error("[vault-refresher] uncaught error:", e.message, e.filename, e.lineno);
+});
+self.addEventListener("unhandledrejection", (e) => {
+  console.error("[vault-refresher] unhandled rejection:", e.reason?.message || e.reason);
+});
+
 async function getVaultConfig() {
   const stored = await chrome.storage.local.get(["VAULT_URL", "VAULT_SECRET"]);
   return {
