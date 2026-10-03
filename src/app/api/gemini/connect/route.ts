@@ -369,6 +369,20 @@ function buildBidiUrl(opts: {
     u.searchParams.set("AID", "0");
     u.searchParams.set("CI", "0");
     u.searchParams.set("TYPE", "xmlhttp");
+    // SID: Google's SID cookie is `S=alkali-makersuite=<value>` — the
+    // value we extracted is `alkali-makersuite=<value>`. The `=` in the
+    // value is LITERAL (not a separator) — Google expects it unencoded
+    // in the SID query param. URL.searchParams.set encodes `=` as %3D,
+    // which causes a 400. Fix: append the SID directly to the search
+    // string without encoding (after the other params are set).
+    if (opts.sid) {
+      // Remove the encoded SID that URL.searchParams.set added, then
+      // append the raw SID value.
+      u.searchParams.delete("SID");
+      const sep = u.searchParams.toString().length > 0 ? "&" : "?";
+      // Build the search string with the raw SID value (unencoded =).
+      u.search += `${sep}SID=${opts.sid}`;
+    }
   }
   return u.toString();
 }
@@ -504,8 +518,10 @@ async function sendViaCurlImpersonate(
     "-o",
     "-", // body to stdout
     url,
-    "--impersonate",
-    "chrome131",
+    // NOTE: this curl-impersonate binary (8.1.1, BoringSSL) has the Chrome
+    // TLS fingerprint BUILT-IN — no `--impersonate chrome131` flag needed
+    // (that flag is only for the newer curl-impersonate binaries). The
+    // binary's BoringSSL already produces the Chrome JA3/JA4 fingerprint.
     "--http2",
     "--compressed",
   ];
@@ -600,6 +616,26 @@ function extractGsessionId(setCookie: string[], body: string): string | null {
   }
   const bodyMatch = body.match(/gsessionid=([A-Za-z0-9_\-]+)/);
   if (bodyMatch) return bodyMatch[1];
+  // FALLBACK: the body's `[[0,["c","<value>","",8,15,30000]]]` actually
+  // contains the gsessionid (the "c" = channel session id), NOT the SID.
+  // The real SID is in the `Set-Cookie: S=...` header. So if we didn't
+  // find a `gsessionid=` in the body, use the "c" value from the body
+  // as the gsessionid (it's the same thing in Google's Web Channel).
+  const cMatch = body.match(/\[\[0,\["c","([A-Za-z0-9_-]+)"/);
+  if (cMatch) return cMatch[1];
+  return null;
+}
+
+/** Extract the SID from the Set-Cookie header (the `S=...` cookie).
+ *  Google's Web Channel returns the SID in `Set-Cookie: S=...; path=/`.
+ *  This is DIFFERENT from the gsessionid (which is in the body's
+ *  `[[0,["c","<gsessionid>"]]]` — the "c" = channel session id). */
+function extractSidFromCookie(setCookie: string[]): string | null {
+  for (const c of setCookie) {
+    // Match "S=value" (the cookie name is literally "S")
+    const m = c.match(/^S=([^;]+)/i);
+    if (m) return m[1];
+  }
   return null;
 }
 
@@ -815,17 +851,27 @@ async function handleStart(_body: GeminiRequestBody) {
         { status: 502 },
       );
     }
-    // gsessionid: Google returns it in the x-http-session-id RESPONSE HEADER
-    // Vercel might strip this header, so also try body extraction + SID fallback
+    // gsessionid: Google returns it in the body's `[[0,["c","<value>"]]`,
+    // NOT in the x-http-session-id response header (that's empty on Vercel).
+    // SID: Google returns it in the `Set-Cookie: S=<value>` header — this
+    // is DIFFERENT from the gsessionid. The receive long-poll needs BOTH
+    // the gsessionid (as a query param) AND the SID (as a query param).
     const headerGsid = (res.headers["x-http-session-id"] as string) ?? "";
-    const sid = extractSid(res.body) ?? headerGsid ?? "";
+    // Extract the SID from the Set-Cookie S=... header (the REAL SID).
+    const cookieSid = extractSidFromCookie(res.setCookie);
+    // Extract the gsessionid from the body's `[[0,["c","<value>"]]` (or
+    // fall back to the header / a body regex).
+    const bodyGsessionid = extractGsessionId(res.setCookie, res.body);
+    const sid = cookieSid ?? extractSid(res.body) ?? headerGsid ?? "";
     const gsessionid =
+      bodyGsessionid ||
       headerGsid ||
-      extractGsessionId(res.setCookie, res.body) ||
       (res.body.match(/gsessionid=([A-Za-z0-9_\-]+)/)?.[1]) ||
-      sid || // Use SID as gsessionid if header is missing (Google sometimes uses the same value)
+      sid || // last-resort fallback (same value — Google sometimes uses them interchangeably)
       randomUuid();
-    console.log(`[gemini] start: headerGsid=${headerGsid ? "yes" : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
+    console.log(`[gemini] start: headerGsid=${headerGsid ? "yes" : "no"}, cookieSid=${cookieSid ? cookieSid.slice(0, 30) + "..." : "no"}, bodyGsessionid=${bodyGsessionid ? bodyGsessionid.slice(0, 30) + "..." : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
+    console.log(`[gemini] start: raw body (first 1000 chars):\n${res.body.slice(0, 1000)}`);
+    console.log(`[gemini] start: set-cookie:`, JSON.stringify(res.setCookie).slice(0, 500));
     // Surface the parsed setup response too — it may carry the first
     // server message (a greeting audio chunk, etc.).
     const parsed = parseBidiChunks(res.body);
@@ -953,6 +999,8 @@ async function handleReceive(body: GeminiRequestBody) {
   }
   const sapisidHash = computeSapisidHash(sapisid, GEMINI_ORIGIN);
   const url = buildBidiUrl({ rid, gsessionid, sid, sapisidHash, apiKey, receive: true });
+  console.log(`[gemini] receive URL: ${url.slice(0, 300)}`);
+  console.log(`[gemini] receive: gsessionid=${gsessionid}, sid=${sid.slice(0, 40)}..., rid=${rid}`);
   const headers = buildGoogleHeaders(cookies, sapisidHash, true); // isGet=true, no Content-Type
   // Long-poll: allow up to 25s for a chunk.
   try {
