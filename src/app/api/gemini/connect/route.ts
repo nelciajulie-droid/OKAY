@@ -520,8 +520,21 @@ async function sendViaCurlImpersonate(
     if (!v) continue;
     args.push("-H", `${k}: ${v}`);
   }
+  // Write the body to a temp file instead of stdin — curl-impersonate
+  // exits with code 55 ("Failed sending HTTP POST request") when the
+  // body is sent via stdin + the pipe breaks before curl finishes reading.
+  // Using --data-binary @<file> is more reliable.
+  let tmpBodyFile: string | null = null;
   if (body != null) {
-    args.push("--data-binary", "@-");
+    tmpBodyFile = `/tmp/gemini-body-${Date.now()}.txt`;
+    try {
+      writeFileSync(tmpBodyFile, body);
+      args.push("--data-binary", `@${tmpBodyFile}`);
+    } catch {
+      tmpBodyFile = null;
+      // Fallback to stdin if the temp file write fails.
+      args.push("--data-binary", "@-");
+    }
   }
 
   return new Promise<BidiResponse>((resolve, reject) => {
@@ -536,6 +549,9 @@ async function sendViaCurlImpersonate(
     child.on("close", (code) => {
       if (code !== 0) {
         reject(new Error(`curl-impersonate exited ${code}: ${stderr.slice(0, 400)}`));
+        // Cleanup temp files on error too.
+        try { unlinkSync(tmpHeaderFile); } catch { /* ignore */ }
+        if (tmpBodyFile) { try { unlinkSync(tmpBodyFile); } catch { /* ignore */ }
         return;
       }
       // Read body from stdout, headers from the temp file
@@ -545,6 +561,7 @@ async function sendViaCurlImpersonate(
         headerBlock = readFileSync(tmpHeaderFile, "utf-8");
       } catch { /* headers not written */ }
       try { unlinkSync(tmpHeaderFile); } catch { /* ignore */ }
+      if (tmpBodyFile) { try { unlinkSync(tmpBodyFile); } catch { /* ignore */ } }
 
       // Parse status (HTTP/2 format: "HTTP/2 200" or HTTP/1.1 format)
       const statusMatch = headerBlock.match(/^HTTP\/[\d.]+\s+(\d+)/m);
@@ -566,8 +583,17 @@ async function sendViaCurlImpersonate(
       }
       resolve({ status, body: bodyText, headers: parsedHeaders, setCookie });
     });
-    if (body != null) child.stdin.end(body);
-    else child.stdin.end();
+    // Send the body via stdin. Wrap in a try/catch + add an error handler
+    // to avoid EPIPE crashes (curl: (55) Failed sending HTTP POST request)
+    // — this happens if curl exits before we finish writing stdin.
+    if (body != null) {
+      child.stdin.on("error", () => { /* EPIPE — curl already exited */ });
+      try {
+        child.stdin.end(body);
+      } catch { /* EPIPE — ignore */ }
+    } else {
+      child.stdin.end();
+    }
   });
 }
 
@@ -946,7 +972,7 @@ async function handleSend(body: GeminiRequestBody) {
 
   try {
     const res = await sendBidi("POST", url, headers, payload, 30_000);
-    console.log(`[gemini] send response: status=${res.status}, body length=${res.body.length}, body (first 200): ${res.body.slice(0, 200)}`);
+    console.log(`[gemini] send response: status=${res.status}, body length=${res.body.length}, body (first 800): ${res.body.slice(0, 800)}`);
     if (res.status >= 400) {
       return NextResponse.json(
         {
