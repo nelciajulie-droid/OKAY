@@ -130,6 +130,21 @@ function extractSapisid(cookies: string): string | null {
   return match ? match[2] : null;
 }
 
+/** Extract the bidi SID from the S=alkali-makersuite=<sid> cookie in the
+ *  Google cookies string. Google sets this cookie on clients6.google.com
+ *  during a bidi session. The <sid> (after the "alkali-makersuite="
+ *  prefix) is the SID needed by the receive/send URL query params.
+ *  This is a fallback for when the vault Worker doesn't have the bidiSid
+ *  field (the deployed Worker predates the bidiSid feature). */
+function extractBidiSidFromCookies(cookies: string): string | null {
+  for (const pair of cookies.split("; ")) {
+    if (pair.startsWith("S=alkali-makersuite=")) {
+      return pair.slice("S=alkali-makersuite=".length);
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Web Channel helpers
 // ---------------------------------------------------------------------------
@@ -935,10 +950,13 @@ async function handleStart(_body: GeminiRequestBody) {
     const bodyGsessionid = extractGsessionId(res.setCookie, res.body);
     const gsessionid = headerGsid || bodyGsessionid || "";
     // SID priority: 1) vault bidiSid (from Chrome extension S=alkali-makersuite
-    // cookie), 2) cookie S= from the start response Set-Cookie, 3) body
-    // [[0,["c","..."]]] (fallback — may not be the real SID).
-    const sid = vaultBidiSid || cookieSid || extractSid(res.body) || "";
-    console.log(`[gemini] start: headerGsid=${headerGsid ? headerGsid.slice(0, 30) + "..." : "no"}, vaultBidiSid=${vaultBidiSid ? vaultBidiSid.slice(0, 30) + "..." : "no"}, cookieSid=${cookieSid ? cookieSid.slice(0, 30) + "..." : "no"}, bodyGsessionid=${bodyGsessionid ? bodyGsessionid.slice(0, 30) + "..." : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
+    // cookie, stored as a separate KV field), 2) bidiSid extracted from the
+    // cookies string (fallback for when the vault Worker hasn't been
+    // redeployed with the bidiSid field), 3) cookie S= from the start
+    // response Set-Cookie, 4) body [[0,["c","..."]]] (last resort).
+    const cookieBidiSid = extractBidiSidFromCookies(cookies);
+    const sid = vaultBidiSid || cookieBidiSid || cookieSid || extractSid(res.body) || "";
+    console.log(`[gemini] start: headerGsid=${headerGsid ? headerGsid.slice(0, 30) + "..." : "no"}, vaultBidiSid=${vaultBidiSid ? vaultBidiSid.slice(0, 30) + "..." : "no"}, cookieBidiSid=${cookieBidiSid ? cookieBidiSid.slice(0, 30) + "..." : "no"}, cookieSid=${cookieSid ? cookieSid.slice(0, 30) + "..." : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
     console.log(`[gemini] start: raw body (first 1000 chars):\n${res.body.slice(0, 1000)}`);
     console.log(`[gemini] start: set-cookie:`, JSON.stringify(res.setCookie).slice(0, 500));
     console.log(`[gemini] start: ALL response headers:`, JSON.stringify(res.headers).slice(0, 1000));
