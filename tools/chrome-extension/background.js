@@ -215,16 +215,23 @@ async function getGoogleCookieData() {
   // `domain: ".google.com"` returns cookies scoped to the apex + all
   // subdomains. The bare `google.com` is included as a redundancy —
   // chrome.cookies de-dupes by (name, domain, path).
-  // We ALSO query `clients6.google.com` + `webchannel-alkalimakersuite-pa.clients6.google.com`
-  // to capture the `S=alkali-makersuite=<sid>` cookie that Google sets
-  // during a bidi session — this is the SID needed by the receive long-poll.
-  const all = await Promise.all([
-    chrome.cookies.getAll({ domain: ".google.com" }),
-    chrome.cookies.getAll({ domain: "google.com" }),
-    chrome.cookies.getAll({ domain: ".clients6.google.com" }),
-    chrome.cookies.getAll({ domain: "clients6.google.com" }),
-    chrome.cookies.getAll({ domain: "webchannel-alkalimakersuite-pa.clients6.google.com" }),
-  ]);
+  // We ALSO query `clients6.google.com` to capture the
+  // `S=alkali-makersuite=<sid>` cookie that Google sets during a bidi
+  // session — this is the SID needed by the receive long-poll.
+  // NOTE: chrome.cookies.getAll with a specific subdomain can throw if
+  // the user hasn't visited that domain — we wrap each in its own try/catch
+  // so one failure doesn't block the others.
+  const queries = [
+    { domain: ".google.com" },
+    { domain: "google.com" },
+    { domain: ".clients6.google.com" },
+    { domain: "clients6.google.com" },
+  ];
+  const all = await Promise.all(
+    queries.map((q) =>
+      chrome.cookies.getAll(q).catch(() => [])
+    ),
+  );
   const seen = new Set();
   const cookies = [];
   for (const list of all) {
