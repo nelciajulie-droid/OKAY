@@ -321,79 +321,60 @@ function buildBidiUrl(opts: {
   apiKey: string;
   receive?: boolean;
 }): string {
-  const u = new URL(GEMINI_BIDI_PATH, GEMINI_BIDI_BASE);
-  u.searchParams.set("VER", WC_VER);
-  u.searchParams.set("RID", opts.rid);
-  u.searchParams.set("CVER", WC_CVER);
-  u.searchParams.set("zx", randomZx());
-  u.searchParams.set("t", "1");
-  // SID: Google's SID cookie value is `alkali-makersuite=<value>` — the
-  // `=` in the value is LITERAL (not a separator). URL.searchParams.set
-  // encodes `=` as %3D, which causes a 400. Fix: append the SID directly
-  // to the search string without encoding. We set it AFTER all other
-  // params so the order is preserved.
-  if (opts.gsessionid) {
-    u.searchParams.set("X-HTTP-Session-Id", opts.gsessionid);
-  }
+  // The SID is now extracted WITHOUT the "alkali-makersuite=" prefix
+  // (see extractSidFromCookie), so it's a clean value like
+  // "l-7YCzqPuJwNOqcUe2XS4g" — no `=` in it, so URL.searchParams.set
+  // works correctly (no %3D encoding needed).
 
-  // The $httpHeaders param is a URL-encoded list of "Header: value\n"
-  // lines. Google's Web Channel JS encodes it this way; the server reads
-  // them as if they were real HTTP headers on the long-poll GET.
-  const headerLines = [
-    `Authorization: ${opts.sapisidHash}`,
-    `X-Goog-Api-Key: ${opts.apiKey}`,
-    `X-Goog-AuthUser: 0`,
-    `X-WebChannel-Content-Type: application/json+protobuf`,
-    `Content-Type: application/json+protobuf`,
-  ].join("\n");
-  u.searchParams.set("$httpHeaders", headerLines);
-
-  // For a receive (long-poll) request, Google's Web Channel uses a different
-  // URL format:
-  //   /v1/bidiGenerateContent?gsessionid=<gsessionid>&VER=8&RID=rpc&SID=<sid>&AID=0&CI=0&TYPE=xmlhttp&zx=<zx>&t=1
-  // Key differences from the POST (start/send) URL:
-  //   - gsessionid is a query param (not X-HTTP-Session-Id)
-  //   - RID=rpc (not the numeric rid)
-  //   - TYPE=xmlhttp (not 'xml')
-  //   - AID=0 and CI=0 params
-  //   - No $httpHeaders param (headers are sent as real HTTP headers)
   if (opts.receive) {
-    // Clear the $httpHeaders param — for GET long-poll, headers go as real HTTP headers
-    u.searchParams.delete("$httpHeaders");
-    u.searchParams.delete("X-HTTP-Session-Id");
-    // Remove CVER for receive (Google's real URL doesn't have it on GET)
-    u.searchParams.delete("CVER");
-    // Set gsessionid as a query param (not as X-HTTP-Session-Id)
-    if (opts.gsessionid) {
-      u.searchParams.set("gsessionid", opts.gsessionid);
-    }
-    // RID=rpc for the long-poll (not the original numeric rid)
+    // GET long-poll receive URL — matches the real AI Studio format:
+    //   /v1/bidiGenerateContent?gsessionid=<gsid>&VER=8&RID=rpc&SID=<sid>&AID=0&CI=0&TYPE=xmlhttp&zx=<zx>&t=1
+    // Key: gsessionid is a query param (NOT X-HTTP-Session-Id), RID=rpc,
+    // no CVER, no $httpHeaders (headers go as real HTTP headers on GET).
+    const u = new URL(GEMINI_BIDI_PATH, GEMINI_BIDI_BASE);
+    if (opts.gsessionid) u.searchParams.set("gsessionid", opts.gsessionid);
+    u.searchParams.set("VER", WC_VER);
     u.searchParams.set("RID", "rpc");
-    // Required Web Channel params
+    if (opts.sid) u.searchParams.set("SID", opts.sid);
     u.searchParams.set("AID", "0");
     u.searchParams.set("CI", "0");
     u.searchParams.set("TYPE", "xmlhttp");
-    // SID: Google's SID cookie is `S=alkali-makersuite=<value>` — the
-    // value we extracted is `alkali-makersuite=<value>`. The `=` in the
-    // value is LITERAL (not a separator) — Google expects it unencoded
-    // in the SID query param. URL.searchParams.set encodes `=` as %3D,
-    // which causes a 400. Fix: append the SID directly to the search
-    // string without encoding (after the other params are set).
-    if (opts.sid) {
-      // Remove the encoded SID that URL.searchParams.set added, then
-      // append the raw SID value.
-      u.searchParams.delete("SID");
-      const sep = u.searchParams.toString().length > 0 ? "&" : "?";
-      // Build the search string with the raw SID value (unencoded =).
-      u.search += `${sep}SID=${opts.sid}`;
-    }
-  } else {
-    // For start/send (POST): also append the SID unencoded at the end.
-    if (opts.sid) {
-      const sep = u.searchParams.toString().length > 0 ? "&" : "?";
-      u.search += `${sep}SID=${opts.sid}`;
-    }
+    u.searchParams.set("zx", randomZx());
+    u.searchParams.set("t", "1");
+    return u.toString();
   }
+
+  // POST start/send URL — matches the real AI Studio format:
+  //   start: /v1/bidiGenerateContent?VER=8&RID=<n>&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=...&zx=<zx>&t=1
+  //   send:  /v1/bidiGenerateContent?VER=8&gsessionid=<gsid>&SID=<sid>&RID=<n>&AID=0&zx=<zx>&t=1
+  // The start has $httpHeaders + X-HTTP-Session-Id=gsessionid (placeholder).
+  // The send has gsessionid + SID as query params + AID.
+  const isStart = !opts.gsessionid; // start has no gsessionid yet
+  const u = new URL(GEMINI_BIDI_PATH, GEMINI_BIDI_BASE);
+  u.searchParams.set("VER", WC_VER);
+  if (isStart) {
+    // Start: RID=<numeric>, CVER=22, X-HTTP-Session-Id=gsessionid (placeholder),
+    // $httpHeaders with auth + api key.
+    u.searchParams.set("RID", opts.rid);
+    u.searchParams.set("CVER", WC_CVER);
+    u.searchParams.set("X-HTTP-Session-Id", "gsessionid");
+    // The $httpHeaders param is a URL-encoded list of "Header: value\n" lines.
+    const headerLines = [
+      `Authorization: ${opts.sapisidHash}`,
+      `X-Goog-Api-Key: ${opts.apiKey}`,
+      `X-Goog-AuthUser: 0`,
+      `X-WebChannel-Content-Type: application/json+protobuf`,
+    ].join("\r\n");
+    u.searchParams.set("$httpHeaders", headerLines);
+  } else {
+    // Send: gsessionid + SID + RID=<numeric> + AID=0 as query params.
+    u.searchParams.set("gsessionid", opts.gsessionid ?? "");
+    if (opts.sid) u.searchParams.set("SID", opts.sid);
+    u.searchParams.set("RID", opts.rid);
+    u.searchParams.set("AID", "0");
+  }
+  u.searchParams.set("zx", randomZx());
+  u.searchParams.set("t", "1");
   return u.toString();
 }
 
@@ -638,13 +619,28 @@ function extractGsessionId(setCookie: string[], body: string): string | null {
 
 /** Extract the SID from the Set-Cookie header (the `S=...` cookie).
  *  Google's Web Channel returns the SID in `Set-Cookie: S=...; path=/`.
- *  This is DIFFERENT from the gsessionid (which is in the body's
- *  `[[0,["c","<gsessionid>"]]]` — the "c" = channel session id). */
+ *  The cookie value is `alkali-makersuite=<sid_value>` — the SID in the
+ *  bidi URL should be just the `<sid_value>` (without the
+ *  `alkali-makersuite=` prefix). Verified by comparing with the real
+ *  AI Studio web client network capture (Task 71):
+ *    Cookie: S=alkali-makersuite=l-7YCzqPuJwNOqcUe2XS4g
+ *    URL SID param: SID=l-7YCzqPuJwNOqcUe2XS4g (no prefix)
+ */
 function extractSidFromCookie(setCookie: string[]): string | null {
   for (const c of setCookie) {
     // Match "S=value" (the cookie name is literally "S")
     const m = c.match(/^S=([^;]+)/i);
-    if (m) return m[1];
+    if (m) {
+      const cookieValue = m[1];
+      // The cookie value is "alkali-makersuite=<sid>" — strip the prefix
+      // to get the raw SID that goes in the URL.
+      if (cookieValue.startsWith("alkali-makersuite=")) {
+        return cookieValue.slice("alkali-makersuite=".length);
+      }
+      // Fallback: if the value doesn't have the expected prefix,
+      // return it as-is (some Google deployments may differ).
+      return cookieValue;
+    }
   }
   return null;
 }
@@ -861,25 +857,24 @@ async function handleStart(_body: GeminiRequestBody) {
         { status: 502 },
       );
     }
-    // gsessionid: Google returns it in the body's `[[0,["c","<value>"]]`,
-    // NOT in the x-http-session-id response header (that's empty on Vercel).
-    // SID: Google returns it in the `Set-Cookie: S=<value>` header — this
-    // is DIFFERENT from the gsessionid. The receive long-poll needs BOTH
-    // the gsessionid (as a query param) AND the SID (as a query param).
+    // gsessionid: Google returns it in the `x-http-session-id` RESPONSE HEADER
+    // (verified from the real AI Studio capture — Task 71):
+    //   x-http-session-id: eZkQzqA0j8eylLXWfYFDfLNpUsqOzKtMaL7SofnsX9g
+    // SID: Google returns it in the `Set-Cookie: S=alkali-makersuite=<sid>`
+    // header — the SID in the URL should be just `<sid>` (without the
+    // `alkali-makersuite=` prefix). The receive + send both need the
+    // gsessionid + the clean SID.
     const headerGsid = (res.headers["x-http-session-id"] as string) ?? "";
-    // Extract the SID from the Set-Cookie S=... header (the REAL SID).
+    // Extract the SID from the Set-Cookie S=... header (stripped of the
+    // "alkali-makersuite=" prefix).
     const cookieSid = extractSidFromCookie(res.setCookie);
-    // Extract the gsessionid from the body's `[[0,["c","<value>"]]` (or
-    // fall back to the header / a body regex).
+    // Fallback: extract gsessionid from the body's `[[0,["c","<value>"]]`
+    // (in case the header is missing — e.g. on Vercel where headers can
+    // be stripped).
     const bodyGsessionid = extractGsessionId(res.setCookie, res.body);
-    const sid = cookieSid ?? extractSid(res.body) ?? headerGsid ?? "";
-    const gsessionid =
-      bodyGsessionid ||
-      headerGsid ||
-      (res.body.match(/gsessionid=([A-Za-z0-9_\-]+)/)?.[1]) ||
-      sid || // last-resort fallback (same value — Google sometimes uses them interchangeably)
-      randomUuid();
-    console.log(`[gemini] start: headerGsid=${headerGsid ? "yes" : "no"}, cookieSid=${cookieSid ? cookieSid.slice(0, 30) + "..." : "no"}, bodyGsessionid=${bodyGsessionid ? bodyGsessionid.slice(0, 30) + "..." : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
+    const gsessionid = headerGsid || bodyGsessionid || "";
+    const sid = cookieSid ?? extractSid(res.body) ?? "";
+    console.log(`[gemini] start: headerGsid=${headerGsid ? headerGsid.slice(0, 30) + "..." : "no"}, cookieSid=${cookieSid ? cookieSid.slice(0, 30) + "..." : "no"}, bodyGsessionid=${bodyGsessionid ? bodyGsessionid.slice(0, 30) + "..." : "no"}, sid=${sid.slice(0, 30)}..., gsessionid=${gsessionid.slice(0, 30)}...`);
     console.log(`[gemini] start: raw body (first 1000 chars):\n${res.body.slice(0, 1000)}`);
     console.log(`[gemini] start: set-cookie:`, JSON.stringify(res.setCookie).slice(0, 500));
     // Surface the parsed setup response too — it may carry the first
