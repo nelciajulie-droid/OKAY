@@ -238,7 +238,7 @@ wss.on("connection", (ws, req) => {
       userText,
     ], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
+      env: { PYTHONUNBUFFERED: "1",
         ...process.env,
         // NVIDIA_API_KEY must be set in the environment.
       },
@@ -374,6 +374,8 @@ wss.on("connection", (ws, req) => {
       const msg = JSON.parse(data.toString("utf8"));
       if (msg && msg.type === "speak" && typeof msg.text === "string") {
         speak(msg.text);
+      } else if (msg && msg.type === "ai" && typeof msg.text === "string") {
+        startAiPipeline(msg.text);
       } else {
         // Unknown JSON — ignore silently.
       }
