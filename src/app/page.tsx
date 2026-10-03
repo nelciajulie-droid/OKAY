@@ -2495,12 +2495,24 @@ function RealtimeChat() {
           break;
         }
         case "stt_final": {
-          // Final transcription after Vosk detects end-of-speech.
-          // The server has already triggered TTS for this text; we
-          // just log it as a You: line (don't use upsertUserLine
-          // because the partial already created the line + we want
-          // a clean final "You: <text>" line for the record).
           if (msg.text) log(`You: ${msg.text}`);
+          break;
+        }
+        case "ai_start": {
+          // NVIDIA streaming started — create a new AI: line.
+          log("[vosk] AI pipeline starting…");
+          break;
+        }
+        case "ai_text": {
+          // Streaming AI text — append to the last AI: line (same
+          // pattern as appendAiDelta for Inworld/Gemini).
+          appendAiDelta(msg.text || "");
+          break;
+        }
+        case "ai_end": {
+          // NVIDIA streaming finished. Any remaining segments are
+          // still being TTS'd by the server pipeline.
+          if (msg.error) log(`[vosk] AI error: ${msg.error}`);
           break;
         }
         case "tts_start": {

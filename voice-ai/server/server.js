@@ -140,7 +140,6 @@ wss.on("connection", (ws, req) => {
     ttsProcess = child;
 
     child.stdout.on("data", (chunk) => {
-      // Forward MP3 bytes straight to the client as a binary frame.
       sendBinary(chunk);
     });
     child.on("error", (err) => {
@@ -163,19 +162,172 @@ wss.on("connection", (ws, req) => {
     });
   };
 
+  // --- NVIDIA Nemotron streaming pipeline --------------------------------
+  // When Vosk produces a final transcript, we:
+  // 1. Stream the transcript to NVIDIA Nemotron (Python subprocess).
+  // 2. Accumulate the text chunks until we detect a sentence boundary.
+  // 3. As soon as a segment is ready → spawn Edge TTS for that segment.
+  // 4. Continue accumulating → next segment → next TTS → pipeline.
+  // This gives near-zero latency: the first sentence starts speaking
+  // while NVIDIA is still generating the rest.
+
+  let aiProcess = null;     // current NVIDIA streaming process
+  let aiTextBuffer = "";   // accumulated text from NVIDIA
+  let aiCancelled = false;  // set true on barge-in / disconnect
+  let aiSegmentQueue = [];  // pending segments to TTS
+  let aiTtsRunning = false;  // is a TTS for a segment currently running?
+
+  /** Kill the AI streaming process + cancel pending segments. */
+  const killAi = () => {
+    aiCancelled = true;
+    if (aiProcess) {
+      try { aiProcess.kill("SIGKILL"); } catch { /* ignore */ }
+      aiProcess = null;
+    }
+    aiTextBuffer = "";
+    aiSegmentQueue = [];
+    // Also kill any running segment TTS.
+    killTts();
+  };
+
+  /** Process the next segment in the queue. Called after each TTS ends. */
+  const processNextSegment = () => {
+    if (closed || aiCancelled) return;
+    if (aiSegmentQueue.length === 0) {
+      aiTtsRunning = false;
+      return;
+    }
+    aiTtsRunning = true;
+    const segment = aiSegmentQueue.shift();
+    speak(segment);
+    // After speak() starts, the TTS process runs. When it exits
+    // (tts_end), we need to process the next segment. We hook into
+    // the child.on("exit") callback — but since speak() sets ttsProcess,
+    // we can poll for completion. A simpler approach: use a setTimeout
+    // loop to check if ttsProcess became null.
+    const checkDone = () => {
+      if (closed || aiCancelled) return;
+      if (!ttsProcess) {
+        // TTS for this segment finished — process next.
+        processNextSegment();
+      } else {
+        setTimeout(checkDone, 50);
+      }
+    };
+    setTimeout(checkDone, 100);
+  };
+
+  /** Start the NVIDIA Nemotron streaming pipeline for the user's text.
+   *  Spawns a Python subprocess that streams tokens via stdout. We
+   *  accumulate them + detect sentence boundaries + queue TTS. */
+  const startAiPipeline = (userText) => {
+    if (!userText || typeof userText !== "string") return;
+    // Cancel any previous AI pipeline.
+    killAi();
+    aiCancelled = false;
+    aiTextBuffer = "";
+    aiSegmentQueue = [];
+    aiTtsRunning = false;
+
+    console.log(`[voice-ai] AI pipeline starting for: ${userText.slice(0, 80)}`);
+    sendJson({ type: "ai_start", text: userText });
+
+    // Spawn the Python NVIDIA streaming script.
+    const child = spawn(PYTHON_BIN, [
+      path.join(__dirname, "ai_stream.py"),
+      userText,
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        // NVIDIA_API_KEY must be set in the environment.
+      },
+    });
+    aiProcess = child;
+
+    let textBuffer = "";
+
+    child.stdout.on("data", (chunk) => {
+      if (closed || aiCancelled) return;
+      const text = chunk.toString("utf8");
+      textBuffer += text;
+
+      // Send each token/chunk to the client as "ai_text" for display.
+      sendJson({ type: "ai_text", text });
+
+      // Detect sentence boundaries: . ! ? ; \n or text > 200 chars.
+      // Split the buffer at the last boundary + keep the remainder.
+      const boundary = Math.max(
+        textBuffer.lastIndexOf(". "),
+        textBuffer.lastIndexOf("! "),
+        textBuffer.lastIndexOf("? "),
+        textBuffer.lastIndexOf(".\n"),
+        textBuffer.lastIndexOf("!\n"),
+        textBuffer.lastIndexOf("?\n"),
+        textBuffer.lastIndexOf("; "),
+        textBuffer.lastIndexOf("\n"),
+      );
+
+      if (boundary >= 0 && boundary < textBuffer.length - 1) {
+        const segment = textBuffer.slice(0, boundary + 1).trim();
+        const remainder = textBuffer.slice(boundary + 1);
+        textBuffer = remainder;
+
+        if (segment.length > 0) {
+          console.log(`[voice-ai] AI segment ready: ${segment.slice(0, 60)}`);
+          // Queue this segment for TTS.
+          aiSegmentQueue.push(segment);
+          if (!aiTtsRunning) {
+            processNextSegment();
+          }
+        }
+      } else if (textBuffer.length > 200) {
+        // Force a segment if text is too long (no boundary found).
+        const segment = textBuffer.trim();
+        textBuffer = "";
+        if (segment.length > 0) {
+          aiSegmentQueue.push(segment);
+          if (!aiTtsRunning) {
+            processNextSegment();
+          }
+        }
+      }
+    });
+
+    child.stderr.on("data", (chunk) => {
+      console.error("[voice-ai] AI stderr:", chunk.toString("utf8").slice(0, 200));
+    });
+
+    child.on("error", (err) => {
+      console.error("[voice-ai] AI spawn error:", err.message);
+      aiProcess = null;
+      sendJson({ type: "ai_end", error: err.message });
+    });
+
+    child.on("exit", (code) => {
+      aiProcess = null;
+      // Flush any remaining text as a final segment.
+      if (!closed && !aiCancelled && textBuffer.trim().length > 0) {
+        const segment = textBuffer.trim();
+        textBuffer = "";
+        aiSegmentQueue.push(segment);
+        if (!aiTtsRunning) {
+          processNextSegment();
+        }
+      }
+      sendJson({ type: "ai_end", code: code ?? 0 });
+      console.log(`[voice-ai] AI pipeline ended (code ${code ?? 0})`);
+    });
+  };
+
   // --- Messages ---------------------------------------------------------
   ws.on("message", (data, isBinary) => {
     if (closed) return;
 
     if (isBinary) {
-      // --- Barge-in: any new mic audio while TTS is playing kills TTS.
-      // This is the simplest, most reliable barge-in strategy —
-      // even silence will interrupt, but the user's mic + echo-
-      // cancellation make false triggers rare in practice. A more
-      // sophisticated version would gate on VAD energy, but for v1
-      // any-audio-kills-TTS gives the user a satisfying interrupt.
-      if (ttsPlaying) {
-        killTts();
+      // --- Barge-in: any new mic audio while TTS/AI is playing kills both.
+      if (ttsPlaying || aiProcess) {
+        killAi();
       }
 
       // --- Feed PCM16 to Vosk. `data` is a Buffer of Int16 LE samples.
@@ -195,9 +347,8 @@ wss.on("connection", (ws, req) => {
           if (text) {
             console.log(`[voice-ai] STT final: ${text}`);
             sendJson({ type: "stt_final", text });
-            // v1 pipeline: speak the same text back (echo / TTS test).
-            // Replace this with an LLM call for a real assistant.
-            speak(text);
+            // Start the NVIDIA streaming AI pipeline (instead of echo TTS).
+            startAiPipeline(text);
           }
         } else {
           // `partialResult()` is also a METHOD — returns a parsed
@@ -235,7 +386,7 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     closed = true;
     console.log("[voice-ai] client disconnected");
-    killTts();
+    killAi();
     try { recognizer.free(); } catch { /* ignore */ }
   });
   ws.on("error", (err) => {
