@@ -67,13 +67,22 @@ export async function POST(req: Request) {
       }
     }
 
-    // Dynamic import — the SDK is ESM-only (`"type": "module"`). Using a
-    // top-level import would force Next.js to bundle it for the route
-    // segment, which is fine, but dynamic import matches the pattern used
-    // elsewhere in this project for vendor SDKs (Qwen) + lets the SDK
-    // read its config file at first call (lazy init).
-    const ZAI = (await import("z-ai-web-dev-sdk")).default;
-    const zai = await ZAI.create();
+    // Dynamic import — the SDK is ESM-only. We use `new ZAI(config)` with
+    // env vars so it works on Vercel (where /etc/.z-ai-config doesn't exist).
+    // Fallback: ZAI.create() reads the config file (works locally on the sandbox).
+    const ZAIModule = await import("z-ai-web-dev-sdk");
+    const ZAI = ZAIModule.default;
+
+    let zai;
+    // Try env-var config first (works on Vercel).
+    const envConfig = process.env.ZAI_CONFIG?.trim();
+    if (envConfig) {
+      // ZAI_CONFIG is a JSON string with { baseUrl, apiKey, chatId, userId, token }
+      zai = new ZAI(JSON.parse(envConfig));
+    } else {
+      // Fallback: config file (works on the sandbox with /etc/.z-ai-config).
+      zai = await ZAI.create();
+    }
 
     const messages: ChatMessage[] = [
       { role: "system", content: SYSTEM_PROMPT },
