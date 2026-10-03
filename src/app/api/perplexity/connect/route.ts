@@ -429,10 +429,35 @@ export async function POST(req: Request) {
     );
   }
 
-  // 3. Try curl-impersonate (with proxies if configured), then fall back to
-  //    the pure-JS proxy path. curl-impersonate has the Chrome TLS fingerprint
-  //    built-in, so it can pass Cloudflare's TLS check. If proxies are
-  //    configured, we try curl-impersonate through each proxy first.
+  // 3. Try in order: relay → curl-impersonate direct → curl-impersonate + proxy → pure-JS proxy → extension relay
+  const relayUrl = (process.env.PERPLEXITY_RELAY_URL ?? "").trim();
+
+  // 3a. Try the relay proxy first (if configured) — this is a Cloudflare
+  //     Tunnel on the user's machine that forwards to perplexity.ai from
+  //     the user's real IP. No Cloudflare block, no rate limit.
+  if (relayUrl) {
+    console.log("[perplexity] trying relay proxy:", relayUrl);
+    try {
+      const relayRes = await fetch(`${relayUrl.replace(/\/+$/, "")}/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sdp, cookies, account }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (relayRes.ok) {
+        const relayData = (await relayRes.json()) as { ok?: boolean; sdp?: string; error?: string };
+        if (relayData.ok && relayData.sdp) {
+          console.log("[perplexity] success via relay proxy!");
+          return NextResponse.json({ sdp: relayData.sdp, type: "answer" });
+        }
+      }
+      console.warn("[perplexity] relay proxy failed:", relayRes.status);
+    } catch (err) {
+      console.warn("[perplexity] relay proxy error:", (err as Error).message);
+    }
+  }
+
+  // 3b. Try curl-impersonate (with proxies if configured).
   const proxyList = (process.env.PERPLEXITY_PROXY_LIST ?? "")
     .split(",")
     .map((p) => p.trim())
