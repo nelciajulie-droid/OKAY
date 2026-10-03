@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voice AI — Vosk + Edge TTS</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0a0a0a;
+        --panel: #18181b;
+        --border: #27272a;
+        --fg: #e4e4e7;
+        --muted: #71717a;
+        --accent: #f59e0b;
+        --green: #10b981;
+        --red: #ef4444;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 2rem 1rem;
+      }
+      h1 {
+        font-size: 1.25rem;
+        margin: 0 0 0.5rem;
+      }
+      p.subtitle {
+        margin: 0 0 2rem;
+        color: var(--muted);
+        font-size: 0.875rem;
+      }
+      .controls {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+        justify-content: center;
+        margin-bottom: 1.5rem;
+      }
+      button {
+        background: var(--panel);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        border-radius: 0.5rem;
+        padding: 0.5rem 1rem;
+        font-size: 0.875rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.15s, border-color 0.15s;
+      }
+      button:hover:not(:disabled) {
+        background: #27272a;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      button.connect {
+        background: var(--green);
+        color: #052e1b;
+        border-color: transparent;
+        font-weight: 600;
+      }
+      button.connect:hover:not(:disabled) {
+        background: #34d399;
+      }
+      button.disconnect {
+        background: var(--red);
+        color: #fff;
+        border-color: transparent;
+      }
+      button.muted {
+        border-color: #b91c1c;
+        color: #fca5a5;
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-size: 0.75rem;
+        padding: 0.25rem 0.6rem;
+        border-radius: 999px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        color: var(--muted);
+        margin-bottom: 1.5rem;
+      }
+      .status .dot {
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 999px;
+        background: var(--muted);
+      }
+      .status.live .dot {
+        background: var(--green);
+      }
+      .status.error .dot {
+        background: var(--red);
+      }
+      .status.connecting .dot {
+        background: var(--accent);
+        animation: pulse 1s infinite;
+      }
+      @keyframes pulse {
+        50% { opacity: 0.4; }
+      }
+      .log {
+        width: 100%;
+        max-width: 720px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 0.5rem;
+        padding: 1rem;
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 0.75rem;
+        line-height: 1.5;
+        color: var(--muted);
+        height: 360px;
+        overflow-y: auto;
+      }
+      .log .user {
+        color: #93c5fd;
+      }
+      .log .ai {
+        color: #fcd34d;
+      }
+      .log .system {
+        color: var(--muted);
+      }
+      .log .err {
+        color: #fca5a5;
+      }
+      .speak-form {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 1.5rem;
+        width: 100%;
+        max-width: 720px;
+      }
+      .speak-form input {
+        flex: 1;
+        background: var(--panel);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        border-radius: 0.5rem;
+        padding: 0.5rem 0.75rem;
+        font-size: 0.875rem;
+      }
+      .speak-form input:focus {
+        outline: none;
+        border-color: var(--accent);
+      }
+      .speak-form button {
+        background: var(--accent);
+        color: #1c1917;
+        border-color: transparent;
+        font-weight: 600;
+      }
+      footer {
+        margin-top: 2rem;
+        color: var(--muted);
+        font-size: 0.75rem;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Voice AI — Vosk + Edge TTS</h1>
+    <p class="subtitle">
+      Streaming STT (Vosk, local) + streaming TTS (Microsoft Edge) over WebSocket.
+      No Web Speech API. Barge-in: speak while the AI is talking to interrupt.
+    </p>
+
+    <div class="status" id="status">
+      <span class="dot"></span>
+      <span id="status-label">Idle</span>
+    </div>
+
+    <div class="controls">
+      <button class="connect" id="connect-btn">Connect</button>
+      <button class="disconnect" id="disconnect-btn" disabled>Disconnect</button>
+      <button id="mute-btn" disabled>Mute</button>
+    </div>
+
+    <div class="log" id="log" aria-label="Event log"></div>
+
+    <form class="speak-form" id="speak-form">
+      <input
+        id="speak-input"
+        type="text"
+        placeholder="Type text to speak (TTS test, no STT)"
+        autocomplete="off"
+      />
+      <button type="submit">Speak</button>
+    </form>
+
+    <footer>
+      Voice AI server on <code>ws://localhost:3005</code>. See README.md for setup.
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>

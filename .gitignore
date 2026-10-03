@@ -55,3 +55,6 @@ server.log
 
 # Tool output (read results, large file dumps)
 /tool-results/
+# Voice AI — Vosk model (~66MB, downloaded separately — see voice-ai/README.md)
+voice-ai/server/model/
+voice-ai/server/node_modules

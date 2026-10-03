@@ -1,0 +1,14 @@
+{
+  "name": "voice-ai",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "vosk": "^0.3.39"
+  }
+}

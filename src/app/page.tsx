@@ -163,7 +163,8 @@ type RealtimeProvider =
   | "gemini"
   | "inworld"
   | "qwen"
-  | "zai";
+  | "zai"
+  | "vosk";
 
 // The 9 ChatGPT Realtime voices (the consumer chatgpt.com session.update
 // event accepts any of these). Perplexity, Gemini, and Inworld have their
@@ -269,6 +270,25 @@ function RealtimeChat() {
   const zaiHistoryRef = useRef<
     Array<{ role: "user" | "assistant"; content: string }>
   >([]);
+  // `voskWsRef` is the WebSocket to the voice-ai server (port 3005)
+  // for the Vosk provider. The server does local Vosk STT + Microsoft
+  // Edge TTS — the browser sends raw PCM16 binary frames (16 kHz
+  // mono), receives JSON control messages (stt_partial, stt_final,
+  // tts_start, tts_end) AND MP3 audio chunks as binary frames. TTS
+  // playback is via a Blob + `new Audio(url)` (V1 — accumulate +
+  // play; Edge TTS generates fast enough for near-real-time).
+  // `voskTtsChunksRef` holds the MP3 ArrayBuffers for the current
+  // TTS response (reset on tts_start + on barge-in).
+  // `voskTtsActiveRef` is true between tts_start + tts_end (gates
+  // which binary frames we accumulate — stale frames after tts_end
+  // are dropped).
+  // `voskAudioElRef` holds the HTMLAudioElement currently playing
+  // the AI's TTS response (same pattern as ZAI — fresh per TTS,
+  // revoked on ended). `teardown` pauses + revokes + nulls it.
+  const voskWsRef = useRef<WebSocket | null>(null);
+  const voskTtsChunksRef = useRef<ArrayBuffer[]>([]);
+  const voskTtsActiveRef = useRef<boolean>(false);
+  const voskAudioElRef = useRef<HTMLAudioElement | null>(null);
   useEffect(() => {
     voiceRef.current = voice;
   }, [voice]);
@@ -381,6 +401,36 @@ function RealtimeChat() {
     zaiStartTurnRef.current = null;
     zaiMutedRef.current = false;
     zaiHistoryRef.current = [];
+    // --- Vosk WebSocket + TTS audio ---
+    // Close the WebSocket to the voice-ai server (port 3005) FIRST so
+    // the mic-flush loop stops sending into a closing socket. Then
+    // pause + revoke the audio element (stops mid-playback TTS) +
+    // drop the in-progress MP3 buffer so a reconnect starts fresh.
+    if (voskWsRef.current) {
+      try {
+        if (voskWsRef.current.readyState === WebSocket.OPEN ||
+            voskWsRef.current.readyState === WebSocket.CONNECTING) {
+          voskWsRef.current.close(1000, "client-teardown");
+        }
+      } catch { /* ignore */ }
+      voskWsRef.current.onmessage = null;
+      voskWsRef.current.onerror = null;
+      voskWsRef.current.onclose = null;
+      voskWsRef.current = null;
+    }
+    if (voskAudioElRef.current) {
+      try { voskAudioElRef.current.pause(); } catch { /* ignore */ }
+      try { voskAudioElRef.current.onended = null; } catch { /* ignore */ }
+      try { voskAudioElRef.current.onerror = null; } catch { /* ignore */ }
+      // Revoke the blob URL — the `src` is a string blob: URL.
+      const url = voskAudioElRef.current.src;
+      if (url && url.startsWith("blob:")) {
+        try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+      }
+      voskAudioElRef.current = null;
+    }
+    voskTtsChunksRef.current = [];
+    voskTtsActiveRef.current = false;
     // --- Shared mic ---
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -2263,10 +2313,300 @@ function RealtimeChat() {
     startTurn();
   }, [log, upsertUserLine]);
 
+  /** Connect via the Vosk + Edge TTS streaming pipeline (the 7th
+   *  realtime voice provider). NO Web Speech API — Vosk runs locally
+   *  in the voice-ai Node server (port 3005) + Microsoft Edge TTS
+   *  is generated server-side via the `edge-tts` Python package.
+   *
+   *  Flow:
+   *    1. Open a WebSocket to `wss://<page-host>/?XTransformPort=3005`
+   *       — the Caddy gateway forwards to the voice-ai server on
+   *       port 3005 (see `voice-ai/server/server.js`). We use the
+   *       same `wss://` scheme as Inworld (matches the page protocol
+   *       — no mixed-content block on HTTPS hosts). For local dev
+   *       (http://localhost:3000) we'd fall back to `ws://`, but
+   *       `wss://` works in both cases because the gateway handles
+   *       TLS termination.
+   *    2. Create an AudioContext at 16 kHz (Vosk's input rate) +
+   *       getUserMedia + ScriptProcessor (4096-sample buffer).
+   *    3. ScriptProcessor.onaudioprocess → Float32 → Int16 →
+   *       `ws.send(int16.buffer)` as a BINARY frame. The server feeds
+   *       these bytes directly to `vosk.Recognizer.acceptWaveform`.
+   *    4. ws.onmessage:
+   *       - Binary frame → MP3 audio chunk from Edge TTS →
+   *         accumulate in `voskTtsChunksRef` (only while
+   *         `voskTtsActiveRef` is true — stale frames after tts_end
+   *         are dropped).
+   *       - Text frame → JSON control message:
+   *         - `stt_partial`  → `upsertUserLine(text)` (the in-progress
+   *            transcription; replaces the last "You:" line per speech).
+   *         - `stt_final`    → `log("You: <text>")` (the final
+   *            transcription after silence is detected by Vosk).
+   *         - `tts_start`    → reset `voskTtsChunksRef` + pause any
+   *            currently-playing TTS audio (barge-in safety).
+   *         - `tts_end`      → build a Blob from `voskTtsChunksRef` →
+   *            `new Audio(url).play()` + log "AI audio complete".
+   *    5. Barge-in: handled server-side — any new mic audio while TTS
+   *       is playing kills the TTS Python child + emits `tts_end`.
+   *       The client just drops the in-progress buffer + the
+   *       `tts_end` builds an empty Blob (no playback).
+   *    6. Cleanup: `teardown` (see the Vosk block above) closes the
+   *       WebSocket + pauses + revokes + nulls the audio element.
+   *
+   *  Mute (toggleMute): falls through to the shared `localStreamRef`
+   *  path (toggles `track.enabled` on the mic tracks — the
+   *  ScriptProcessor keeps firing but its output is silent, so the
+   *  server's Vosk recognizer receives zero PCM + produces no
+   *  partials/finals). No Vosk-specific mute state is needed.
+   *
+   *  Audio format: Vosk expects Int16 LE PCM @ 16 kHz mono. Edge TTS
+   *  returns MP3 (audio/mpeg) — we play via a Blob URL + `<audio>`
+   *  element (NOT via the AudioContext, because the AudioContext
+   *  playback path is for PCM16, not MP3).
+   */
+  const connectVosk = useCallback(async () => {
+    // 1. Open the WebSocket. Same Caddy-gateway pattern as Inworld —
+    //    the browser connects to the page host with
+    //    `?XTransformPort=3005`, and Caddy forwards to localhost:3005
+    //    on the VPS. We use `wss://` (or `ws://` if the page is HTTP)
+    //    to match the page protocol — no mixed-content block.
+    const wsHost = window.location.host;
+    const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${wsProto}//${wsHost}/?XTransformPort=3005`;
+    log(`Opening Vosk WebSocket (XTransformPort=3005)…`);
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer"; // receive MP3 chunks as ArrayBuffer
+    voskWsRef.current = ws;
+
+    // Wait for open (or close/error within 10s).
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("Vosk WebSocket did not open within 10s."));
+      }, 10_000);
+      const onOpen = () => {
+        clearTimeout(timeout);
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(new Error("Vosk WebSocket error during open (is voice-ai/server running on port 3005?)."));
+      };
+      const onClose = (e: CloseEvent) => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(new Error(`Vosk WebSocket closed during open (code ${e.code}).`));
+      };
+      const cleanup = () => {
+        ws.removeEventListener("open", onOpen);
+        ws.removeEventListener("error", onError);
+        ws.removeEventListener("close", onClose);
+      };
+      ws.addEventListener("open", onOpen);
+      ws.addEventListener("error", onError);
+      ws.addEventListener("close", onClose);
+    });
+    log("Vosk WebSocket open.");
+
+    // 2. AudioContext at 16 kHz (Vosk's rate) + get the user's mic.
+    //    Some browsers ignore the requested sample rate; we resample
+    //    below by routing the mic through a ScriptProcessor at the ctx
+    //    rate (the captured Float32 is already at the ctx rate, so no
+    //    extra resampling needed — the ScriptProcessor reads at the
+    //    context rate + we convert to Int16 for the server).
+    const AudioCtor: typeof AudioContext =
+      window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    let audioCtx: AudioContext;
+    try {
+      audioCtx = new AudioCtor({ sampleRate: 16000 });
+    } catch {
+      audioCtx = new AudioCtor();
+    }
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => { /* ignore */ });
+    }
+    audioCtxRef.current = audioCtx;
+    log(`AudioContext @ ${audioCtx.sampleRate} Hz (requested 16000).`);
+
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    micStreamRef.current = micStream;
+    // Reuse the shared localStreamRef so the existing mute toggle works.
+    localStreamRef.current = micStream;
+
+    // 3. Wire mic → ScriptProcessor → PCM16 binary frames.
+    //    Same pattern as Gemini/Inworld: 4096-sample buffer at 16 kHz =
+    //    256ms per callback. We convert Float32 → Int16 + send as
+    //    binary over the WebSocket (NOT base64 — Vosk's
+    //    `acceptWaveform` takes raw bytes, so binary frames are
+    //    cheaper + simpler than JSON+base64).
+    const source = audioCtx.createMediaStreamSource(micStream);
+    const scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    scriptNodeRef.current = scriptNode;
+    scriptNode.onaudioprocess = (e) => {
+      const sock = voskWsRef.current;
+      if (!sock || sock.readyState !== WebSocket.OPEN) return;
+      const input = e.inputBuffer.getChannelData(0);
+      // Float32 → Int16 (same helper used by Gemini + Inworld).
+      const int16 = float32ToInt16(new Float32Array(input));
+      // Send the Int16 buffer as a binary frame.
+      try {
+        sock.send(int16.buffer);
+      } catch (err) {
+        console.warn("[vosk] send failed:", (err as Error).message);
+      }
+    };
+    source.connect(scriptNode);
+    // ScriptProcessor needs a destination to fire — connect to a muted
+    // gain so we don't echo the mic back out the speakers.
+    const mutedGain = audioCtx.createGain();
+    mutedGain.gain.value = 0;
+    scriptNode.connect(mutedGain);
+    mutedGain.connect(audioCtx.destination);
+
+    // 4. Handle incoming messages.
+    ws.onmessage = (e) => {
+      // Binary frame = MP3 audio chunk from Edge TTS.
+      if (e.data instanceof ArrayBuffer) {
+        // Only accumulate while a TTS response is in progress —
+        // stale chunks after tts_end are dropped.
+        if (voskTtsActiveRef.current) {
+          voskTtsChunksRef.current.push(e.data);
+        }
+        return;
+      }
+      // Text frame = JSON control message.
+      if (typeof e.data !== "string") return;
+      let msg: { type?: string; text?: string; code?: number; error?: string };
+      try {
+        msg = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      switch (msg.type) {
+        case "stt_partial": {
+          // In-progress transcription — UPDATE the same "You:" line
+          // via `upsertUserLine` (collapses all partials for one
+          // speech into ONE growing line — same pattern as Inworld +
+          // Gemini + Qwen).
+          if (msg.text) upsertUserLine(msg.text);
+          break;
+        }
+        case "stt_final": {
+          // Final transcription after Vosk detects end-of-speech.
+          // The server has already triggered TTS for this text; we
+          // just log it as a You: line (don't use upsertUserLine
+          // because the partial already created the line + we want
+          // a clean final "You: <text>" line for the record).
+          if (msg.text) log(`You: ${msg.text}`);
+          break;
+        }
+        case "tts_start": {
+          // Reset the MP3 buffer for the new TTS response + stop any
+          // currently-playing TTS audio (barge-in safety — should
+          // not happen because the server kills TTS before sending
+          // tts_start, but defensive).
+          voskTtsActiveRef.current = true;
+          voskTtsChunksRef.current = [];
+          if (voskAudioElRef.current) {
+            try { voskAudioElRef.current.pause(); } catch { /* ignore */ }
+            const url = voskAudioElRef.current.src;
+            if (url && url.startsWith("blob:")) {
+              try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+            }
+            voskAudioElRef.current.onended = null;
+            voskAudioElRef.current.onerror = null;
+            voskAudioElRef.current = null;
+          }
+          break;
+        }
+        case "tts_end": {
+          // Play the accumulated MP3 chunks. If barge-in fired
+          // (server killed TTS), the buffer may be empty — skip
+          // playback in that case.
+          voskTtsActiveRef.current = false;
+          const chunks = voskTtsChunksRef.current;
+          voskTtsChunksRef.current = [];
+          if (chunks.length === 0) {
+            log("AI audio complete (barge-in).");
+            break;
+          }
+          if (msg.code != null && msg.code !== 0) {
+            log(`AI audio failed (TTS exit ${msg.code}).`);
+            break;
+          }
+          try {
+            const blob = new Blob(chunks, { type: "audio/mpeg" });
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            voskAudioElRef.current = audio;
+            audio.onended = () => {
+              URL.revokeObjectURL(url);
+              if (voskAudioElRef.current === audio) voskAudioElRef.current = null;
+            };
+            audio.onerror = () => {
+              URL.revokeObjectURL(url);
+              if (voskAudioElRef.current === audio) voskAudioElRef.current = null;
+            };
+            // `.catch` handles the rare case where autoplay is blocked
+            // (shouldn't happen here — the Connect click counts as a
+            // user gesture — but be defensive).
+            audio.play().catch((playErr) => {
+              log(`Audio playback failed: ${(playErr as Error).message}.`);
+              URL.revokeObjectURL(url);
+              if (voskAudioElRef.current === audio) voskAudioElRef.current = null;
+            });
+            log("AI audio complete.");
+          } catch (err) {
+            log(`AI audio build error: ${(err as Error).message}.`);
+          }
+          break;
+        }
+        default:
+          // Unknown control message — ignore.
+          break;
+      }
+    };
+
+    ws.onerror = () => {
+      log("Vosk WebSocket error.");
+    };
+    ws.onclose = (e) => {
+      log(`Vosk WebSocket closed (code ${e.code}).`);
+      voskWsRef.current = null;
+      // If the socket closed on its own (not via teardown), reflect it
+      // in the UI so the user knows they need to reconnect.
+      if (status !== "idle" && providerRef.current === "vosk") {
+        setStatus("idle");
+        if (scriptNodeRef.current) {
+          try { scriptNodeRef.current.disconnect(); } catch { /* ignore */ }
+          scriptNodeRef.current = null;
+        }
+        if (micStreamRef.current) {
+          micStreamRef.current.getTracks().forEach((t) => t.stop());
+          micStreamRef.current = null;
+        }
+        if (localStreamRef.current) {
+          localStreamRef.current = null;
+        }
+        if (audioCtxRef.current) {
+          try { audioCtxRef.current.close(); } catch { /* ignore */ }
+          audioCtxRef.current = null;
+        }
+      }
+    };
+
+    setStatus("connected");
+    log("Connected. Speak when ready.");
+  }, [float32ToInt16, log, status, upsertUserLine]);
+
   /** Connect to the selected provider's realtime endpoint. Dispatches to
    * the WebRTC path (ChatGPT / Perplexity / Qwen), the Gemini bidi path,
-   * the Inworld WebSocket path, or the ZAI turn-based pipeline (Web Speech
-   * API STT + z-ai LLM + Edge TTS). */
+   * the Inworld WebSocket path, the ZAI turn-based pipeline (Web Speech
+   * API STT + z-ai LLM + Edge TTS), or the Vosk streaming pipeline
+   * (local Vosk STT + Microsoft Edge TTS over a WebSocket to port 3005). */
   const connect = useCallback(async () => {
     setError(null);
     setStatus("connecting");
@@ -2281,6 +2621,8 @@ function RealtimeChat() {
         await connectQwen();
       } else if (providerRef.current === "zai") {
         await connectZai();
+      } else if (providerRef.current === "vosk") {
+        await connectVosk();
       } else {
         await connectWebRtc();
       }
@@ -2291,13 +2633,17 @@ function RealtimeChat() {
       log(`Error: ${message}`);
       teardown();
     }
-  }, [connectGemini, connectInworld, connectQwen, connectWebRtc, connectZai, log, teardown]);
+  }, [connectGemini, connectInworld, connectQwen, connectVosk, connectWebRtc, connectZai, log, teardown]);
 
   /** Toggle the mic on/off (mutes the local audio track). Works for the
-   * WebRTC path (localStream), the Gemini/Inworld paths (micStream), the
-   * Qwen path (Aliyun RTC SDK owns the mic — uses `muteLocalMic`), AND
-   * the ZAI path (Web Speech API STT — abort the current recognition +
-   * set `zaiMutedRef`; restart the loop on unmute via `zaiStartTurnRef`). */
+   * WebRTC path (localStream), the Gemini/Inworld/Vosk paths (micStream),
+   * the Qwen path (Aliyun RTC SDK owns the mic — uses `muteLocalMic`),
+   * AND the ZAI path (Web Speech API STT — abort the current recognition
+   * + set `zaiMutedRef`; restart the loop on unmute via
+   * `zaiStartTurnRef`). For Vosk, muting just disables the shared
+   * MediaStream tracks — the ScriptProcessor keeps firing but its
+   * output is silent, so the server's Vosk recognizer receives zero PCM
+   * + produces no partials/finals. */
   const toggleMute = useCallback(() => {
     const next = !muted;
     // Qwen path — the Aliyun RTC SDK owns the mic stream.
@@ -2331,8 +2677,8 @@ function RealtimeChat() {
       log(next ? "Mic muted." : "Mic unmuted.");
       return;
     }
-    // ChatGPT / Perplexity / Gemini / Inworld path — toggle the shared
-    // MediaStream tracks' `enabled` property.
+    // ChatGPT / Perplexity / Gemini / Inworld / Vosk path — toggle the
+    // shared MediaStream tracks' `enabled` property.
     const stream = localStreamRef.current;
     if (!stream) return;
     stream.getAudioTracks().forEach((t) => (t.enabled = !next));
@@ -2341,9 +2687,10 @@ function RealtimeChat() {
   }, [muted, log]);
 
   /** Disconnect from the provider. For Gemini this fires a best-effort
-   * stop call to the backend; for Inworld the WebSocket close (handled
-   * inside `teardown`) IS the stop; for the WebRTC providers there's no
-   * explicit teardown call — closing the peer connection is enough. */
+   * stop call to the backend; for Inworld + Vosk the WebSocket close
+   * (handled inside `teardown`) IS the stop; for the WebRTC providers
+   * there's no explicit teardown call — closing the peer connection is
+   * enough. */
   const disconnect = useCallback(() => {
     // Best-effort stop call for Gemini (the server doesn't really need a
     // stop — we just stop long-polling — but it's polite).
@@ -2401,11 +2748,15 @@ function RealtimeChat() {
           Inworld uses a direct browser WebSocket to api.inworld.ai; ZAI
           is a fully self-contained turn-based pipeline (Web Speech API
           STT + z-ai LLM + Microsoft Edge TTS) — no external API keys
-          needed. ChatGPT needs a JWT in the vault; Perplexity + Gemini
-          need their session cookies there (refreshed by the Chrome
+          needed; Vosk is a real-time streaming pipeline (local Vosk
+          STT at 16 kHz + Microsoft Edge TTS) over a WebSocket to the
+          voice-ai mini-service on port 3005 — no external API keys,
+          no Web Speech API, with barge-in (speaking interrupts TTS).
+          ChatGPT needs a JWT in the vault; Perplexity + Gemini need
+          their session cookies there (refreshed by the Chrome
           extension); Inworld needs an `INWORLD_TOKEN` env var (or a
           token in the vault); Qwen needs a `QWEN_ACCESS_TOKEN` env var
-          (the chat.qwen.ai JWT); ZAI needs nothing.
+          (the chat.qwen.ai JWT); ZAI + Vosk need nothing.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -2460,6 +2811,13 @@ function RealtimeChat() {
               disabled={connected || status === "connecting"}
             >
               ZAI
+            </ProviderButton>
+            <ProviderButton
+              active={provider === "vosk"}
+              onClick={() => setProvider("vosk")}
+              disabled={connected || status === "connecting"}
+            >
+              Vosk
             </ProviderButton>
           </div>
 
