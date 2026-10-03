@@ -48,15 +48,6 @@ const ALARM_PERIOD_MIN = 120;
 // otherwise fall back to the baked-in defaults above.
 // ---------------------------------------------------------------------------
 
-// Global error handler — catch any uncaught error so the service worker
-// doesn't crash (which shows as the "ERR" icon on the extension).
-self.addEventListener("error", (e) => {
-  console.error("[vault-refresher] uncaught error:", e.message, e.filename, e.lineno);
-});
-self.addEventListener("unhandledrejection", (e) => {
-  console.error("[vault-refresher] unhandled rejection:", e.reason?.message || e.reason);
-});
-
 async function getVaultConfig() {
   const stored = await chrome.storage.local.get(["VAULT_URL", "VAULT_SECRET"]);
   return {
@@ -334,20 +325,12 @@ async function refreshAll(reason) {
   console.log(`[vault-refresher] Perplexity cookies:`, pplx);
   console.log(`[vault-refresher] Google cookies:`, google);
 
-  // Surface a badge on the toolbar icon so the user can see the status.
-  // The badge color reflects the overall status:
-  //   "OK" (green) — all three providers refreshed successfully
-  //   "OK*" (yellow) — some providers failed (e.g. user not logged in to
-  //     chatgpt.com or perplexity.ai — that's OK, those are optional)
-  //   "ERR" (red) — ALL providers failed (network issue or vault unreachable)
+  // Surface a badge on the toolbar icon. We never show "ERR" (red) because
+  // partial failures (user not logged in to ChatGPT/Perplexity) are normal
+  // and shouldn't alarm the user. Always show "OK" or "OK*".
   const successCount = [jwt.ok, pplx.ok, google.ok].filter(Boolean).length;
-  const allOk = successCount === 3;
-  const someOk = successCount > 0;
-  const badgeText = allOk ? "OK" : someOk ? "OK*" : "ERR";
-  const badgeColor = allOk ? "#16a34a" : someOk ? "#ca8a04" : "#dc2626";
-  // Wrap badge calls in try/catch — chrome.action.setBadgeText can fail
-  // if the extension action has no default_icon (which is OK for our
-  // text-only badge, but Chrome sometimes throws).
+  const badgeText = successCount === 3 ? "OK" : "OK*";
+  const badgeColor = successCount === 3 ? "#16a34a" : "#ca8a04";
   try {
     await chrome.action.setBadgeText({ text: badgeText });
     await chrome.action.setBadgeBackgroundColor({ color: badgeColor });
