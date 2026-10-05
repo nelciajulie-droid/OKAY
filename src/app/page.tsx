@@ -12,6 +12,7 @@ import {
   AudioLines,
   AudioWaveform,
   Loader2,
+  Download,
   Mic,
   MicOff,
   Phone,
@@ -153,10 +154,17 @@ function TracksSection({
 }
 
 // ---------------------------------------------------------------------------
-// Realtime AI section — ChatGPT / Perplexity / Gemini / Inworld / Qwen voice
+// Realtime AI section — ChatGPT / Perplexity / Gemini / Inworld / Qwen / ZAI voice
 // ---------------------------------------------------------------------------
 
-type RealtimeProvider = "chatgpt" | "perplexity" | "gemini" | "inworld" | "qwen";
+type RealtimeProvider =
+  | "chatgpt"
+  | "perplexity"
+  | "gemini"
+  | "inworld"
+  | "qwen"
+  | "zai"
+  | "vosk";
 
 // The 9 ChatGPT Realtime voices (the consumer chatgpt.com session.update
 // event accepts any of these). Perplexity, Gemini, and Inworld have their
@@ -207,6 +215,10 @@ function RealtimeChat() {
     gsessionid: string;
     sid: string;
     rid: string;
+    // The RID must be INCREMENTAL for each POST (start uses rid, send uses
+    // rid+1, rid+2, ...). The receive uses RID=rpc (fixed). Verified from
+    // the real AI Studio capture: start RID=3054, send RID=3055, etc.
+    nextRid: number;
   } | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -225,6 +237,58 @@ function RealtimeChat() {
   // `leaveChannel()`, + `destroy()` on this instance to release the mic
   // + the WebRTC resources.
   const qwenEngineRef = useRef<any>(null);
+  // `zaiRecognitionRef` holds the active `webkitSpeechRecognition` instance
+  // for the ZAI provider (turn-based STT). We use a loose `any` type because
+  // the Web Speech API is not in TS's `lib.dom.d.ts` by default + the
+  // vendor-prefixed `webkitSpeechRecognition` ctor is only reachable via
+  // a `window` cast. `teardown` calls `abort()` + `stop()` on this
+  // instance to release the mic + cancel any pending recognition.
+  // `zaiAudioElRef` holds the `HTMLAudioElement` currently playing the
+  // AI's TTS response (one per turn — a fresh `new Audio()` is created
+  // for each AI reply so we can revoke the blob URL on `ended`). On
+  // teardown we pause + null it to stop mid-playback audio.
+  // `zaiStartTurnRef` holds the `startTurn` closure (defined inside
+  // `connectZai`) so `toggleMute` can restart the recognition loop after
+  // the user unmutes — without it, `toggleMute` would need to be defined
+  // inside `connectZai` (which it can't be — it's a top-level callback).
+  // `zaiStoppingRef` is a boolean flag — set to true by `teardown` so
+  // the async `onend` / `onerror` handlers don't auto-restart the
+  // recognition loop after we've torn down. Reset to false at the start
+  // of `connectZai` so a reconnect works.
+  // `zaiMutedRef` mirrors the `muted` state for ZAI — when true, the
+  // `onend` handler should NOT auto-restart recognition (the user has
+  // muted the mic). Reset to false at the start of `connectZai`.
+  // `zaiHistoryRef` holds the last 10 conversation messages
+  // ({ role: "user" | "assistant", content: string }) — passed to
+  // `/api/zai/chat` as `history` for context. Capped at 10 to keep the
+  // LLM context window + the request body small.
+  const zaiRecognitionRef = useRef<any>(null);
+  const zaiAudioElRef = useRef<HTMLAudioElement | null>(null);
+  const zaiStartTurnRef = useRef<(() => void) | null>(null);
+  const zaiStoppingRef = useRef<boolean>(false);
+  const zaiMutedRef = useRef<boolean>(false);
+  const zaiHistoryRef = useRef<
+    Array<{ role: "user" | "assistant"; content: string }>
+  >([]);
+  // `voskWsRef` is the WebSocket to the voice-ai server (port 3005)
+  // for the Vosk provider. The server does local Vosk STT + Microsoft
+  // Edge TTS — the browser sends raw PCM16 binary frames (16 kHz
+  // mono), receives JSON control messages (stt_partial, stt_final,
+  // tts_start, tts_end) AND MP3 audio chunks as binary frames. TTS
+  // playback is via a Blob + `new Audio(url)` (V1 — accumulate +
+  // play; Edge TTS generates fast enough for near-real-time).
+  // `voskTtsChunksRef` holds the MP3 ArrayBuffers for the current
+  // TTS response (reset on tts_start + on barge-in).
+  // `voskTtsActiveRef` is true between tts_start + tts_end (gates
+  // which binary frames we accumulate — stale frames after tts_end
+  // are dropped).
+  // `voskAudioElRef` holds the HTMLAudioElement currently playing
+  // the AI's TTS response (same pattern as ZAI — fresh per TTS,
+  // revoked on ended). `teardown` pauses + revokes + nulls it.
+  const voskWsRef = useRef<WebSocket | null>(null);
+  const voskTtsChunksRef = useRef<ArrayBuffer[]>([]);
+  const voskTtsActiveRef = useRef<boolean>(false);
+  const voskAudioElRef = useRef<HTMLAudioElement | null>(null);
   useEffect(() => {
     voiceRef.current = voice;
   }, [voice]);
@@ -308,6 +372,65 @@ function RealtimeChat() {
       try { void eng.leaveChannel().catch(() => { /* ignore */ }); } catch { /* ignore */ }
       try { void eng.destroy().catch(() => { /* ignore */ }); } catch { /* ignore */ }
     }
+    // --- ZAI Web Speech API + TTS audio ---
+    // Set the stopping flag FIRST so the async `onend` / `onerror`
+    // handlers in `connectZai` don't auto-restart the recognition loop
+    // after we abort the current session. Then abort the recognition
+    // (cancels any in-flight STT + releases the mic) + pause + null the
+    // audio element (stops mid-playback TTS). The blob URL for the
+    // current TTS clip is leaked on teardown (its `onended` won't fire
+    // because we paused it) — this is a tiny, one-shot leak per ZAI
+    // session, acceptable for v1. The `startTurn` closure is cleared so
+    // `toggleMute` can't restart the loop after teardown. The history
+    // is cleared so a fresh ZAI session starts with no context.
+    zaiStoppingRef.current = true;
+    if (zaiRecognitionRef.current) {
+      try { zaiRecognitionRef.current.abort(); } catch { /* ignore */ }
+      try { zaiRecognitionRef.current.stop(); } catch { /* ignore */ }
+      try { zaiRecognitionRef.current.onresult = null; } catch { /* ignore */ }
+      try { zaiRecognitionRef.current.onerror = null; } catch { /* ignore */ }
+      try { zaiRecognitionRef.current.onend = null; } catch { /* ignore */ }
+      zaiRecognitionRef.current = null;
+    }
+    if (zaiAudioElRef.current) {
+      try { zaiAudioElRef.current.pause(); } catch { /* ignore */ }
+      try { zaiAudioElRef.current.onended = null; } catch { /* ignore */ }
+      try { zaiAudioElRef.current.onerror = null; } catch { /* ignore */ }
+      zaiAudioElRef.current = null;
+    }
+    zaiStartTurnRef.current = null;
+    zaiMutedRef.current = false;
+    zaiHistoryRef.current = [];
+    // --- Vosk WebSocket + TTS audio ---
+    // Close the WebSocket to the voice-ai server (port 3005) FIRST so
+    // the mic-flush loop stops sending into a closing socket. Then
+    // pause + revoke the audio element (stops mid-playback TTS) +
+    // drop the in-progress MP3 buffer so a reconnect starts fresh.
+    if (voskWsRef.current) {
+      try {
+        if (voskWsRef.current.readyState === WebSocket.OPEN ||
+            voskWsRef.current.readyState === WebSocket.CONNECTING) {
+          voskWsRef.current.close(1000, "client-teardown");
+        }
+      } catch { /* ignore */ }
+      voskWsRef.current.onmessage = null;
+      voskWsRef.current.onerror = null;
+      voskWsRef.current.onclose = null;
+      voskWsRef.current = null;
+    }
+    if (voskAudioElRef.current) {
+      try { voskAudioElRef.current.pause(); } catch { /* ignore */ }
+      try { voskAudioElRef.current.onended = null; } catch { /* ignore */ }
+      try { voskAudioElRef.current.onerror = null; } catch { /* ignore */ }
+      // Revoke the blob URL — the `src` is a string blob: URL.
+      const url = voskAudioElRef.current.src;
+      if (url && url.startsWith("blob:")) {
+        try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+      }
+      voskAudioElRef.current = null;
+    }
+    voskTtsChunksRef.current = [];
+    voskTtsActiveRef.current = false;
     // --- Shared mic ---
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -663,10 +786,12 @@ function RealtimeChat() {
     if (!startData.ok || !startData.gsessionid || !startData.rid) {
       throw new Error(startData.error ?? "Gemini start returned no session.");
     }
+    const startRidNum = parseInt(startData.rid, 10) || 0;
     geminiSessionRef.current = {
       gsessionid: startData.gsessionid,
       sid: startData.sid ?? "",
       rid: startData.rid,
+      nextRid: startRidNum + 1, // the next send POST will use startRid + 1
     };
     log(`Gemini session started (rid=${startData.rid}).`);
 
@@ -712,6 +837,10 @@ function RealtimeChat() {
         off += c.length;
       }
       const b64 = int16ToBase64(merged);
+      // Use the INCREMENTAL RID — each send POST gets a new RID (the start
+      // used startRid, the first send uses startRid+1, the second startRid+2,
+      // etc.). Verified from the real AI Studio capture.
+      const sendRid = String(session.nextRid++);
       try {
         await fetch("/api/gemini/connect", {
           method: "POST",
@@ -720,7 +849,7 @@ function RealtimeChat() {
             action: "send",
             gsessionid: session.gsessionid,
             sid: session.sid,
-            rid: session.rid,
+            rid: sendRid, // incremental RID (not the start RID)
             audio: b64,
           }),
           signal: AbortSignal.timeout(30_000),
@@ -1548,6 +1677,10 @@ function RealtimeChat() {
       rtc_gslb?: string;
       rtc_user_id_client?: string;
       rtc_user_id_voicechat?: string;
+      // CRITICAL — timestamp + nonce are cryptographically bound to the
+      // token. Must be passed through from Qwen's response (not Date.now()).
+      rtc_timestamp?: number;
+      rtc_nonce?: string;
       chat_id?: string;
       times_left?: number | null;
       audio_timeout?: number | null;
@@ -1617,20 +1750,46 @@ function RealtimeChat() {
       log(`[qwen] kicked from channel (code: ${code}).`);
     });
 
+    // DEBUG: log ALL remote user events to understand the channel lifecycle.
+    // The AI user (rtc_user_id_voicechat = "rtc-user-voiceChat") should join
+    // the channel after we do — that's when the data channel opens.
+    engine.on("remoteUserOnLineNotify", (uid: string) => {
+      log(`[qwen] remote user online: ${uid}`);
+    });
+    engine.on("remoteUserOffLineNotify", (uid: string) => {
+      log(`[qwen] remote user offline: ${uid}`);
+    });
+    engine.on("remoteUserSubscribedDataChannel", (uid: string) => {
+      log(`[qwen] remote user subscribed data channel: ${uid}`);
+    });
+    engine.on("dataSubscribeStateChanged", (state: unknown) => {
+      log(`[qwen] data subscribe state: ${JSON.stringify(state).slice(0, 200)}`);
+    });
+    engine.on("dataPublishStateChanged", (state: unknown) => {
+      log(`[qwen] data publish state: ${JSON.stringify(state).slice(0, 200)}`);
+    });
+    // Also listen for the alternative event name (some SDK versions use
+    // `remoteDataChannelMessage` instead of `dataChannelMsg`).
+    engine.on("remoteDataChannelMessage", (uid: string, message: unknown) => {
+      log(`[qwen] remoteDataChannelMessage from ${uid}: ${JSON.stringify(message).slice(0, 200)}`);
+    });
+
     // 6. Join the Aliyun RTC channel. The auth info matches the
     //    AliRtcAuthInfo shape from the SDK types (channelId, userId,
-    //    appId, nonce, timestamp, token). Qwen doesn't use the nonce
-    //    field — we pass an empty string (the Qwen Omni SDK does the
-    //    same). The timestamp is the current time in milliseconds.
+    //    appId, nonce, timestamp, token). CRITICAL: the `timestamp` and
+    //    `nonce` MUST be the values Qwen returned (the token is
+    //    cryptographically bound to them). Using `Date.now()` →
+    //    "Signaling connect failed" (the SDK rejects the token because
+    //    the timestamp doesn't match the one the token was issued for).
     const authInfo = {
       channelId: rtc.rtc_channel ?? "",
       userId: rtc.rtc_user_id_client ?? "",
       appId: rtc.rtc_app_id ?? "",
-      nonce: "",
-      timestamp: Date.now(),
+      nonce: rtc.rtc_nonce ?? "",
+      timestamp: rtc.rtc_timestamp ?? 0,
       token: rtc.rtc_token ?? "",
     };
-    log(`Joining Aliyun RTC channel ${authInfo.channelId.slice(0, 24)}…`);
+    log(`Joining Aliyun RTC channel ${authInfo.channelId.slice(0, 24)} (timestamp: ${authInfo.timestamp})…`);
     try {
       await engine.joinChannel(authInfo, "rtc-user-client");
     } catch (err) {
@@ -1858,9 +2017,620 @@ function RealtimeChat() {
     log("Connected. Speak when ready.");
   }, [clearAudioQueue, log, upsertUserLine]);
 
+  /** Connect via the ZAI turn-based pipeline (Web Speech API STT +
+   * z-ai-web-dev-sdk LLM + Microsoft Edge TTS). This is the 6th realtime
+   * provider — fully self-contained, no external API keys, no WebRTC.
+   *
+   * Flow (per turn):
+   *   1. Create a `webkitSpeechRecognition` instance, set
+   *      `continuous=false`, `interimResults=true`, `lang=navigator.language`.
+   *   2. On `result` → accumulate interim + final transcripts → show
+   *      "You: <transcript>" in the transcript panel (via `upsertUserLine`).
+   *   3. On `end` (silence detected by the browser) → take the final
+   *      transcript → POST `/api/zai/chat` with `{ message, history }` →
+   *      get the AI text → log "AI: <text>" → append to history → POST
+   *      `/api/zai/tts` with `{ text }` → get mp3 blob → play via a
+   *      fresh `new Audio(blobUrl)`.
+   *   4. After `audio.onended` → revoke the blob URL → restart recognition
+   *      for the next turn.
+   *
+   * Mute (toggleMute): set `zaiMutedRef = true` + abort the current
+   * recognition. The audio clip currently playing is NOT paused — it
+   * finishes naturally + `onended` checks `zaiMutedRef` to decide whether
+   * to restart. Unmuting sets `zaiMutedRef = false` + calls
+   * `zaiStartTurnRef.current()` if no audio is currently playing.
+   *
+   * Teardown: set `zaiStoppingRef = true` + abort recognition + pause
+   * audio. All refs are cleared so a reconnect starts fresh.
+   *
+   * History: last 10 messages `{ role, content }` are kept in
+   * `zaiHistoryRef` + sent to `/api/zai/chat` for context.
+   */
+  const connectZai = useCallback(async () => {
+    // 1. Browser support check. The Web Speech API is available in
+    //    Chrome + Edge as `window.SpeechRecognition` or the prefixed
+    //    `window.webkitSpeechRecognition`. Firefox + Safari don't
+    //    support it (Safari has its own proprietary API we don't use).
+    const w = window as unknown as {
+      SpeechRecognition?: any;
+      webkitSpeechRecognition?: any;
+    };
+    const SpeechRecognitionCtor = w.SpeechRecognition ?? w.webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) {
+      throw new Error(
+        "ZAI needs the Web Speech API (Chrome or Edge). Your browser doesn't support it.",
+      );
+    }
+
+    // 2. Reset the per-session refs (a previous ZAI session would have
+    //    left these set; teardown clears them but a direct re-connect
+    //    without disconnect is also safe).
+    zaiStoppingRef.current = false;
+    zaiMutedRef.current = false;
+    zaiHistoryRef.current = [];
+    zaiRecognitionRef.current = null;
+    zaiAudioElRef.current = null;
+
+    // 3. Trigger the mic permission prompt. Web Speech API manages its
+    //    own mic internally, but we call getUserMedia first so the
+    //    browser's permission prompt fires here (clearer UX + lets us
+    //    fail early with a clear message if the user denies). We stop
+    //    the tracks immediately — the SpeechRecognition API will
+    //    re-acquire the mic on `start()`.
+    try {
+      const localStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      localStream.getTracks().forEach((t) => t.stop());
+      // We DON'T store this in localStreamRef — the Web Speech API owns
+      // its own mic stream; storing a stopped stream here would break
+      // toggleMute for the other providers on the next connect.
+    } catch (err) {
+      throw new Error(
+        `Microphone permission denied: ${(err as Error).message ?? err}. Allow mic access + retry.`,
+      );
+    }
+
+    // 4. Define the per-turn recognition starter. Each call creates a
+    //    fresh `SpeechRecognition` instance (the API does not support
+    //    re-starting a stopped instance in all browsers) + wires the
+    //    result / error / end handlers + calls `start()`.
+    const startTurn = () => {
+      // If we're tearing down or muted, don't start a new turn.
+      if (zaiStoppingRef.current || zaiMutedRef.current) return;
+      // If a previous recognition is somehow still active, abort it
+      // first (defensive — the onend handler nulls the ref, but a
+      // duplicate startTurn call could race).
+      if (zaiRecognitionRef.current) {
+        try { zaiRecognitionRef.current.abort(); } catch { /* ignore */ }
+        zaiRecognitionRef.current = null;
+      }
+      // If the AI's TTS audio is still playing, don't restart the mic
+      // yet — the audio.onended handler will call startTurn() when it
+      // finishes. This prevents the user's voice from being captured
+      // while the AI is talking (no echo / barge-in in this v1).
+      if (zaiAudioElRef.current) return;
+
+      const recognition = new SpeechRecognitionCtor();
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
+      // Use the browser's preferred language. Chrome's
+      // `webkitSpeechRecognition` does NOT accept "auto" as a lang
+      // value (it falls back to the browser default), so we use
+      // `navigator.language` which gives a BCP-47 tag like "en-US",
+      // "fr-FR", "zh-CN", "ja-JP". This makes the STT multilingual
+      // based on the user's browser preference.
+      try {
+        recognition.lang = (navigator.language || "en-US");
+      } catch {
+        recognition.lang = "en-US";
+      }
+
+      // Per-turn state — accumulated transcripts + a `gaveUp` flag so
+      // the `onend` handler knows not to restart after a fatal error
+      // (e.g. permission denied).
+      let finalTranscript = "";
+      let interimTranscript = "";
+      let gaveUp = false;
+
+      // 5. onresult — accumulate interim + final transcripts + surface
+      //    the combined text in the transcript panel via `upsertUserLine`.
+      //    `interimResults=true` means this fires multiple times per
+      //    speech with the cumulative partial transcript; each delta
+      //    REPLACES the previous "You:" line (upsertUserLine handles this
+      //    via the inUserSpeechRef flag).
+      recognition.onresult = (event: any) => {
+        try {
+          for (let i = (event.resultIndex ?? 0); i < event.results.length; i++) {
+            const r = event.results[i];
+            if (!r || !r[0]) continue;
+            const t = (r[0].transcript as string) ?? "";
+            if (r.isFinal) finalTranscript += t;
+            else interimTranscript += t;
+          }
+        } catch { /* ignore parse errors */ }
+        const full = (finalTranscript + interimTranscript).trim();
+        if (full) upsertUserLine(full);
+      };
+
+      // 6. onerror — log + mark `gaveUp` for fatal errors. The actual
+      //    restart decision is in `onend` (which always fires after
+      //    `onerror` per the spec).
+      recognition.onerror = (e: any) => {
+        const err = (e?.error as string) ?? "unknown";
+        if (err === "no-speech" || err === "aborted") {
+          // no-speech: the user paused without speaking — silent restart.
+          // aborted: we aborted it (mute / teardown) — silent no-op.
+          return;
+        }
+        if (err === "not-allowed" || err === "service-not-allowed") {
+          gaveUp = true;
+          log("Microphone permission denied. Reconnect + allow mic access.");
+          return;
+        }
+        log(`Speech recognition error: ${err}`);
+      };
+
+      // 7. onend — the recognition session ended (silence detected by
+      //    the browser's VAD, OR we aborted it). This is the heart of
+      //    the turn-based loop: process the transcript → AI → TTS →
+      //    play → restart. Defined as `async` because we await the
+      //    chat + TTS fetches.
+      recognition.onend = async () => {
+        // Clear the ref so teardown + toggleMute know no recognition
+        // is active. CRITICAL: this must happen BEFORE the awaits
+        // below so a teardown call during the AI/TTS fetch sees the
+        // ref as null + can cancel the audio cleanly.
+        zaiRecognitionRef.current = null;
+        // Reset the in-speech flag so the NEXT turn creates a fresh
+        // "You:" line (collapsing per-turn, not across turns).
+        inUserSpeechRef.current = false;
+
+        // If we're tearing down, muted, or gave up (permission denied) →
+        // don't restart. The teardown path will clean up the audio too.
+        if (zaiStoppingRef.current || zaiMutedRef.current || gaveUp) return;
+
+        const text = finalTranscript.trim();
+        if (!text) {
+          // No speech detected in this turn — restart the mic after a
+          // short delay (avoids the Chrome "InvalidStateError" when
+          // start() is called immediately after end()).
+          setTimeout(startTurn, 100);
+          return;
+        }
+
+        try {
+          // 8. POST to /api/zai/chat with the message + history.
+          const history = zaiHistoryRef.current;
+          const chatRes = await fetch("/api/zai/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: text, history }),
+            signal: AbortSignal.timeout(60_000),
+          });
+          if (!chatRes.ok) {
+            const errText = await chatRes.text().catch(() => "");
+            throw new Error(`AI ${chatRes.status}: ${errText.slice(0, 200)}`);
+          }
+          const chatData = (await chatRes.json()) as { ok?: boolean; text?: string; error?: string };
+          if (!chatData.ok || !chatData.text) {
+            throw new Error(chatData.error ?? "AI returned no text.");
+          }
+          const aiText = chatData.text.trim();
+          if (!aiText) {
+            setTimeout(startTurn, 100);
+            return;
+          }
+
+          // 9. Show the AI response in the transcript (one line).
+          log(`AI: ${aiText}`);
+
+          // 10. Append the user + assistant messages to the history
+          //     (cap at the last 10 entries).
+          zaiHistoryRef.current = [
+            ...history,
+            { role: "user" as const, content: text },
+            { role: "assistant" as const, content: aiText },
+          ].slice(-10);
+
+          // 11. POST to /api/zai/tts → mp3 blob → play via a fresh
+          //     `new Audio()`. Store in `zaiAudioElRef` so teardown can
+          //     pause it.
+          const ttsRes = await fetch("/api/zai/tts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: aiText }),
+            signal: AbortSignal.timeout(60_000),
+          });
+          if (!ttsRes.ok) {
+            const errText = await ttsRes.text().catch(() => "");
+            throw new Error(`TTS ${ttsRes.status}: ${errText.slice(0, 200)}`);
+          }
+          const audioBlob = await ttsRes.blob();
+          const audioUrl = URL.createObjectURL(audioBlob);
+          const audio = new Audio(audioUrl);
+          zaiAudioElRef.current = audio;
+
+          // 12. On audio end (natural or aborted) → revoke the blob URL
+          //     + clear the ref + restart the mic for the next turn
+          //     (unless tearing down or muted). On error → same cleanup.
+          const onAudioDone = () => {
+            URL.revokeObjectURL(audioUrl);
+            if (zaiAudioElRef.current === audio) zaiAudioElRef.current = null;
+            if (!zaiStoppingRef.current && !zaiMutedRef.current) {
+              setTimeout(startTurn, 100);
+            }
+          };
+          audio.onended = onAudioDone;
+          audio.onerror = onAudioDone;
+
+          // 13. Play. The `.catch` handles the rare case where the
+          //     browser blocks autoplay (shouldn't happen here because
+          //     the user clicked Connect — a user gesture — but be
+          //     defensive). If play() rejects, treat it as "audio done"
+          //     so the loop continues.
+          try {
+            await audio.play();
+          } catch (playErr) {
+            log(`Audio playback failed: ${(playErr as Error).message}. Restarting mic.`);
+            onAudioDone();
+          }
+        } catch (err) {
+          const msg = (err as Error).message ?? String(err);
+          log(`Error: ${msg}`);
+          // Don't abort the whole session on a single failed turn —
+          // restart the mic for the next turn after a short delay.
+          if (!zaiStoppingRef.current && !zaiMutedRef.current) {
+            setTimeout(startTurn, 500);
+          }
+        }
+      };
+
+      // 14. Store the recognition + the startTurn closure, then start.
+      zaiRecognitionRef.current = recognition;
+      zaiStartTurnRef.current = startTurn;
+      try {
+        recognition.start();
+      } catch (startErr) {
+        // `start()` throws `InvalidStateError` if the recognition is
+        // already started or if it's called too rapidly after a
+        // previous end(). Retry after a short delay.
+        log(`Recognition start error: ${(startErr as Error).message}`);
+        zaiRecognitionRef.current = null;
+        if (!zaiStoppingRef.current && !zaiMutedRef.current) {
+          setTimeout(startTurn, 500);
+        }
+      }
+    };
+
+    // 15. Kick off the first turn + mark connected. Store startTurn in
+    //     the ref before calling it so `toggleMute` (which may fire
+    //     immediately after status flips to "connected") can find it.
+    zaiStartTurnRef.current = startTurn;
+    log("ZAI connected. Speak when ready.");
+    setStatus("connected");
+    startTurn();
+  }, [log, upsertUserLine]);
+
+  /** Connect via the Vosk + Edge TTS streaming pipeline (the 7th
+   *  realtime voice provider). NO Web Speech API — Vosk runs locally
+   *  in the voice-ai Node server (port 3005) + Microsoft Edge TTS
+   *  is generated server-side via the `edge-tts` Python package.
+   *
+   *  Flow:
+   *    1. Open a WebSocket to `wss://<page-host>/?XTransformPort=3005`
+   *       — the Caddy gateway forwards to the voice-ai server on
+   *       port 3005 (see `voice-ai/server/server.js`). We use the
+   *       same `wss://` scheme as Inworld (matches the page protocol
+   *       — no mixed-content block on HTTPS hosts). For local dev
+   *       (http://localhost:3000) we'd fall back to `ws://`, but
+   *       `wss://` works in both cases because the gateway handles
+   *       TLS termination.
+   *    2. Create an AudioContext at 16 kHz (Vosk's input rate) +
+   *       getUserMedia + ScriptProcessor (4096-sample buffer).
+   *    3. ScriptProcessor.onaudioprocess → Float32 → Int16 →
+   *       `ws.send(int16.buffer)` as a BINARY frame. The server feeds
+   *       these bytes directly to `vosk.Recognizer.acceptWaveform`.
+   *    4. ws.onmessage:
+   *       - Binary frame → MP3 audio chunk from Edge TTS →
+   *         accumulate in `voskTtsChunksRef` (only while
+   *         `voskTtsActiveRef` is true — stale frames after tts_end
+   *         are dropped).
+   *       - Text frame → JSON control message:
+   *         - `stt_partial`  → `upsertUserLine(text)` (the in-progress
+   *            transcription; replaces the last "You:" line per speech).
+   *         - `stt_final`    → `log("You: <text>")` (the final
+   *            transcription after silence is detected by Vosk).
+   *         - `tts_start`    → reset `voskTtsChunksRef` + pause any
+   *            currently-playing TTS audio (barge-in safety).
+   *         - `tts_end`      → build a Blob from `voskTtsChunksRef` →
+   *            `new Audio(url).play()` + log "AI audio complete".
+   *    5. Barge-in: handled server-side — any new mic audio while TTS
+   *       is playing kills the TTS Python child + emits `tts_end`.
+   *       The client just drops the in-progress buffer + the
+   *       `tts_end` builds an empty Blob (no playback).
+   *    6. Cleanup: `teardown` (see the Vosk block above) closes the
+   *       WebSocket + pauses + revokes + nulls the audio element.
+   *
+   *  Mute (toggleMute): falls through to the shared `localStreamRef`
+   *  path (toggles `track.enabled` on the mic tracks — the
+   *  ScriptProcessor keeps firing but its output is silent, so the
+   *  server's Vosk recognizer receives zero PCM + produces no
+   *  partials/finals). No Vosk-specific mute state is needed.
+   *
+   *  Audio format: Vosk expects Int16 LE PCM @ 16 kHz mono. Edge TTS
+   *  returns MP3 (audio/mpeg) — we play via a Blob URL + `<audio>`
+   *  element (NOT via the AudioContext, because the AudioContext
+   *  playback path is for PCM16, not MP3).
+   */
+  const connectVosk = useCallback(async () => {
+    // 1. Open the WebSocket. Same Caddy-gateway pattern as Inworld —
+    //    the browser connects to the page host with
+    //    `?XTransformPort=3005`, and Caddy forwards to localhost:3005
+    //    on the VPS. We use `wss://` (or `ws://` if the page is HTTP)
+    //    to match the page protocol — no mixed-content block.
+    const wsHost = window.location.host;
+    const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${wsProto}//${wsHost}/?XTransformPort=3005`;
+    log(`Opening Vosk WebSocket (XTransformPort=3005)…`);
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer"; // receive MP3 chunks as ArrayBuffer
+    voskWsRef.current = ws;
+
+    // Wait for open (or close/error within 10s).
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("Vosk WebSocket did not open within 10s."));
+      }, 10_000);
+      const onOpen = () => {
+        clearTimeout(timeout);
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(new Error("Vosk WebSocket error during open (is voice-ai/server running on port 3005?)."));
+      };
+      const onClose = (e: CloseEvent) => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(new Error(`Vosk WebSocket closed during open (code ${e.code}).`));
+      };
+      const cleanup = () => {
+        ws.removeEventListener("open", onOpen);
+        ws.removeEventListener("error", onError);
+        ws.removeEventListener("close", onClose);
+      };
+      ws.addEventListener("open", onOpen);
+      ws.addEventListener("error", onError);
+      ws.addEventListener("close", onClose);
+    });
+    log("Vosk WebSocket open.");
+
+    // 2. AudioContext at 16 kHz (Vosk's rate) + get the user's mic.
+    //    Some browsers ignore the requested sample rate; we resample
+    //    below by routing the mic through a ScriptProcessor at the ctx
+    //    rate (the captured Float32 is already at the ctx rate, so no
+    //    extra resampling needed — the ScriptProcessor reads at the
+    //    context rate + we convert to Int16 for the server).
+    const AudioCtor: typeof AudioContext =
+      window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    let audioCtx: AudioContext;
+    try {
+      audioCtx = new AudioCtor({ sampleRate: 16000 });
+    } catch {
+      audioCtx = new AudioCtor();
+    }
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => { /* ignore */ });
+    }
+    audioCtxRef.current = audioCtx;
+    log(`AudioContext @ ${audioCtx.sampleRate} Hz (requested 16000).`);
+
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    micStreamRef.current = micStream;
+    // Reuse the shared localStreamRef so the existing mute toggle works.
+    localStreamRef.current = micStream;
+
+    // 3. Wire mic → ScriptProcessor → PCM16 binary frames.
+    //    Same pattern as Gemini/Inworld: 4096-sample buffer at 16 kHz =
+    //    256ms per callback. We convert Float32 → Int16 + send as
+    //    binary over the WebSocket (NOT base64 — Vosk's
+    //    `acceptWaveform` takes raw bytes, so binary frames are
+    //    cheaper + simpler than JSON+base64).
+    const source = audioCtx.createMediaStreamSource(micStream);
+    const scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    scriptNodeRef.current = scriptNode;
+    scriptNode.onaudioprocess = (e) => {
+      const sock = voskWsRef.current;
+      if (!sock || sock.readyState !== WebSocket.OPEN) return;
+      const input = e.inputBuffer.getChannelData(0);
+      // Float32 → Int16 (same helper used by Gemini + Inworld).
+      const int16 = float32ToInt16(new Float32Array(input));
+      // Send the Int16 buffer as a binary frame.
+      try {
+        sock.send(int16.buffer);
+      } catch (err) {
+        console.warn("[vosk] send failed:", (err as Error).message);
+      }
+    };
+    source.connect(scriptNode);
+    // ScriptProcessor needs a destination to fire — connect to a muted
+    // gain so we don't echo the mic back out the speakers.
+    const mutedGain = audioCtx.createGain();
+    mutedGain.gain.value = 0;
+    scriptNode.connect(mutedGain);
+    mutedGain.connect(audioCtx.destination);
+
+    // 4. Handle incoming messages.
+    ws.onmessage = (e) => {
+      // Binary frame = MP3 audio chunk from Edge TTS.
+      if (e.data instanceof ArrayBuffer) {
+        // Only accumulate while a TTS response is in progress —
+        // stale chunks after tts_end are dropped.
+        if (voskTtsActiveRef.current) {
+          voskTtsChunksRef.current.push(e.data);
+        }
+        return;
+      }
+      // Text frame = JSON control message.
+      if (typeof e.data !== "string") return;
+      let msg: { type?: string; text?: string; code?: number; error?: string };
+      try {
+        msg = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      switch (msg.type) {
+        case "stt_partial": {
+          // In-progress transcription — UPDATE the same "You:" line
+          // via `upsertUserLine` (collapses all partials for one
+          // speech into ONE growing line — same pattern as Inworld +
+          // Gemini + Qwen).
+          if (msg.text) upsertUserLine(msg.text);
+          break;
+        }
+        case "stt_final": {
+          if (msg.text) log(`You: ${msg.text}`);
+          break;
+        }
+        case "ai_start": {
+          // NVIDIA streaming started — create a new AI: line.
+          log("[vosk] AI pipeline starting…");
+          break;
+        }
+        case "ai_text": {
+          // Streaming AI text — append to the last AI: line.
+          // Define inline because appendAiDelta from connectInworld
+          // is not in scope (separate useCallback closure).
+          const delta = msg.text || "";
+          if (!delta) break;
+          setTranscript((t) => {
+            const next = [...t];
+            const last = next[next.length - 1] ?? "";
+            if (last.includes("] AI:")) {
+              next[next.length - 1] = last + delta;
+            } else {
+              next.push(`[${new Date().toLocaleTimeString()}] AI: ${delta}`);
+            }
+            return next.slice(-200);
+          });
+          break;
+        }
+        case "ai_end": {
+          // NVIDIA streaming finished. Any remaining segments are
+          // still being TTS'd by the server pipeline.
+          if (msg.error) log(`[vosk] AI error: ${msg.error}`);
+          break;
+        }
+        case "tts_start": {
+          // Reset the MP3 buffer for the new TTS response + stop any
+          // currently-playing TTS audio (barge-in safety — should
+          // not happen because the server kills TTS before sending
+          // tts_start, but defensive).
+          voskTtsActiveRef.current = true;
+          voskTtsChunksRef.current = [];
+          if (voskAudioElRef.current) {
+            try { voskAudioElRef.current.pause(); } catch { /* ignore */ }
+            const url = voskAudioElRef.current.src;
+            if (url && url.startsWith("blob:")) {
+              try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+            }
+            voskAudioElRef.current.onended = null;
+            voskAudioElRef.current.onerror = null;
+            voskAudioElRef.current = null;
+          }
+          break;
+        }
+        case "tts_end": {
+          // Play the accumulated MP3 chunks. If barge-in fired
+          // (server killed TTS), the buffer may be empty — skip
+          // playback in that case.
+          voskTtsActiveRef.current = false;
+          const chunks = voskTtsChunksRef.current;
+          voskTtsChunksRef.current = [];
+          if (chunks.length === 0) {
+            log("AI audio complete (barge-in).");
+            break;
+          }
+          if (msg.code != null && msg.code !== 0) {
+            log(`AI audio failed (TTS exit ${msg.code}).`);
+            break;
+          }
+          try {
+            const blob = new Blob(chunks, { type: "audio/mpeg" });
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            voskAudioElRef.current = audio;
+            audio.onended = () => {
+              URL.revokeObjectURL(url);
+              if (voskAudioElRef.current === audio) voskAudioElRef.current = null;
+            };
+            audio.onerror = () => {
+              URL.revokeObjectURL(url);
+              if (voskAudioElRef.current === audio) voskAudioElRef.current = null;
+            };
+            // `.catch` handles the rare case where autoplay is blocked
+            // (shouldn't happen here — the Connect click counts as a
+            // user gesture — but be defensive).
+            audio.play().catch((playErr) => {
+              log(`Audio playback failed: ${(playErr as Error).message}.`);
+              URL.revokeObjectURL(url);
+              if (voskAudioElRef.current === audio) voskAudioElRef.current = null;
+            });
+            log("AI audio complete.");
+          } catch (err) {
+            log(`AI audio build error: ${(err as Error).message}.`);
+          }
+          break;
+        }
+        default:
+          // Unknown control message — ignore.
+          break;
+      }
+    };
+
+    ws.onerror = () => {
+      log("Vosk WebSocket error.");
+    };
+    ws.onclose = (e) => {
+      log(`Vosk WebSocket closed (code ${e.code}).`);
+      voskWsRef.current = null;
+      // If the socket closed on its own (not via teardown), reflect it
+      // in the UI so the user knows they need to reconnect.
+      if (status !== "idle" && providerRef.current === "vosk") {
+        setStatus("idle");
+        if (scriptNodeRef.current) {
+          try { scriptNodeRef.current.disconnect(); } catch { /* ignore */ }
+          scriptNodeRef.current = null;
+        }
+        if (micStreamRef.current) {
+          micStreamRef.current.getTracks().forEach((t) => t.stop());
+          micStreamRef.current = null;
+        }
+        if (localStreamRef.current) {
+          localStreamRef.current = null;
+        }
+        if (audioCtxRef.current) {
+          try { audioCtxRef.current.close(); } catch { /* ignore */ }
+          audioCtxRef.current = null;
+        }
+      }
+    };
+
+    setStatus("connected");
+    log("Connected. Speak when ready.");
+  }, [float32ToInt16, log, status, upsertUserLine]);
+
   /** Connect to the selected provider's realtime endpoint. Dispatches to
-   * the WebRTC path (ChatGPT / Perplexity), the Gemini bidi path, or the
-   * Inworld WebSocket path. */
+   * the WebRTC path (ChatGPT / Perplexity / Qwen), the Gemini bidi path,
+   * the Inworld WebSocket path, the ZAI turn-based pipeline (Web Speech
+   * API STT + z-ai LLM + Edge TTS), or the Vosk streaming pipeline
+   * (local Vosk STT + Microsoft Edge TTS over a WebSocket to port 3005). */
   const connect = useCallback(async () => {
     setError(null);
     setStatus("connecting");
@@ -1873,6 +2643,10 @@ function RealtimeChat() {
         await connectInworld();
       } else if (providerRef.current === "qwen") {
         await connectQwen();
+      } else if (providerRef.current === "zai") {
+        await connectZai();
+      } else if (providerRef.current === "vosk") {
+        await connectVosk();
       } else {
         await connectWebRtc();
       }
@@ -1883,11 +2657,17 @@ function RealtimeChat() {
       log(`Error: ${message}`);
       teardown();
     }
-  }, [connectGemini, connectInworld, connectQwen, connectWebRtc, log, teardown]);
+  }, [connectGemini, connectInworld, connectQwen, connectVosk, connectWebRtc, connectZai, log, teardown]);
 
   /** Toggle the mic on/off (mutes the local audio track). Works for the
-   * WebRTC path (localStream), the Gemini/Inworld paths (micStream), AND
-   * the Qwen path (Aliyun RTC SDK owns the mic — uses `muteLocalMic`). */
+   * WebRTC path (localStream), the Gemini/Inworld/Vosk paths (micStream),
+   * the Qwen path (Aliyun RTC SDK owns the mic — uses `muteLocalMic`),
+   * AND the ZAI path (Web Speech API STT — abort the current recognition
+   * + set `zaiMutedRef`; restart the loop on unmute via
+   * `zaiStartTurnRef`). For Vosk, muting just disables the shared
+   * MediaStream tracks — the ScriptProcessor keeps firing but its
+   * output is silent, so the server's Vosk recognizer receives zero PCM
+   * + produces no partials/finals. */
   const toggleMute = useCallback(() => {
     const next = !muted;
     // Qwen path — the Aliyun RTC SDK owns the mic stream.
@@ -1897,8 +2677,32 @@ function RealtimeChat() {
       log(next ? "Mic muted." : "Mic unmuted.");
       return;
     }
-    // ChatGPT / Perplexity / Gemini / Inworld path — toggle the shared
-    // MediaStream tracks' `enabled` property.
+    // ZAI path — turn-based Web Speech API STT. Muting = abort the
+    // current recognition + set the muted flag (the AI's currently
+    // playing TTS audio is NOT paused — it finishes naturally +
+    // `onended` checks `zaiMutedRef`). Unmuting = clear the flag +
+    // call `startTurn` to restart the mic (only if no audio is
+    // currently playing — otherwise the audio.onended handler will
+    // restart the loop naturally when the clip finishes).
+    if (zaiRecognitionRef.current || zaiAudioElRef.current || zaiStartTurnRef.current) {
+      zaiMutedRef.current = next;
+      if (next) {
+        if (zaiRecognitionRef.current) {
+          try { zaiRecognitionRef.current.abort(); } catch { /* ignore */ }
+          // Don't null the ref here — the `onend` handler does that.
+        }
+      } else {
+        // Unmuting — restart the mic if nothing is currently active.
+        if (!zaiRecognitionRef.current && !zaiAudioElRef.current) {
+          zaiStartTurnRef.current?.();
+        }
+      }
+      setMuted(next);
+      log(next ? "Mic muted." : "Mic unmuted.");
+      return;
+    }
+    // ChatGPT / Perplexity / Gemini / Inworld / Vosk path — toggle the
+    // shared MediaStream tracks' `enabled` property.
     const stream = localStreamRef.current;
     if (!stream) return;
     stream.getAudioTracks().forEach((t) => (t.enabled = !next));
@@ -1907,9 +2711,10 @@ function RealtimeChat() {
   }, [muted, log]);
 
   /** Disconnect from the provider. For Gemini this fires a best-effort
-   * stop call to the backend; for Inworld the WebSocket close (handled
-   * inside `teardown`) IS the stop; for the WebRTC providers there's no
-   * explicit teardown call — closing the peer connection is enough. */
+   * stop call to the backend; for Inworld + Vosk the WebSocket close
+   * (handled inside `teardown`) IS the stop; for the WebRTC providers
+   * there's no explicit teardown call — closing the peer connection is
+   * enough. */
   const disconnect = useCallback(() => {
     // Best-effort stop call for Gemini (the server doesn't really need a
     // stop — we just stop long-polling — but it's polite).
@@ -1964,11 +2769,18 @@ function RealtimeChat() {
         <CardDescription className="text-zinc-500">
           Talk to a realtime AI model. ChatGPT, Perplexity, and Qwen use
           WebRTC; Gemini Live uses Google's bidi (Web Channel) protocol;
-          Inworld uses a direct browser WebSocket to api.inworld.ai. ChatGPT
-          needs a JWT in the vault; Perplexity + Gemini need their session
-          cookies there (refreshed by the Chrome extension); Inworld needs
-          an `INWORLD_TOKEN` env var (or a token in the vault); Qwen needs
-          a `QWEN_ACCESS_TOKEN` env var (the chat.qwen.ai JWT).
+          Inworld uses a direct browser WebSocket to api.inworld.ai; ZAI
+          is a fully self-contained turn-based pipeline (Web Speech API
+          STT + z-ai LLM + Microsoft Edge TTS) — no external API keys
+          needed; Vosk is a real-time streaming pipeline (local Vosk
+          STT at 16 kHz + Microsoft Edge TTS) over a WebSocket to the
+          voice-ai mini-service on port 3005 — no external API keys,
+          no Web Speech API, with barge-in (speaking interrupts TTS).
+          ChatGPT needs a JWT in the vault; Perplexity + Gemini need
+          their session cookies there (refreshed by the Chrome
+          extension); Inworld needs an `INWORLD_TOKEN` env var (or a
+          token in the vault); Qwen needs a `QWEN_ACCESS_TOKEN` env var
+          (the chat.qwen.ai JWT); ZAI + Vosk need nothing.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -2016,6 +2828,20 @@ function RealtimeChat() {
               disabled={connected || status === "connecting"}
             >
               Qwen
+            </ProviderButton>
+            <ProviderButton
+              active={provider === "zai"}
+              onClick={() => setProvider("zai")}
+              disabled={connected || status === "connecting"}
+            >
+              ZAI
+            </ProviderButton>
+            <ProviderButton
+              active={provider === "vosk"}
+              onClick={() => setProvider("vosk")}
+              disabled={connected || status === "connecting"}
+            >
+              Vosk
             </ProviderButton>
           </div>
 
@@ -2078,6 +2904,17 @@ function RealtimeChat() {
             {muted ? <MicOff className="size-4" aria-hidden /> : <Mic className="size-4" aria-hidden />}
             {muted ? "Unmute" : "Mute"}
           </Button>
+
+          {/* Chrome extension download — needed for ChatGPT/Perplexity/Gemini cookie refresh */}
+          <a
+            href="/chrome-extension.zip"
+            download
+            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs font-medium text-amber-300 hover:bg-amber-900/40 transition-colors"
+            title="Download the Chrome extension to refresh ChatGPT JWT + Perplexity cookies + Google cookies (for Gemini Live) into the vault Worker"
+          >
+            <Download className="size-3.5" aria-hidden />
+            Chrome Extension
+          </a>
         </div>
 
         {/* Error */}

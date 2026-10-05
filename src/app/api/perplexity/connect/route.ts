@@ -188,6 +188,7 @@ async function connectViaCurlImpersonate(
   cookies: string,
   account: string | null,
   sdp: string,
+  proxy?: string | null,
 ): Promise<string> {
   const body = buildPerplexityBody(sdp);
   const headers = buildPerplexityHeaders(cookies, account);
@@ -203,12 +204,22 @@ async function connectViaCurlImpersonate(
     PERPLEXITY_SESSION_URL,
     "--data-binary",
     "@-", // read body from stdin
-    // Chrome 131 impersonation flags (same set the ChatGPT route uses).
-    "--impersonate",
-    "chrome131",
+    // NOTE: this curl-impersonate binary (8.1.1, BoringSSL) has the Chrome
+    // TLS fingerprint BUILT-IN — no `--impersonate chrome131` flag needed.
     "--http2",
     "--compressed",
   ];
+  // If a proxy is provided, add it to the curl args. curl-impersonate
+  // supports --socks5, --socks4, and -x (HTTP proxy) flags.
+  if (proxy) {
+    if (proxy.startsWith("socks5://")) {
+      args.push("--socks5", proxy.replace("socks5://", ""));
+    } else if (proxy.startsWith("socks4://")) {
+      args.push("--socks4", proxy.replace("socks4://", ""));
+    } else {
+      args.push("-x", proxy);
+    }
+  }
   for (const [k, v] of Object.entries(headers)) {
     args.push("-H", `${k}: ${v}`);
   }
@@ -327,6 +338,66 @@ function makeProxyAgent(proxyUrl: string): unknown {
   return null;
 }
 
+/** Chrome extension relay — stores the SDP offer in the vault, polls for
+ *  the SDP answer. The Chrome extension (running in the user's browser with
+ *  the real IP) picks up the offer, does the fetch to perplexity.ai, and
+ *  stores the answer. Timeout: 60s (the extension polls every 2s). */
+async function exchangeSdpViaExtensionRelay(sdp: string): Promise<string | null> {
+  const vaultUrl = (process.env.CHATGPT_VAULT_URL ?? "").trim();
+  const vaultSecret = (process.env.CHATGPT_VAULT_SECRET ?? "").trim();
+  if (!vaultUrl) return null;
+
+  const baseUrl = vaultUrl.replace(/\/+$/, "");
+  const headers = { "X-Vault-Secret": vaultSecret, "Content-Type": "application/json" };
+
+  // 1. Store the SDP offer in the vault.
+  const offerRes = await fetch(`${baseUrl}/perplexity/sdp-offer`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ sdp }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!offerRes.ok) {
+    throw new Error(`Vault SDP offer store failed: ${offerRes.status}`);
+  }
+  console.log("[perplexity] SDP offer stored in vault, waiting for extension relay…");
+
+  // 2. Poll for the SDP answer (up to 60s, every 1s).
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      const answerRes = await fetch(`${baseUrl}/perplexity/sdp-answer`, {
+        headers: { "X-Vault-Secret": vaultSecret },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!answerRes.ok) continue;
+      const data = (await answerRes.json()) as { sdp?: string | null; ts?: number | null };
+      if (data.sdp) {
+        console.log("[perplexity] SDP answer received from extension relay!");
+        // Check if it's an error response.
+        if (data.sdp.startsWith("{")) {
+          try {
+            const errObj = JSON.parse(data.sdp) as { error?: string };
+            if (errObj.error) {
+              throw new Error(errObj.error);
+            }
+          } catch (e) {
+            if (e instanceof SyntaxError) {
+              // Not JSON — it's a real SDP answer.
+              return data.sdp;
+            }
+            throw e;
+          }
+        }
+        return data.sdp;
+      }
+    } catch {
+      // Continue polling.
+    }
+  }
+  throw new Error("Extension relay timeout — the Chrome extension didn't pick up the SDP offer within 60s. Make sure the extension is running.");
+}
+
 export async function POST(req: Request) {
   // 1. Parse the browser's SDP offer.
   let body: unknown;
@@ -358,27 +429,94 @@ export async function POST(req: Request) {
     );
   }
 
-  // 3. Try curl-impersonate first (the only path that reliably passes
-  //    Cloudflare's TLS check), then fall back to the pure-JS proxy path.
-  const rawResponse =
-    (existsSync(CURL_IMPERSONATE_BIN)
-      ? await connectViaCurlImpersonate(cookies, account, sdp).catch((err) => {
-          console.warn("[perplexity] curl-impersonate failed:", err.message);
+  // 3. Try in order: relay → curl-impersonate direct → curl-impersonate + proxy → pure-JS proxy → extension relay
+  const relayUrl = (process.env.PERPLEXITY_RELAY_URL ?? "").trim();
+
+  // 3a. Try the relay proxy first (if configured) — this is a Cloudflare
+  //     Tunnel on the user's machine that forwards to perplexity.ai from
+  //     the user's real IP. No Cloudflare block, no rate limit.
+  if (relayUrl) {
+    console.log("[perplexity] trying relay proxy:", relayUrl);
+    try {
+      const relayRes = await fetch(`${relayUrl.replace(/\/+$/, "")}/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sdp, cookies, account }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (relayRes.ok) {
+        const relayData = (await relayRes.json()) as { ok?: boolean; sdp?: string; error?: string };
+        if (relayData.ok && relayData.sdp) {
+          console.log("[perplexity] success via relay proxy!");
+          return NextResponse.json({ sdp: relayData.sdp, type: "answer" });
+        }
+      }
+      console.warn("[perplexity] relay proxy failed:", relayRes.status);
+    } catch (err) {
+      console.warn("[perplexity] relay proxy error:", (err as Error).message);
+    }
+  }
+
+  // 3b. Try curl-impersonate (with proxies if configured).
+  const proxyList = (process.env.PERPLEXITY_PROXY_LIST ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  let rawResponse: string | null = null;
+
+  if (existsSync(CURL_IMPERSONATE_BIN)) {
+    // Try direct first (no proxy) — works if the sandbox IP isn't blocked.
+    rawResponse = await connectViaCurlImpersonate(cookies, account, sdp, null).catch((err) => {
+      console.warn("[perplexity] curl-impersonate direct failed:", err.message);
+      return null;
+    });
+
+    // If direct failed, try each proxy with curl-impersonate (Chrome TLS + proxy).
+    if (!rawResponse && proxyList.length > 0) {
+      for (const proxy of proxyList) {
+        rawResponse = await connectViaCurlImpersonate(cookies, account, sdp, proxy).catch((err) => {
+          console.warn(`[perplexity] curl-impersonate via ${proxy} failed:`, err.message);
           return null;
-        })
-      : null) ??
-    (await connectViaProxies(cookies, account, sdp).catch((err) => {
+        });
+        if (rawResponse) {
+          console.log(`[perplexity] success via curl-impersonate + proxy ${proxy}`);
+          break;
+        }
+      }
+    }
+  }
+
+  // Fall back to pure-JS proxy path if curl-impersonate didn't work.
+  if (!rawResponse) {
+    rawResponse = await connectViaProxies(cookies, account, sdp).catch((err) => {
       console.warn("[perplexity] proxy fallback failed:", err.message);
       return null;
-    }));
+    });
+  }
+
+  // 3b. If all direct/proxy paths failed, try the Chrome extension relay.
+  // The extension polls the vault for pending SDP offers, does the fetch
+  // to perplexity.ai from the user's real browser IP (no Cloudflare block,
+  // no rate limit), and stores the SDP answer in the vault.
+  if (!rawResponse) {
+    console.log("[perplexity] all direct/proxy paths failed, trying Chrome extension relay…");
+    try {
+      const answer = await exchangeSdpViaExtensionRelay(sdp);
+      if (answer) {
+        return NextResponse.json({ sdp: answer, type: "answer" });
+      }
+    } catch (err) {
+      console.warn("[perplexity] extension relay failed:", (err as Error).message);
+    }
+  }
 
   if (!rawResponse) {
     return NextResponse.json(
       {
         error:
-          "Perplexity session request failed. The cf_clearance cookie may be IP-bound — " +
-          "configure PERPLEXITY_PROXY_LIST with a proxy that matches the cookie's IP, " +
-          "or run the route on a host with curl-impersonate installed.",
+          "Perplexity session request failed. All paths exhausted (direct, proxy, extension relay). " +
+          "Make sure the Chrome extension is running + the user is logged in to perplexity.ai.",
       },
       { status: 502 },
     );

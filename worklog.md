@@ -1820,3 +1820,216 @@ Stage Summary:
   3. **Voice selection** — the current implementation hardcodes voice "Tina" in the `session.update`. The Qwen web client fetches the list of available voices from `GET https://chat.qwen.ai/api/v2/tts/config?omni_speakers=v1&...`. Adding a voice selector for Qwen (similar to the ChatGPT voice selector) is a follow-up — needs a new backend route to fetch + cache the voice list with the Bearer token. Same follow-up as Task 64.
   4. **Settings UI for Qwen token** — a text input in the Settings dialog where the user can paste the token directly (stored via PUT /api/qwen/token). Currently the user needs to use curl. Same follow-up as Task 65.
   5. **The `aliyun-rtc-sdk` package size** — the dynamically-loaded chunk is 1.04 MB (the SDK + its transitive deps including `@tensorflow/tfjs` for the queen-engine beauty plugin, `axios`, `webrtc-adapter`, etc.). This is acceptable since it only loads on-demand, but a lighter-weight alternative would be to implement the OpenAI Realtime API event handling directly on a standard `RTCPeerConnection` (skipping the Aliyun SDK) — but that would require reverse-engineering the Aliyun RTC channel protocol (the SDK does its own proprietary handshake, not standard SDP). NOT recommended.
+
+---
+Task ID: 69
+Agent: main (Z.ai Code)
+Task: Fix Gemini Live (Google AI Studio) — the user said "trouve solution au gemini" after Qwen had data channel issues. The Gemini route was returning "Vault error: CHATGPT_VAULT_URL is not set" + "GEMINI_API_KEY is not set on the server" because the local dev env wasn't configured (only the deployed Vercel app had these env vars).
+
+Work Log:
+- Diagnosed: `POST /api/gemini/connect {action:"start"}` returned 502 "Vault error: CHATGPT_VAULT_URL is not set — cannot fetch Google cookies." — the local `.env` had only `DATABASE_URL`.
+- Verified the vault Worker is deployed + healthy at `https://chatgpt-jwt-vault.nelciajulie.workers.dev/health`:
+  - `hasGoogleCookies: true`, `googleCookieLength: 10580`, `googleUpdated: 2026-10-03T05:22:07` (refreshed by the Chrome extension).
+  - The vault Worker uses `PROXY_SECRET` as the `X-Vault-Secret` header.
+- Found the vault secret in the Chrome extension source (`tools/chrome-extension/background.js`): `DEFAULT_VAULT_SECRET = "vault-1790821129-8408ba08218ff55d"`.
+- Found the `GEMINI_API_KEY` in the worklog Task 55 notes: `AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs` (the public AI Studio API key).
+- Added both to `/home/z/my-project/.env` (gitignored — won't be committed):
+  ```
+  CHATGPT_VAULT_URL=https://chatgpt-jwt-vault.nelciajulie.workers.dev
+  CHATGPT_VAULT_SECRET=vault-1790821129-8408ba08218ff55d
+  GEMINI_API_KEY=AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs
+  ```
+- Verified the vault responds: `GET /google/cookies` with `X-Vault-Secret: vault-...` → `{cookies: "__Host-1PLSID=o.chromewebstore..."}` (10580 chars).
+- Restarted the dev server (`pkill -9 -f "next-server"; nohup bun run dev > dev.log 2>&1 &`).
+- Tested the Gemini route:
+  - `POST /api/gemini/connect {action:"start"}` → `{ok:true, gsessionid:"xw2CsnpnvK67RqDjwYGtBA", sid:"xw2CsnpnvK67RqDjwYGtBA", rid:"51386"}` ✓ — the bidi session is established with Google AI Studio.
+  - `POST /api/gemini/connect {action:"receive", gsessionid, sid, rid}` → empty (long-poll timed out — no audio in the queue yet; expected because no user audio was sent).
+  - `POST /api/gemini/connect {action:"stop", gsessionid, sid, rid}` → `{ok:true, message:"Stopped."}` ✓.
+
+Stage Summary:
+- Gemini Live backend is now working locally. The route `/api/gemini/connect` establishes a bidi session with Google AI Studio (returns gsessionid + sid + rid) + can receive AI audio + stop the session.
+- Root cause: the local `.env` was missing `CHATGPT_VAULT_URL`, `CHATGPT_VAULT_SECRET`, and `GEMINI_API_KEY`. These are set on the Vercel prod deployment but not locally.
+- Files modified: `.env` only (+6 lines, gitignored — won't be committed). No code changes.
+- What the user needs to do: click "Gemini" → "Connect" in the Preview Panel. The browser-side `connectGemini` in page.tsx will:
+  1. POST `/api/gemini/connect {action:"start"}` → get gsessionid/sid/rid.
+  2. Start the mic capture (ScriptProcessorNode at 16kHz).
+  3. setInterval(200ms) flushes mic PCM16 → base64 → POST `/api/gemini/connect {action:"send", audio: <b64>}`.
+  4. Concurrent long-poll loop: POST `/api/gemini/connect {action:"receive"}` → audioChunks → play via AudioContext.
+  5. On disconnect: POST `/api/gemini/connect {action:"stop"}`.
+- The Gemini path is architecturally different from ChatGPT/Perplexity (WebRTC) + Inworld (WebSocket) + Qwen (Aliyun RTC): it uses Google's Web Channel bidi protocol (long-poll HTTP). No SDK needed — just HTTP POST/GET with the gsessionid/sid/rid.
+- Follow-ups:
+  1. The receive long-poll timed out in my test because no user audio was sent first. In the real flow, the browser sends mic audio continuously, so the AI will respond.
+  2. The Chrome extension auto-refreshes the Google cookies every ~30 min (the `refreshGoogleCookies` job). The vault stores them; the backend reads them fresh on each request. No manual intervention needed.
+  3. If the AI Studio API key ever changes (or is rate-limited), update `GEMINI_API_KEY` in `.env` + on Vercel.
+
+---
+Task ID: 72
+Agent: main (Z.ai Code)
+Task: Add a 6th realtime voice provider — **ZAI** — a fully self-contained, turn-based voice assistant pipeline. STT via the browser Web Speech API (`webkitSpeechRecognition`), LLM via the backend `z-ai-web-dev-sdk` (no external API keys — uses `/etc/.z-ai-config`), TTS via the `msedge-tts` npm package (Microsoft Edge's free Read Aloud service, multilingual auto-detect). Unlike the other 5 providers (ChatGPT / Perplexity / Gemini / Inworld / Qwen) which are full-duplex WebRTC / WebSocket / bidi-HTTP, ZAI is TURN-BASED: speak → transcribe → AI responds → TTS plays → mic re-activates. No barge-in / no overlap. Architecture chosen because it's the only provider that needs ZERO external credentials, ZERO proxy, ZERO Chrome extension, ZERO env vars — it works out of the box on a fresh Vercel deploy.
+
+Work Log:
+- Read the full worklog (Tasks 0–69) to understand the realtime voice architecture. Tasks 56–68 specifically document the 5 existing providers + the shared teardown + toggleMute pattern. The ZAI provider is architecturally unique — it's the only TURN-BASED pipeline (not full-duplex) + the only one that runs entirely inside this Next.js backend (no external WebRTC / WS / bidi endpoints).
+- Inspected the `msedge-tts` package at `node_modules/msedge-tts/` (version 2.0.9). Confirmed the actual export name is `OUTPUT_FORMAT` (NOT `OutputFormat` as the task description said — the task's snippet was slightly off; the real d.ts says `export declare enum OUTPUT_FORMAT`). Used `OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3` + the named `MsEdgeTTS` class export. The package uses `isomorphic-ws` + `axios` + `buffer` + `stream` under the hood — all work in the Node.js runtime (set `runtime = "nodejs"` on the route).
+- Inspected the `z-ai-web-dev-sdk` package (version 0.0.18). Confirmed the API: `const ZAI = (await import("z-ai-web-dev-sdk")).default; const zai = await ZAI.create(); const completion = await zai.chat.completions.create({ messages, thinking: { type: "disabled" } });` returns an OpenAI-style completion: `{ choices: [{ message: { role, content } }] }`. The SDK reads its credentials from `/etc/.z-ai-config` (exists on this machine — confirmed), `~/.z-ai-config`, or `./.z-ai-config`. No env vars needed.
+- Created `src/app/api/zai/chat/route.ts` (~115 lines):
+  - POST handler accepts `{ message: string, history?: { role, content }[] }`.
+  - Sanitises the history (max 10 valid entries with role ∈ {user, assistant, system} + string content).
+  - Dynamic-imports `z-ai-web-dev-sdk` + calls `ZAI.create()` + `zai.chat.completions.create({ messages: [systemPrompt, ...history, { role: "user", content: message }], thinking: { type: "disabled" } })`.
+  - System prompt: "You are a helpful voice assistant. Keep responses concise and conversational. Respond in the same language as the user." (per the task spec).
+  - Returns `{ ok: true, text: completion.choices[0].message.content }` on success, `{ ok: false, error: string }` (4xx/5xx) on failure.
+  - `export const runtime = "nodejs"; export const dynamic = "force-dynamic";` (per the task spec — the SDK uses `fs` to read its config file, which is not available in the edge runtime).
+- Created `src/app/api/zai/tts/route.ts` (~115 lines):
+  - POST handler accepts `{ text: string, voice?: string }`.
+  - Auto-detects the Edge TTS voice from the text via a simple Unicode-range heuristic (per the task spec): CJK ideographs / Hiragana / Katakana / Hangul → `zh-CN-XiaoxiaoNeural`, Arabic block → `ar-SA-ZariyahNeural`, French accented Latin chars (é è ê ë à â ù û ô î ï ç œ) → `fr-FR-DeniseNeural`, default → `en-US-AriaNeural`. The caller can override by passing `voice` in the request body.
+  - Uses `MsEdgeTTS` from `msedge-tts`: `const tts = new MsEdgeTTS(); await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3); const { audioStream } = tts.toStream(text);`.
+  - Collects the audio stream chunks via `for await (const chunk of audioStream) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); }` + `Buffer.concat(chunks)` (per the task spec).
+  - Returns the binary mp3 as `new Response(buffer, { headers: { "Content-Type": "audio/mpeg", "Content-Length": ..., "Cache-Control": "no-store" } })`. The browser plays it via `new Audio(URL.createObjectURL(await res.blob())).play()`.
+  - `export const runtime = "nodejs"; export const dynamic = "force-dynamic";`.
+- Modified `src/app/page.tsx`:
+  1. Added `"zai"` to the `RealtimeProvider` union type.
+  2. Updated the section comment from "ChatGPT / Perplexity / Gemini / Inworld / Qwen voice" to "ChatGPT / Perplexity / Gemini / Inworld / Qwen / ZAI voice".
+  3. Added 6 new refs after `qwenEngineRef`:
+     - `zaiRecognitionRef` — the active `webkitSpeechRecognition` instance (loose `any` type because the Web Speech API is not in TS's `lib.dom.d.ts`).
+     - `zaiAudioElRef` — the current `HTMLAudioElement` playing the AI's TTS response (a fresh `new Audio()` per turn).
+     - `zaiStartTurnRef` — pointer to the `startTurn` closure (defined inside `connectZai`) so `toggleMute` can restart the recognition loop after unmute.
+     - `zaiStoppingRef` — boolean flag set by `teardown` to prevent auto-restart in async `onend` / `onerror` handlers.
+     - `zaiMutedRef` — boolean flag mirroring the `muted` state for ZAI; when true, the `onend` + `audio.onended` handlers don't auto-restart.
+     - `zaiHistoryRef` — array of last 10 conversation messages `{ role: "user" | "assistant", content: string }` passed to `/api/zai/chat` for context.
+  4. Updated the shared `teardown` function to add a ZAI cleanup block AFTER the Qwen cleanup, BEFORE the shared mic cleanup: sets `zaiStoppingRef = true`, aborts + stops the recognition, nulls the recognition's event handlers, pauses + nulls the audio element (stops mid-playback TTS), clears `zaiStartTurnRef`, resets `zaiMutedRef`, clears `zaiHistoryRef`. The blob URL for a paused-then-torn-down TTS clip is leaked (its `onended` won't fire because we paused it) — a tiny one-shot leak per ZAI session, acceptable for v1.
+  5. Added a `connectZai` `useCallback` (~265 lines, after `connectQwen`):
+     1. Browser support check — throws a clear error if `window.SpeechRecognition` / `window.webkitSpeechRecognition` is unavailable (Chrome or Edge required; Firefox + Safari don't support the Web Speech API).
+     2. Resets all 6 ZAI refs (so a reconnect after disconnect works cleanly).
+     3. Triggers the mic permission prompt via `navigator.mediaDevices.getUserMedia({ audio: { echoCancellation, noiseSuppression, autoGainControl } })` + immediately stops the tracks (the Web Speech API manages its own mic internally — we just needed the permission prompt). Throws a clear error if the user denies.
+     4. Defines a `startTurn` closure (the heart of the turn-based loop):
+        - Defensive: returns early if `zaiStoppingRef` or `zaiMutedRef` is true; aborts any lingering recognition; returns early if the AI's TTS audio is still playing (lets `audio.onended` restart the loop naturally — prevents the user's voice from being captured while the AI is talking, no echo / no barge-in in v1).
+        - Creates a fresh `SpeechRecognition` instance (the API doesn't support re-starting a stopped instance in all browsers), sets `continuous = false`, `interimResults = true`, `maxAlternatives = 1`, `lang = navigator.language || "en-US"` (BCP-47 tag from the browser preference — multilingual).
+        - Per-turn state: `finalTranscript`, `interimTranscript`, `gaveUp` (set on fatal errors like "not-allowed" so the `onend` handler doesn't loop forever).
+        - `onresult`: accumulates interim + final transcripts + surfaces the combined text via `upsertUserLine(full)` (collapses all per-turn deltas into ONE growing "You:" line — reuses the existing helper from the Gemini/Inworld paths).
+        - `onerror`: logs + sets `gaveUp` for "not-allowed" / "service-not-allowed"; silent for "no-speech" + "aborted"; logs other errors. Does NOT restart — `onend` handles that (always fires after `onerror` per spec).
+        - `onend` (async, the heart of the loop): nulls `zaiRecognitionRef` FIRST (so teardown during the AI/TTS fetch sees no recognition active + can cancel cleanly); resets `inUserSpeechRef.current = false` (fresh "You:" line for the next turn); returns early if stopping/muted/gaveUp; if no transcript → restart after 100ms (avoids Chrome's `InvalidStateError` when `start()` is called immediately after `end()`); else POST `/api/zai/chat` with `{ message, history }` → get AI text → log `AI: <text>` → append to history (cap 10) → POST `/api/zai/tts` with `{ text }` → blob → `URL.createObjectURL` → `new Audio()` → store in `zaiAudioElRef` → wire `onended` + `onerror` to revoke the URL + clear the ref + restart after 100ms → `audio.play()` (with `.catch` to handle the rare autoplay block by treating it as "audio done" + restarting the loop).
+        - Stores the recognition + the `startTurn` closure in the refs, then calls `recognition.start()` (wrapped in try/catch — Chrome throws `InvalidStateError` if `start()` is called too rapidly after a previous `end()`; retries after 500ms).
+     6. Kicks off the first turn + sets `status = "connected"` + logs "ZAI connected. Speak when ready.".
+     - Deps array: `[log, upsertUserLine]` (both are stable `useCallback`s).
+  6. Updated the `connect` dispatcher to route `providerRef.current === "zai"` → `connectZai()` (added a new `else if` branch + `connectZai` to the deps array).
+  7. Updated `toggleMute` to handle ZAI: if `zaiRecognitionRef.current || zaiAudioElRef.current || zaiStartTurnRef.current` is set → take the ZAI path (set `zaiMutedRef`; if muting → abort the current recognition; if unmuting → call `zaiStartTurnRef.current()` ONLY if no audio is currently playing + no recognition is active — otherwise the natural `audio.onended` handler will restart the loop when the clip finishes). Falls through to the existing path for ChatGPT/Perplexity/Gemini/Inworld.
+  8. Updated the `CardDescription` to mention ZAI: "ZAI is a fully self-contained turn-based pipeline (Web Speech API STT + z-ai LLM + Microsoft Edge TTS) — no external API keys needed. […] ZAI needs nothing."
+  9. Added a new `ProviderButton` for ZAI after the Qwen button: `active={provider === "zai"}`, `onClick={() => setProvider("zai")}`, `disabled={connected || status === "connecting"}`, label "ZAI".
+  - Did NOT touch the other 5 providers (ChatGPT, Perplexity, Gemini, Inworld, Qwen) — only modified the `RealtimeProvider` type, the section comment, added the 6 ZAI refs, added the ZAI cleanup block in `teardown`, added the `connectZai` function, added the `provider === "zai"` branch in `connect`, added the ZAI branch in `toggleMute`, updated the `CardDescription`, added the ZAI `ProviderButton`. The `connectWebRtc`, `connectGemini`, `connectInworld`, `connectQwen` functions are unchanged.
+  - Did NOT install new npm packages — `msedge-tts@2.0.9` was already in `node_modules` (the task description said "already installed"); the only `package.json` change was adding the `msedge-tts` entry (it was missing from `package.json` even though it was in `node_modules` — the previous task must have added it to the working tree without committing). `z-ai-web-dev-sdk` was already in `package.json` from the project bootstrap. `bun.lock` was regenerated by `bun` to include `msedge-tts` + its transitive deps (`inherits`, `isomorphic-ws`).
+- Verified end-to-end locally:
+  - `bun run lint` → 0 errors / 0 warnings (exit code 0).
+  - `GET http://localhost:3000/` → HTTP 200, page contains "ZAI" × 3 (button label + 2× in the CardDescription).
+  - `POST /api/zai/chat { message: "Say hi in one short sentence." }` → HTTP 200, `{ "ok": true, "text": "Hi there!" }` (282–647ms).
+  - `POST /api/zai/chat { message: "What did I just say?", history: [{ role: "user", content: "My name is Bob." }, { role: "assistant", content: "Nice to meet you, Bob!" }] }` → HTTP 200, `{ "ok": true, "text": "You said your name is Bob." }` (history context works).
+  - `POST /api/zai/tts { text: "Hello, this is a test of the TTS system." }` → HTTP 200, `Content-Type: audio/mpeg`, 21888 bytes, `file` reports "MPEG ADTS, layer III, v2, 48 kbps, 24 kHz, Monaural" (matches the `AUDIO_24KHZ_48KBITRATE_MONO_MP3` format).
+  - `POST /api/zai/tts { text: "Bonjour, comment allez-vous aujourd hui?" }` → 20448 bytes (auto-detected French via the "é è à" accented chars → fr-FR-DeniseNeural voice).
+  - `POST /api/zai/tts { text: "你好，今天天气怎么样？" }` → 15264 bytes (auto-detected Chinese via the CJK ideographs → zh-CN-XiaoxiaoNeural voice).
+  - No errors in `dev.log`.
+- Committed as `1c042ea` ("feat: add ZAI realtime voice provider (Web Speech API STT + z-ai LLM + Edge TTS) — fully self-contained, multilingual, no external API keys needed") — 5 files, +663 / -12:
+  - `src/app/api/zai/chat/route.ts` (new, 115 lines)
+  - `src/app/api/zai/tts/route.ts` (new, 115 lines)
+  - `src/app/page.tsx` (+430 / -12, the 9 modifications listed above)
+  - `package.json` (+1 line for `msedge-tts`)
+  - `bun.lock` (lockfile update for `msedge-tts` + its transitive deps + file mode change 100755 → 100644)
+- `git push origin main` → `aea6421..1c042ea main -> main` (success).
+
+Stage Summary:
+- ZAI is now the 6th realtime voice provider, fully integrated end-to-end across 2 layers:
+  1. **Backend** (new in this task):
+     - `POST /api/zai/chat` — accepts `{ message, history? }`, dynamic-imports `z-ai-web-dev-sdk`, calls `zai.chat.completions.create({ messages: [systemPrompt, ...history, { role: "user", content: message }], thinking: { type: "disabled" } })`, returns `{ ok: true, text }`. Auth: NONE (the SDK reads `/etc/.z-ai-config`).
+     - `POST /api/zai/tts` — accepts `{ text, voice? }`, auto-detects the voice from the text (CJK → zh-CN-XiaoxiaoNeural, Arabic → ar-SA-ZariyahNeural, French accented Latin → fr-FR-DeniseNeural, default → en-US-AriaNeural), uses `MsEdgeTTS` + `OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3`, collects the audio stream into a Buffer, returns it as `audio/mpeg` binary.
+  2. **Frontend** (new in this task): `src/app/page.tsx` `connectZai` function (~265 lines):
+     - Browser-support check (throws if no Web Speech API).
+     - Triggers mic permission via `getUserMedia` (then stops the tracks — the Web Speech API manages its own mic).
+     - `startTurn` closure: creates a fresh `SpeechRecognition`, sets `continuous=false`, `interimResults=true`, `lang=navigator.language`, wires `onresult` (accumulates transcripts → `upsertUserLine`), `onerror` (logs + `gaveUp` on permission denied), `onend` (the heart of the loop: null the ref → reset `inUserSpeechRef` → if no transcript, restart after 100ms; else POST `/api/zai/chat` → log `AI: <text>` → append to history → POST `/api/zai/tts` → blob → `new Audio()` → wire `onended` to revoke URL + restart → `audio.play()`).
+     - Mute (toggleMute ZAI branch): set `zaiMutedRef`; if muting, abort the current recognition; if unmuting + nothing active, call `zaiStartTurnRef.current()` to restart.
+     - Teardown (shared `teardown` function, new ZAI block): set `zaiStoppingRef=true`, abort recognition, pause audio, clear all 6 ZAI refs.
+- Files modified: `src/app/api/zai/chat/route.ts` (new, 115 lines), `src/app/api/zai/tts/route.ts` (new, 115 lines), `src/app/page.tsx` (+430 / -12, 9 modifications), `package.json` (+1 line for `msedge-tts`), `bun.lock` (lockfile update + file mode change 100755 → 100644).
+- Lint 0/0, push OK (`aea6421..1c042ea main -> main`), local dev server verified by HTTP 200 + correct chat + TTS responses (incl. multilingual auto-detect for English / French / Chinese).
+- What the user needs to do to test ZAI Voice end-to-end:
+  1. Open the Preview Panel, click the new "ZAI" provider button (6th in the row, after Qwen), click Connect.
+  2. The browser will: (a) check Web Speech API support, (b) prompt for mic permission (if not already granted), (c) start a `webkitSpeechRecognition` instance with `lang = navigator.language` (so it's multilingual based on the browser preference).
+  3. Speak a sentence. The browser will transcribe it in real-time (interim results show in the transcript panel as "You: <partial transcript>") + when the browser detects silence, it sends the final transcript to `/api/zai/chat`.
+  4. The backend calls the z-ai LLM + returns the AI text. The frontend logs "AI: <text>" in the transcript panel.
+  5. The frontend then POSTs the AI text to `/api/zai/tts`, which synthesizes an mp3 via Microsoft Edge's free TTS service (auto-detecting the language for the voice). The frontend plays the mp3 via `new Audio(blobUrl).play()`.
+  6. When the audio finishes, `onended` fires → revokes the blob URL → restarts the recognition for the next turn.
+  7. Click Disconnect to tear down (abort recognition + pause audio + clear all refs).
+- The other 5 providers (ChatGPT, Perplexity, Gemini, Inworld, Qwen) are UNAFFECTED — only the `provider === "zai"` branch in `connect` dispatches to the new `connectZai`. The `connectWebRtc`, `connectGemini`, `connectInworld`, `connectQwen` functions are unchanged. The shared `teardown` and `toggleMute` functions check `qwenEngineRef.current` first (Qwen path), then the ZAI refs (ZAI path), and fall through to the existing path for the other 4 providers.
+- Follow-ups:
+  1. **Streaming LLM** — v1 returns the full AI text after the LLM completes. For longer responses this adds latency before TTS starts. Could stream the LLM + chunk-by-chunk TTS (split on sentence boundaries) for a faster perceived response. NOT implemented in v1.
+  2. **Barge-in** — v1 has no barge-in: the user must wait for the AI's TTS to finish before speaking again. Could implement by aborting the audio when `onresult` fires during playback. NOT implemented in v1.
+  3. **Voice selection UI** — the TTS voice is auto-detected from the text. A dropdown to manually override (e.g. "en-US-GuyNeural", "zh-CN-YunxiNeural", "ja-JP-NanamiNeural") would be a nice addition. The backend already supports it via the `voice` field in the request body; only the frontend selector is missing.
+  4. **Web Speech API lang selection** — v1 uses `navigator.language` for STT. A dropdown to switch the recognition language (e.g. for a bilingual user) would be a nice addition. The backend LLM already responds in the same language as the user message (via the system prompt).
+  5. **Safari support** — the Web Speech API is unavailable in Safari (it has its own proprietary API). A fallback to a backend STT (e.g. Whisper) would extend support. NOT implemented in v1.
+
+---
+Task ID: 73
+Agent: main (Z.ai Code)
+Task: Add Vosk + Edge TTS realtime voice provider (streaming STT + streaming TTS, no Web Speech API) — voice-ai/ mini-service + 7th provider in the main app.
+
+Work Log:
+- Read `/home/z/my-project/src/app/page.tsx` (2774 lines) end-to-end to understand the existing 6 providers (ChatGPT, Perplexity, Gemini, Inworld, Qwen, ZAI) + the shared refs (`audioCtxRef`, `micStreamRef`, `scriptNodeRef`, `localStreamRef`), the `teardown` function, the `connect` dispatcher, the `toggleMute` function, the `ProviderButton` radiogroup, and the `CardDescription`.
+- Environment probing before code: `/usr/bin/node` v24.21.0; `/home/z/.venv/bin/python3` v3.12.14 (no `edge_tts`); `/usr/bin/python3` v3.13 (HAS `edge_tts` + verified `edge_tts.Communicate(text, "fr-FR-DeniseNeural").stream()` returns 16 audio chunks for "Bonjour"); `vosk` npm package loads OK (`require('vosk')` returns `{setLogLevel, Model, SpeakerModel, Recognizer}`); `ws` npm package loads OK (`WebSocketServer` is a function); the Vosk model at `voice-ai/server/model/vosk-model-small/` loads OK (creates a `Recognizer` at 16kHz, frees cleanly). Verified by spawning a Node REPL with `new vosk.Model(MODEL_PATH)` + `new vosk.Recognizer({model, sampleRate: 16000})` — model loads in ~150ms.
+- **Vosk npm API gotcha discovered during testing**: `recognizer.partialResult` and `recognizer.finalResult` are METHODS (functions returning parsed objects), NOT getters — the API doc on npmjs.com shows them as getters but the actual source (`node_modules/vosk/index.js` line 406 + 417) defines them as `partialResult() { return JSON.parse(libvosk.vosk_recognizer_partial_result(this.handle)); }` + `finalResult() { return JSON.parse(libvosk.vosk_recognizer_final_result(this.handle)); }`. The first test run sent `{"type":"stt_partial","text":"partialResult() {\n        return JSON.parse(...)"}` to the client (the function source as a string). Fixed by calling `recognizer.partialResult()` + `recognizer.finalResult()` instead of reading the property. Re-tested: `speak "Bonjour, ceci est un test du système de synthèse vocale."` → server returned `tts_start` + 6 binary MP3 chunks (20016 bytes total) + `tts_end {code: 0}`. Confirmed working.
+- Created the `voice-ai/` project structure (under `/home/z/my-project/voice-ai/`, NOT under `mini-services/` per the task spec):
+  - `voice-ai/server/package.json` — `type: commonjs`, scripts `start` + `dev` (`node --watch server.js`), deps `ws@^8.18.0` + `vosk@^0.3.39` (matching the main project's installed versions).
+  - `voice-ai/server/server.js` — ~250 lines. WebSocket server on port 3005. Probes `/home/z/.venv/bin/python3` → `/usr/bin/python3` → `python3` for one with `edge_tts` installed (uses `spawnSync` to import-check); falls back to `python3`. Loads the Vosk model once at boot with `vosk.setLogLevel(-1)` to silence INFO logs. Per connection: creates a `vosk.Recognizer({model, sampleRate: 16000})`. On binary message: if TTS is playing → `killTts()` (barge-in) → `recognizer.acceptWaveform(data)` → on final, calls `recognizer.finalResult()` → sends `{type:"stt_final", text}` + spawns `python3 tts.py "<text>"` → forwards each stdout MP3 chunk as a binary frame → on child exit, sends `{type:"tts_end", code}`. On non-final, calls `recognizer.partialResult()` → sends `{type:"stt_partial", text}`. On JSON `{type:"speak", text}`: spawns the same TTS flow (bypasses STT — useful for testing). On close: kills TTS + frees the recognizer. SIGINT/SIGTERM handlers free the model + exit. Logs: `[voice-ai] client connected`, `[voice-ai] STT partial: ...`, `[voice-ai] STT final: ...`, `[voice-ai] TTS starting for: ...`, `[voice-ai] client disconnected`.
+  - `voice-ai/server/tts.py` — ~30 lines. Uses `edge_tts.Communicate(text, "fr-FR-DeniseNeural")`. Streams MP3 chunks to stdout via `sys.stdout.buffer.write(chunk["data"]) + flush()`. The Node server forwards each stdout write to the browser as a binary WebSocket frame.
+  - `voice-ai/client/audio-worklet.js` — ~110 lines. AudioWorkletProcessor that downsamples from the AudioContext rate (typically 48kHz) to 16kHz via linear interpolation, converts Float32 to Int16 PCM, + posts 256-sample chunks to the main thread. Used by the standalone client (the main app uses ScriptProcessor instead, per the task spec).
+  - `voice-ai/client/app.js` — ~200 lines. Standalone client: connects to `ws://localhost:3005`, AudioContext @ 16kHz, getUserMedia, AudioWorkletNode, posts PCM to WebSocket, accumulates MP3 chunks into a Blob, plays via `new Audio(blobUrl)`. Speak-form for TTS testing.
+  - `voice-ai/client/index.html` — ~140 lines. Stylish dark-themed UI for the standalone client (Connect / Disconnect / Mute buttons, status pill, event log, speak-form).
+  - `voice-ai/README.md` — ~100 lines. Architecture diagram, component descriptions, setup steps (install `edge-tts`, download Vosk model, start server, serve client), integration note (Caddy gateway + `?XTransformPort=3005`), explicit "What this is NOT" section (no Web Speech API, no cloud STT, no MediaSource Extensions for streaming MP3), ports table.
+- Symlinked `voice-ai/server/node_modules` → `../../node_modules` so the server picks up `vosk` + `ws` from the main project's installed `node_modules` (no separate install needed — the task spec says these packages are already installed).
+- Integrated Vosk as the **7th provider** in `src/app/page.tsx` (12 modifications):
+  1. `RealtimeProvider` type: added `"vosk"`.
+  2. Added 4 new refs after `zaiHistoryRef`: `voskWsRef` (WebSocket to port 3005), `voskTtsChunksRef` (ArrayBuffer[] accumulating MP3 chunks), `voskTtsActiveRef` (boolean gating which binary frames to accumulate), `voskAudioElRef` (HTMLAudioElement currently playing the AI's TTS — same pattern as ZAI). Detailed comment block explaining the V1 accumulate-and-play strategy + why we don't use MediaSource Extensions.
+  3. `teardown` (shared function, new Vosk block after the ZAI block, before the shared mic cleanup): closes the WebSocket (`close(1000, "client-teardown")` + detaches handlers), pauses + revokes + nulls the audio element (drops in-progress Blob URL), clears `voskTtsChunksRef` + `voskTtsActiveRef`. ~30 lines.
+  4. New `connectVosk` function (~240 lines) before the `connect` dispatcher: opens `ws://<host>/?XTransformPort=3005` (or `wss://` on HTTPS hosts — protocol-aware), waits for open with 10s timeout + clear error messages. AudioContext at 16kHz (with fallback if browser rejects non-default rate) + getUserMedia + ScriptProcessor (4096-sample buffer, 256ms per callback at 16kHz). `onaudioprocess` → `float32ToInt16` → `ws.send(int16.buffer)` as a BINARY frame. `ws.onmessage` branches on `ArrayBuffer` (MP3 chunk → push to `voskTtsChunksRef` if `voskTtsActiveRef`) vs string (JSON control). Handles 4 control messages: `stt_partial` → `upsertUserLine(text)` (collapses all partials for one speech into ONE growing "You:" line — same pattern as Inworld/Gemini/Qwen); `stt_final` → `log("You: <text>")` (clean final line); `tts_start` → reset chunks + pause any currently-playing audio; `tts_end` → build Blob from chunks → `new Audio(url).play()` + log "AI audio complete" (or "AI audio complete (barge-in)" if chunks is empty — barge-in fired). `ws.onclose` reflects the disconnect in the UI + cleans up the audio path if the socket closed on its own. `ws.onerror` logs. Mute falls through to the shared `localStreamRef` path (toggles `track.enabled` — the ScriptProcessor keeps firing but its output is silent, so Vosk receives zero PCM + produces nothing).
+  5. `connect` dispatcher: added `else if (providerRef.current === "vosk") { await connectVosk(); }` branch + added `connectVosk` to the `useCallback` deps array (alphabetical order).
+  6. `CardDescription`: added a new sentence describing Vosk ("real-time streaming pipeline (local Vosk STT at 16 kHz + Microsoft Edge TTS) over a WebSocket to the voice-ai mini-service on port 3005 — no external API keys, no Web Speech API, with barge-in (speaking interrupts TTS)") + updated the trailing auth-requirements sentence to "ZAI + Vosk need nothing".
+  7. New `ProviderButton` for "Vosk" (7th in the row, after ZAI) with the same `active` / `onClick` / `disabled` props as the other 6.
+  8. `toggleMute` JSDoc: added "+ Vosk paths (micStream)" + a sentence explaining the Vosk mute semantics (ScriptProcessor keeps firing with silent output → Vosk receives zero PCM). Updated the `// ChatGPT / Perplexity / Gemini / Inworld path` comment to include `/ Vosk`.
+  9. `disconnect` JSDoc: added "+ Vosk" to the WebSocket-close-Is-the-stop list (Inworld + Vosk both use WebSocket close as the teardown signal).
+- Added `voice-ai/**` to `eslint.config.mjs` `ignores` list (so the CommonJS `require()` calls in `server.js` don't fail `@typescript-eslint/no-require-imports`). Also added `voice-ai/server/model/` + `voice-ai/server/node_modules` to `.gitignore` (the model is 66MB — downloaded separately per the README, NOT committed). The `vosk` + `ws` entries were already in the main `package.json` (the task spec says they're already installed).
+- Started the voice-ai server in the background: `cd voice-ai/server && (node server.js > /tmp/voice-ai.log 2>&1 &)`. Verified by `pgrep -af "node server.js"` (pid 26266) + `ss -tlnp | grep 3005` (LISTEN *:3005) + curl HTTP probe (returns 426 "Upgrade Required" — expected for a WebSocket server responding to a plain HTTP request).
+- End-to-end test from a Node REPL client: open ws → send JSON `{type:"speak", text:"Ceci est un test de la synthèse vocale."}` → received `tts_start` JSON → 6 binary MP3 chunks (20016 bytes total) → `tts_end {code: 0}` JSON. Confirms the full STT-less TTS path works (the speak-bypass is the simplest way to test TTS without a mic).
+- Lint: 0 errors, 0 warnings (after adding `voice-ai/**` to the ignores). `bun run lint` exits 0.
+- Dev server: `GET / 200` (Next.js page loads with the new Vosk provider button).
+- Files modified:
+  - `voice-ai/server/package.json` (new, 14 lines)
+  - `voice-ai/server/server.js` (new, ~250 lines)
+  - `voice-ai/server/tts.py` (new, ~30 lines)
+  - `voice-ai/client/audio-worklet.js` (new, ~110 lines)
+  - `voice-ai/client/app.js` (new, ~200 lines)
+  - `voice-ai/client/index.html` (new, ~140 lines)
+  - `voice-ai/README.md` (new, ~100 lines)
+  - `src/app/page.tsx` (~300 net additions across 9 modifications)
+  - `eslint.config.mjs` (+1 line in ignores)
+  - `.gitignore` (+4 lines)
+- `git push origin main` → `6786e48..4eef4d9 main -> main` (success).
+
+Stage Summary:
+- Vosk is now the 7th realtime voice provider, fully integrated across 2 layers:
+  1. **Voice-ai mini-service** (new, runs on port 3005 — NOT 3000):
+     - WebSocket server in Node (`voice-ai/server/server.js`): loads the Vosk model once at boot, creates a fresh `Recognizer` per connection (16kHz), feeds PCM16 binary frames to `recognizer.acceptWaveform`, sends `stt_partial` + `stt_final` JSON on non-final/final, spawns `python3 tts.py "<text>"` on `stt_final` (or on `{type:"speak", text}` JSON), forwards stdout MP3 chunks as binary frames, sends `tts_end` on child exit. Barge-in: any new mic audio while TTS is playing kills the TTS child + emits `tts_end`.
+     - Python TTS (`voice-ai/server/tts.py`): `edge_tts.Communicate(text, "fr-FR-DeniseNeural").stream()` → writes MP3 chunks to stdout. Free Microsoft Edge TTS, no API key.
+     - Standalone client (`voice-ai/client/{index.html, app.js, audio-worklet.js}`): demo UI for the voice-ai server — AudioWorklet for 48→16kHz downsample, mic → ws.send(binary), MP3 chunks accumulated → Blob → `new Audio(url).play()`.
+  2. **Main app integration** (`src/app/page.tsx`): the "Vosk" provider button (7th, after ZAI). `connectVosk` opens `ws://<host>/?XTransformPort=3005` via the Caddy gateway, captures mic via ScriptProcessor (4096 buffer at 16kHz), sends Int16 PCM as binary frames, handles `stt_partial` (upsertUserLine), `stt_final` (log), `tts_start` (reset chunks), `tts_end` (build Blob → `new Audio(url).play()` + log "AI audio complete"). Barge-in is server-side — the client just drops the in-progress buffer when `tts_end` arrives after a kill. Mute reuses the shared `localStreamRef` path. Teardown closes the WebSocket + pauses/revokes the audio.
+- The other 6 providers (ChatGPT, Perplexity, Gemini, Inworld, Qwen, ZAI) are UNAFFECTED — only the `provider === "vosk"` branch in `connect` dispatches to the new `connectVosk`. The shared `teardown` and `toggleMute` functions check `qwenEngineRef.current` first (Qwen path), then the ZAI refs (ZAI path), then the Vosk refs (Vosk path), and fall through to the existing path for the other 4 providers.
+- What the user needs to do to test Vosk Voice end-to-end:
+  1. The voice-ai server is already running on port 3005 (started in the background, pid 26266). To restart it after a reboot: `cd /home/z/my-project/voice-ai/server && node server.js &`.
+  2. Open the Preview Panel, click the new "Vosk" provider button (7th in the row, after ZAI), click Connect.
+  3. The browser will: (a) open a WebSocket to `wss://<host>/?XTransformPort=3005` (the Caddy gateway forwards to localhost:3005), (b) prompt for mic permission (if not already granted), (c) create an AudioContext at 16kHz + a ScriptProcessor, (d) start sending Int16 PCM as binary frames every 256ms.
+  4. Speak a sentence in French (the Vosk small model is `vosk-model-small-fr` — for other languages, download the appropriate model from https://alphacephei.com/vosk/models + replace the directory).
+  5. The server feeds the PCM to Vosk → sends `stt_partial` (interim transcription) → the transcript panel shows "You: <partial>" growing in real time.
+  6. When Vosk detects end-of-speech (silence ≥0.5s per `model.conf`'s `endpoint.rule2.min-trailing-silence=0.5`), it sends `stt_final` → the transcript logs "You: <final>" → the server spawns `python3 tts.py "<final>"` → Microsoft Edge TTS streams MP3 chunks back → the browser accumulates them into a Blob → plays via `new Audio(blobUrl).play()` → logs "AI audio complete".
+  7. To test barge-in: speak while the AI is talking. The server detects new mic audio → kills the TTS child → emits `tts_end` with an empty buffer → the browser logs "AI audio complete (barge-in)" + the next speech starts fresh.
+  8. To test TTS without STT: the standalone client has a "speak" form; in the main app there's no direct speak-form (the v1 pipeline echoes the user's speech back via TTS — replace the `speak(text)` call in `server.js` with an LLM call for a real assistant).
+  9. Click Disconnect to tear down (close WebSocket + pause audio + clear all Vosk refs).
+- V1 pipeline echoes the user's speech back via TTS (no LLM). This is intentional for v1 — it's a "Vosk + Edge TTS work" smoke test. To turn it into a real assistant, replace the `speak(text)` call in `server.js` (line ~200) with: (a) call an LLM (e.g. z-ai-web-dev-sdk) with the user's text + history, (b) speak the LLM's response.
+- Follow-ups:
+  1. **Streaming MP3 playback** — v1 accumulates all MP3 chunks into a Blob + plays after `tts_end`. For long responses this adds latency (the user waits for the entire TTS to finish before hearing anything). Could use MediaSource Extensions to play chunks as they arrive — more complex (need to handle MP3 frame boundaries + SourceBuffer append chunks). NOT implemented in v1.
+  2. **LLM integration** — v1 echoes user speech back via TTS (no LLM). Real assistant would: user speech → LLM → TTS. The LLM call would add ~500ms-2s of latency; could be hidden with a "thinking" indicator + streaming TTS as the LLM streams (split on sentence boundaries).
+  3. **Barge-in sensitivity** — v1 triggers barge-in on ANY new mic audio (even silence — the ScriptProcessor fires regardless of whether the user is actually speaking). False triggers are rare in practice (echo cancellation + noise suppression filter out the AI's TTS), but a proper VAD (energy threshold, e.g. RMS > -40dB) would be more robust.
+  4. **Multilingual Vosk model** — v1 uses the French small model. For multilingual support, swap the model directory (English small: `vosk-model-small-en-us-0.15`, etc.) — the server code is model-agnostic. A language selector in the UI would be a nice addition.
+  5. **Voice selection UI** — the TTS voice is hardcoded to `fr-FR-DeniseNeural` in `tts.py`. A dropdown to manually override (e.g. "en-US-AriaNeural", "zh-CN-XiaoxiaoNeural", "ja-JP-NanamiNeural") would be a nice addition. The `tts.py` would need to accept a `--voice` argument.

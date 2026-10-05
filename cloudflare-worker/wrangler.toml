@@ -1,0 +1,13 @@
+name = "chatgpt-jwt-vault"
+main = "jwt-vault.js"
+compatibility_date = "2024-12-01"
+
+# KV namespace binding — the ID must match the existing deployment
+# (found in the Cloudflare dashboard or via `wrangler kv:namespace list`)
+[[kv_namespaces]]
+binding = "JWT_VAULT"
+id = "6dba97e7b8a24e0ab9d17cd6e7e5f7ab"
+
+# Secret text binding — the vault secret (X-Vault-Secret header value)
+[vars]
+BACKEND_URL = "https://ace-studio-orcin.vercel.app"

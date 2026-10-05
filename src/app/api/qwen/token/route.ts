@@ -233,17 +233,25 @@ export async function POST(req: Request) {
   }
 
   // Return the full Aliyun RTC credentials to the browser. The browser
-  // will use the Qwen Omni SDK (or Aliyun RTC SDK directly) to join the
-  // channel with these credentials.
+  // will use the Aliyun RTC SDK to join the channel with these credentials.
+  // CRITICAL: `timestamp` and `nonce` MUST be passed through from Qwen's
+  // response — the Aliyun RTC SDK validates the `token` against the
+  // `timestamp` + `nonce` cryptographically. Using `Date.now()` as the
+  // timestamp (the initial implementation) caused "Signaling connect failed"
+  // because the token was issued for a specific timestamp.
   return NextResponse.json({
     ok: true,
-    // Aliyun RTC credentials (the browser uses these to join the channel).
-    rtc_token: dataObj.token as string,
+    // Aliyun RTC auth info (the browser passes these to joinChannel).
+    rtc_token: (dataObj.token as string) ?? "",
     rtc_channel: (dataObj.channel as string) ?? "",
     rtc_app_id: (dataObj.app_id as string) ?? "",
-    rtc_gslb: (dataObj.gslb as string) ?? "",
     rtc_user_id_client: (dataObj.user_id_client as string) ?? "",
     rtc_user_id_voicechat: (dataObj.user_id_voicechat as string) ?? "",
+    // CRITICAL — pass through Qwen's timestamp + nonce (the token is bound
+    // to these; using a different timestamp → "Signaling connect failed").
+    rtc_timestamp: (dataObj.timestamp as number) ?? 0,
+    rtc_nonce: (dataObj.nonce as string) ?? "",
+    rtc_gslb: (dataObj.gslb as string) ?? "",
     // Session metadata.
     chat_id: (dataObj.chat_id as string) ?? "",
     times_left: dataObj.times_left ?? null,

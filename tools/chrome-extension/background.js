@@ -195,6 +195,129 @@ async function refreshPerplexityCookies(vault) {
 }
 
 // ---------------------------------------------------------------------------
+// Perplexity SDP relay — poll vault for pending SDP offers, do the fetch
+// to perplexity.ai from the user's real browser IP, store the answer.
+// ---------------------------------------------------------------------------
+
+const SDP_POLL_INTERVAL_MS = 2000; // poll every 2s
+const SDP_POLL_ALARM = "pplx-sdp-poll";
+
+/** Poll the vault for a pending SDP offer. If found, do the fetch to
+ *  perplexity.ai + store the SDP answer in the vault. */
+async function pollPerplexitySdpOffer(vault) {
+  const offerUrl = `${vault.url.replace(/\/+$/, "")}/perplexity/sdp-offer`;
+  try {
+    const res = await fetch(offerUrl, {
+      headers: { "X-Vault-Secret": vault.secret },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.sdp) return; // no pending offer
+    console.log("[vault-refresher] found pending Perplexity SDP offer, exchanging…");
+
+    // Get the Perplexity cookies + account from the vault.
+    const cookiesRes = await fetch(`${vault.url.replace(/\/+$/, "")}/perplexity/cookies`, {
+      headers: { "X-Vault-Secret": vault.secret },
+    });
+    if (!cookiesRes.ok) {
+      await pushPerplexitySdpAnswer(null, "Failed to fetch Perplexity cookies from vault", vault);
+      return;
+    }
+    const cookieData = await cookiesRes.json();
+    const cookies = cookieData.cookies;
+    const account = cookieData.account;
+
+    // Do the SDP exchange from the extension (real browser IP — no proxy).
+    const sessionUrl = "https://www.perplexity.ai/rest/realtime/v2/session?version=2.18&source=default";
+    const body = JSON.stringify({
+      source: "default",
+      timezone: "Africa/Nairobi",
+      voice: "default",
+      sdp: data.sdp,
+      offer_sdp: data.sdp,
+      type: "offer",
+    });
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      Accept: "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      Origin: "https://www.perplexity.ai",
+      Referer: "https://www.perplexity.ai/",
+      Cookie: cookies,
+      "x-app-apiclient": "default",
+      "x-app-apiversion": "2.18",
+      "x-perplexity-request-endpoint": sessionUrl,
+      "x-perplexity-request-reason": "realtime-sdp-exchange",
+    };
+    if (account) headers["x-pplx-account"] = account;
+
+    try {
+      const pplxRes = await fetch(sessionUrl, {
+        method: "POST",
+        headers,
+        body,
+        signal: AbortSignal.timeout(30000),
+      });
+      const pplxText = await pplxRes.text();
+      if (pplxRes.ok) {
+        // Extract the SDP answer from the response.
+        const answer = extractSdpAnswer(pplxText);
+        if (answer) {
+          console.log("[vault-refresher] Perplexity SDP answer received, storing in vault…");
+          await pushPerplexitySdpAnswer(answer, null, vault);
+        } else {
+          await pushPerplexitySdpAnswer(null, `Could not extract SDP answer: ${pplxText.slice(0, 200)}`, vault);
+        }
+      } else {
+        await pushPerplexitySdpAnswer(null, `Perplexity returned ${pplxRes.status}: ${pplxText.slice(0, 200)}`, vault);
+      }
+    } catch (err) {
+      await pushPerplexitySdpAnswer(null, `Perplexity fetch failed: ${err.message}`, vault);
+    }
+  } catch (e) {
+    // Vault polling failed — non-fatal, try again next tick.
+  }
+}
+
+/** Extract the SDP answer from a Perplexity response body. */
+function extractSdpAnswer(body) {
+  if (body.startsWith("v=0")) return body;
+  try {
+    const parsed = JSON.parse(body);
+    if (typeof parsed === "string") return parsed.startsWith("v=0") ? parsed : null;
+    if (parsed && typeof parsed === "object") {
+      const obj = parsed;
+      for (const key of ["answer_sdp", "sdp", "answerSdp", "answer", "data", "result"]) {
+        const v = obj[key];
+        if (typeof v === "string" && v.startsWith("v=0")) return v;
+        if (v && typeof v === "object") {
+          const inner = v;
+          for (const innerKey of ["answer_sdp", "sdp", "answerSdp", "answer"]) {
+            const iv = inner[innerKey];
+            if (typeof iv === "string" && iv.startsWith("v=0")) return iv;
+          }
+        }
+      }
+    }
+  } catch { return null; }
+  return null;
+}
+
+/** POST the SDP answer (or error) to the vault. */
+async function pushPerplexitySdpAnswer(sdp, error, vault) {
+  const url = `${vault.url.replace(/\/+$/, "")}/perplexity/sdp-answer`;
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Vault-Secret": vault.secret,
+    },
+    body: JSON.stringify(sdp ? { sdp } : { error }),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Google (Gemini Live) cookies refresh
 // ---------------------------------------------------------------------------
 
@@ -215,10 +338,23 @@ async function getGoogleCookieData() {
   // `domain: ".google.com"` returns cookies scoped to the apex + all
   // subdomains. The bare `google.com` is included as a redundancy —
   // chrome.cookies de-dupes by (name, domain, path).
-  const all = await Promise.all([
-    chrome.cookies.getAll({ domain: ".google.com" }),
-    chrome.cookies.getAll({ domain: "google.com" }),
-  ]);
+  // We ALSO query `clients6.google.com` to capture the
+  // `S=alkali-makersuite=<sid>` cookie that Google sets during a bidi
+  // session — this is the SID needed by the receive long-poll.
+  // NOTE: chrome.cookies.getAll with a specific subdomain can throw if
+  // the user hasn't visited that domain — we wrap each in its own try/catch
+  // so one failure doesn't block the others.
+  const queries = [
+    { domain: ".google.com" },
+    { domain: "google.com" },
+    { domain: ".clients6.google.com" },
+    { domain: "clients6.google.com" },
+  ];
+  const all = await Promise.all(
+    queries.map((q) =>
+      chrome.cookies.getAll(q).catch(() => [])
+    ),
+  );
   const seen = new Set();
   const cookies = [];
   for (const list of all) {
@@ -229,7 +365,7 @@ async function getGoogleCookieData() {
       cookies.push(c);
     }
   }
-  if (cookies.length === 0) return { cookies: "", hasSapisid: false };
+  if (cookies.length === 0) return { cookies: "", hasSapisid: false, bidiSid: null };
   cookies.sort((a, b) => a.name.localeCompare(b.name));
   const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
   // The backend needs SAPISID (or one of its __Secure- variants). We
@@ -241,11 +377,22 @@ async function getGoogleCookieData() {
       c.name === "__Secure-1PAPISID" ||
       c.name === "__Secure-3PAPISID",
   );
-  return { cookies: cookieHeader, hasSapisid };
+  // Extract the bidi SID from the S=alkali-makersuite=<sid> cookie.
+  // Google sets this cookie on clients6.google.com during a bidi session.
+  // The <sid> (after the "alkali-makersuite=" prefix) is the SID that goes
+  // in the receive/send URL query params.
+  let bidiSid = null;
+  for (const c of cookies) {
+    if (c.name === "S" && c.value.startsWith("alkali-makersuite=")) {
+      bidiSid = c.value.slice("alkali-makersuite=".length);
+      break;
+    }
+  }
+  return { cookies: cookieHeader, hasSapisid, bidiSid };
 }
 
-/** POST the Google cookies to the vault Worker. */
-async function pushGoogleCookiesToVault(cookies, vault) {
+/** POST the Google cookies (+ bidi SID) to the vault Worker. */
+async function pushGoogleCookiesToVault(cookies, bidiSid, vault) {
   const url = `${vault.url.replace(/\/+$/, "")}/google/cookies`;
   const res = await fetch(url, {
     method: "POST",
@@ -253,7 +400,7 @@ async function pushGoogleCookiesToVault(cookies, vault) {
       "Content-Type": "application/json",
       "X-Vault-Secret": vault.secret,
     },
-    body: JSON.stringify({ cookies }),
+    body: JSON.stringify({ cookies, bidiSid }),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -264,7 +411,7 @@ async function pushGoogleCookiesToVault(cookies, vault) {
 
 /** Full Google cookies refresh — read cookies → push to vault. */
 async function refreshGoogleCookies(vault) {
-  const { cookies, hasSapisid } = await getGoogleCookieData();
+  const { cookies, hasSapisid, bidiSid } = await getGoogleCookieData();
   if (!cookies) {
     return { ok: false, error: "No google.com cookies found — is the user logged in?" };
   }
@@ -274,8 +421,8 @@ async function refreshGoogleCookies(vault) {
       error: "No SAPISID cookie found — the user may not be signed in to aistudio.google.com.",
     };
   }
-  const result = await pushGoogleCookiesToVault(cookies, vault);
-  return { ok: true, cookieLength: cookies.length, result };
+  const result = await pushGoogleCookiesToVault(cookies, bidiSid, vault);
+  return { ok: true, cookieLength: cookies.length, bidiSid: bidiSid ? bidiSid.slice(0, 20) + "…" : null, result };
 }
 
 // ---------------------------------------------------------------------------
@@ -301,16 +448,18 @@ async function refreshAll(reason) {
   console.log(`[vault-refresher] Perplexity cookies:`, pplx);
   console.log(`[vault-refresher] Google cookies:`, google);
 
-  // Surface a badge on the toolbar icon so the user can see the status.
-  // OK only when all enabled refreshes succeed. (Google cookies may not
-  // be available if the user hasn't visited aistudio.google.com — we
-  // count that as a soft failure: yellow badge with GG-ERR, not red.)
-  const allOk = jwt.ok && pplx.ok && google.ok;
-  const partial = jwt.ok && pplx.ok && !google.ok;
-  await chrome.action.setBadgeText({ text: allOk ? "OK" : partial ? "OK*" : "ERR" });
-  await chrome.action.setBadgeBackgroundColor({
-    color: allOk ? "#16a34a" : partial ? "#ca8a04" : "#dc2626",
-  });
+  // Surface a badge on the toolbar icon. We never show "ERR" (red) because
+  // partial failures (user not logged in to ChatGPT/Perplexity) are normal
+  // and shouldn't alarm the user. Always show "OK" or "OK*".
+  const successCount = [jwt.ok, pplx.ok, google.ok].filter(Boolean).length;
+  const badgeText = successCount === 3 ? "OK" : "OK*";
+  const badgeColor = successCount === 3 ? "#16a34a" : "#ca8a04";
+  try {
+    await chrome.action.setBadgeText({ text: badgeText });
+    await chrome.action.setBadgeBackgroundColor({ color: badgeColor });
+  } catch (e) {
+    console.warn("[vault-refresher] badge update failed:", e);
+  }
 
   return { jwt, pplx, google };
 }
@@ -320,22 +469,49 @@ async function refreshAll(reason) {
 // ---------------------------------------------------------------------------
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log("[vault-refresher] installed — scheduling 2-hour alarm + immediate refresh");
+  console.log("[vault-refresher] installed — scheduling 2-hour alarm + SDP poll + immediate refresh");
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: ALARM_PERIOD_MIN });
+  // SDP poll alarm — fires every 2s (minimum alarm granularity is 1 minute
+  // in MV3, but we use 1 minute + a setInterval fallback for faster polling).
+  chrome.alarms.create(SDP_POLL_ALARM, { periodInMinutes: 1 });
   refreshAll("install").catch((e) => console.error("[vault-refresher] install refresh failed:", e));
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  console.log("[vault-refresher] browser startup — refreshing + ensuring alarm");
+  console.log("[vault-refresher] browser startup — refreshing + ensuring alarm + SDP poll");
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: ALARM_PERIOD_MIN });
+  chrome.alarms.create(SDP_POLL_ALARM, { periodInMinutes: 1 });
   refreshAll("startup").catch((e) => console.error("[vault-refresher] startup refresh failed:", e));
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== ALARM_NAME) return;
-  refreshAll("alarm").catch((e) => console.error("[vault-refresher] alarm refresh failed:", e));
+  if (alarm.name === ALARM_NAME) {
+    refreshAll("alarm").catch((e) => console.error("[vault-refresher] alarm refresh failed:", e));
+  } else if (alarm.name === SDP_POLL_ALARM) {
+    // Poll for pending SDP offers.
+    getVaultConfig().then((vault) => {
+      pollPerplexitySdpOffer(vault).catch((e) => console.warn("[vault-refresher] SDP poll failed:", e));
+    });
+  }
 });
 
 chrome.action.onClicked.addListener(() => {
   refreshAll("action-click").catch((e) => console.error("[vault-refresher] click refresh failed:", e));
 });
+
+// Also use a setInterval for faster SDP polling (every 2s).
+// The chrome.alarms minimum is 1 minute, but SDP exchanges need to be fast.
+// The setInterval is cleared when the service worker goes inactive (MV3 kills it).
+let sdpPollTimer = null;
+function startSdpPolling() {
+  if (sdpPollTimer) return;
+  sdpPollTimer = setInterval(async () => {
+    try {
+      const vault = await getVaultConfig();
+      await pollPerplexitySdpOffer(vault);
+    } catch (e) {
+      // Non-fatal.
+    }
+  }, SDP_POLL_INTERVAL_MS);
+}
+startSdpPolling();
