@@ -2706,9 +2706,13 @@ function RealtimeChat() {
    *       `TextDecoder` + `JSON.parse`, then dispatch on `msg.type` /
    *       `msg.role` (user transcript → `upsertUserLine`; AI response
    *       → append to the AI: line).
-   *    8. POST `https://agent.theten.ai/api/agents/start` with the
-   *       `va_azure_v2v` graph (Azure OpenAI voice assistant) — starts the
-   *       AI agent which joins the channel as a remote user. Some
+   *    8. POST `/api/ten/start` (server-side proxy to
+   *       `agent.theten.ai/api/agents/start`) with the `va_azure_v2v`
+   *       graph (Azure OpenAI voice assistant) — starts the AI agent
+   *       which joins the channel as a remote user. We use a same-origin
+   *       proxy (not a direct browser fetch) because agent.theten.ai
+   *       does not send CORS headers allowing our origin — a direct
+   *       browser POST fails with a generic "Failed to fetch". Some
    *       graphs auto-start on join, but the explicit start is
    *       required for `va_azure_v2v`. Fire-and-forget — non-fatal
    *       if it fails (the user can still hear any auto-started AI).
@@ -2892,23 +2896,31 @@ function RealtimeChat() {
 
     // 7. Start the AI agent. Some graphs auto-start on channel join,
     //    but the explicit start is required for `va_azure_v2v`
-    //    (the OpenAI voice assistant graph). The agent joins the
+    //    (the Azure OpenAI voice assistant graph). The agent joins the
     //    channel as a remote user after a brief delay + fires the
-    //    `user-published` handler above. Fire-and-forget — non-fatal
-    //    if it fails (some deployments auto-start on join).
+    //    `user-published` handler above.
+    //
+    //    IMPORTANT: this goes through our own `/api/ten/start` route
+    //    (server-side proxy to agent.theten.ai/api/agents/start), NOT
+    //    a direct browser fetch. A direct cross-origin POST to
+    //    agent.theten.ai from the browser fails with a generic
+    //    "Failed to fetch" because agent.theten.ai does not send CORS
+    //    headers allowing our origin. Server-to-server requests are
+    //    not subject to CORS, so the proxy is the correct fix.
+    //    Fire-and-forget — non-fatal if it fails (some graphs
+    //    auto-start on join).
     try {
-      await fetch("https://agent.theten.ai/api/agents/start", {
+      await fetch("/api/ten/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          request_id: crypto.randomUUID(),
           channel_name: tokenData.channel,
           user_uid: tokenData.uid,
           graph_name: "va_azure_v2v", // Azure OpenAI voice assistant (default)
           language: "en-US",
           voice_type: "male",
         }),
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.timeout(20_000),
       });
       log("[ten] started AI agent (graph: va_azure_v2v).");
     } catch (err) {
