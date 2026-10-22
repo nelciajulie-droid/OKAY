@@ -182,11 +182,58 @@ const CHATGPT_VOICES = [
   "verse",
 ] as const;
 
+// TEN Agent (theten.ai) — language + voice-type options for the
+// `va_azure_v2v` / `va_openai_v2v` graphs (Azure / OpenAI voice
+// assistant). IMPORTANT: the theten.ai PUBLIC deployment only
+// pre-configured 4 STT languages — `en-US`, `zh-CN`, `ja-JP`, `ko-KR`.
+// Other BCP-47 tags (`fr-FR`, `es-ES`, `de-DE`, `it-IT`, `pt-BR`, …)
+// return HTTP 500 "Internal Server Error" from agent.theten.ai (tested
+// across both graphs + multiple voice_types). If you speak a language
+// not in this list, use the ZAI provider instead — it uses the Web
+// Speech API which respects `navigator.language` (so a French browser
+// transcribes French). The `voice_type` field sets the TTS voice
+// gender. Both are forwarded to `/api/ten/start` which proxies to
+// `agent.theten.ai/api/agents/start`.
+const TEN_LANGUAGES = [
+  { value: "en-US", label: "English (US)" },
+  { value: "zh-CN", label: "中文 (简体)" },
+  { value: "ja-JP", label: "日本語" },
+  { value: "ko-KR", label: "한국어" },
+] as const;
+
+// TEN voice graphs offered by theten.ai that accept the same
+// `{ channel_name, user_uid, graph_name, language, voice_type }` body
+// shape. `va_azure_v2v` = Azure OpenAI voice assistant (default);
+// `va_openai_v2v` = OpenAI voice assistant. Both support the same 4
+// languages listed above. Other graphs (`va_elevenlabs_v2v`,
+// `va_coqui_v2v`) need a different body shape (`voice_id` instead of
+// `voice_type`) and are NOT included here — they return
+// `code:10100, msg:"process property json failed"` with this body.
+const TEN_GRAPHS = [
+  { value: "va_azure_v2v", label: "Azure OpenAI" },
+  { value: "va_openai_v2v", label: "OpenAI" },
+] as const;
+
+const TEN_VOICE_TYPES = ["male", "female"] as const;
+
 type ConnectionStatus = "idle" | "connecting" | "connected" | "error";
 
 function RealtimeChat() {
   const [provider, setProvider] = useState<RealtimeProvider>("chatgpt");
   const [voice, setVoice] = useState<(typeof CHATGPT_VOICES)[number]>("alloy");
+  // TEN Agent graph + language + voice-type — the STT language MUST
+  // match the language the user is actually speaking or the Azure/OpenAI
+  // voice assistant transcribes garbage. NOTE: theten.ai only supports
+  // 4 languages (en-US, zh-CN, ja-JP, ko-KR) — see TEN_LANGUAGES above.
+  // Defaults to `va_azure_v2v` / `en-US` / `male` (the previous hardcoded
+  // values) — users who speak another language switch via the
+  // dropdowns before clicking Connect.
+  const [tenGraph, setTenGraph] =
+    useState<(typeof TEN_GRAPHS)[number]["value"]>("va_azure_v2v");
+  const [tenLanguage, setTenLanguage] =
+    useState<(typeof TEN_LANGUAGES)[number]["value"]>("en-US");
+  const [tenVoiceType, setTenVoiceType] =
+    useState<(typeof TEN_VOICE_TYPES)[number]>("male");
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -199,6 +246,13 @@ function RealtimeChat() {
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const voiceRef = useRef(voice);
   const providerRef = useRef(provider);
+  // TEN graph + language + voice-type refs — `connectTen` reads these
+  // at call time so changing the dropdowns while connected has no
+  // effect (you must Disconnect + reconnect to apply a new graph /
+  // language / voice).
+  const tenGraphRef = useRef(tenGraph);
+  const tenLanguageRef = useRef(tenLanguage);
+  const tenVoiceTypeRef = useRef(tenVoiceType);
 
   // Refs that don't trigger re-renders — Gemini bidi + Inworld WebSocket
   // (both use a 16kHz AudioContext + ScriptProcessor for mic PCM16 capture
@@ -313,6 +367,15 @@ function RealtimeChat() {
   useEffect(() => {
     providerRef.current = provider;
   }, [provider]);
+  useEffect(() => {
+    tenLanguageRef.current = tenLanguage;
+  }, [tenLanguage]);
+  useEffect(() => {
+    tenVoiceTypeRef.current = tenVoiceType;
+  }, [tenVoiceType]);
+  useEffect(() => {
+    tenGraphRef.current = tenGraph;
+  }, [tenGraph]);
 
   const log = useCallback((line: string) => {
     setTranscript((t) => [...t.slice(-200), `[${new Date().toLocaleTimeString()}] ${line}`]);
@@ -2910,19 +2973,42 @@ function RealtimeChat() {
     //    Fire-and-forget — non-fatal if it fails (some graphs
     //    auto-start on join).
     try {
-      await fetch("/api/ten/start", {
+      const graph = tenGraphRef.current;
+      const lang = tenLanguageRef.current;
+      const vtype = tenVoiceTypeRef.current;
+      const startRes = await fetch("/api/ten/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           channel_name: tokenData.channel,
           user_uid: tokenData.uid,
-          graph_name: "va_azure_v2v", // Azure OpenAI voice assistant (default)
-          language: "en-US",
-          voice_type: "male",
+          graph_name: graph,
+          language: lang,
+          voice_type: vtype,
         }),
         signal: AbortSignal.timeout(20_000),
       });
-      log("[ten] started AI agent (graph: va_azure_v2v).");
+      // Inspect the upstream envelope — if agent.theten.ai returned a
+      // non-success code (e.g. an unsupported language returns 500),
+      // log a clear, actionable message instead of pretending success.
+      let startEnvelope: { ok?: boolean; status?: number; upstream?: { code?: string; msg?: string } } = {};
+      try { startEnvelope = await startRes.json(); } catch { /* ignore parse error */ }
+      const upCode = startEnvelope.upstream?.code;
+      const upMsg = startEnvelope.upstream?.msg;
+      if (startRes.ok && String(upCode) === "0") {
+        log(`[ten] started AI agent (graph: ${graph}, language: ${lang}, voice: ${vtype}).`);
+      } else {
+        // The agent start failed. Common causes:
+        //  - Unsupported language (theten.ai only supports en-US, zh-CN,
+        //    ja-JP, ko-KR — see TEN_LANGUAGES). French/Spanish/etc.
+        //    return 500 "Internal Server Error".
+        //  - Unsupported graph (va_elevenlabs_v2v / va_coqui_v2v need a
+        //    different body shape — not offered in the dropdown).
+        log(
+          `[ten] agent start failed (code=${upCode ?? startRes.status}, msg=${upMsg ?? startRes.statusText}). ` +
+          `If the language is unsupported, switch to en-US / 中文 / 日本語 / 한국어 or use the ZAI provider for other languages.`,
+        );
+      }
     } catch (err) {
       // Non-fatal — some graphs auto-start on join. Log + continue.
       log(`[ten] agent start request failed (non-fatal): ${(err as Error).message}`);
@@ -3093,13 +3179,16 @@ function RealtimeChat() {
           (graph `va_azure_v2v`) — the browser joins an Agora channel,
           publishes mic audio, subscribes to the AI's audio, and
           receives transcripts + AI responses via the data channel.
-          ChatGPT needs a JWT in the vault; Perplexity + Gemini need
-          their session cookies there (refreshed by the Chrome
-          extension); Inworld needs an `INWORLD_TOKEN` env var (or a
-          token in the vault); Qwen needs a `QWEN_ACCESS_TOKEN` env var
-          (the chat.qwen.ai JWT); ZAI + Vosk need nothing; TEN needs
-          nothing (the backend route proxies to agent.theten.ai which
-          issues the Agora token + starts the agent).
+          Pick the spoken-language dropdown so the Azure STT matches
+          what you say (French → Français, etc.) — a mismatch produces
+          garbage transcripts. ChatGPT needs a JWT in the vault;
+          Perplexity + Gemini need their session cookies there
+          (refreshed by the Chrome extension); Inworld needs an
+          `INWORLD_TOKEN` env var (or a token in the vault); Qwen needs
+          a `QWEN_ACCESS_TOKEN` env var (the chat.qwen.ai JWT); ZAI +
+          Vosk need nothing; TEN needs nothing (the backend route
+          proxies to agent.theten.ai which issues the Agora token +
+          starts the agent).
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -3188,6 +3277,74 @@ function RealtimeChat() {
                 ))}
               </SelectContent>
             </Select>
+          )}
+
+          {/* Graph + language + voice selectors — TEN only. The STT
+              language MUST match the language the user is actually
+              speaking or the Azure/OpenAI voice assistant transcribes
+              garbage. theten.ai only supports 4 languages (en-US,
+              zh-CN, ja-JP, ko-KR) — for French/other languages, use the
+              ZAI provider instead. */}
+          {provider === "ten" && (
+            <>
+              <Select
+                value={tenGraph}
+                onValueChange={(v) => setTenGraph(v as typeof tenGraph)}
+                disabled={connected}
+              >
+                <SelectTrigger
+                  className="ml-auto h-9 w-36 border-zinc-800 bg-zinc-950 text-zinc-200"
+                  aria-label="TEN voice graph"
+                >
+                  <SelectValue placeholder="Graph" />
+                </SelectTrigger>
+                <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+                  {TEN_GRAPHS.map((g) => (
+                    <SelectItem key={g.value} value={g.value} className="focus:bg-zinc-800">
+                      {g.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select
+                value={tenLanguage}
+                onValueChange={(v) => setTenLanguage(v as typeof tenLanguage)}
+                disabled={connected}
+              >
+                <SelectTrigger
+                  className="h-9 w-40 border-zinc-800 bg-zinc-950 text-zinc-200"
+                  aria-label="TEN spoken language"
+                >
+                  <SelectValue placeholder="Language" />
+                </SelectTrigger>
+                <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+                  {TEN_LANGUAGES.map((l) => (
+                    <SelectItem key={l.value} value={l.value} className="focus:bg-zinc-800">
+                      {l.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select
+                value={tenVoiceType}
+                onValueChange={(v) => setTenVoiceType(v as typeof tenVoiceType)}
+                disabled={connected}
+              >
+                <SelectTrigger
+                  className="h-9 w-28 border-zinc-800 bg-zinc-950 text-zinc-200"
+                  aria-label="TEN voice type"
+                >
+                  <SelectValue placeholder="Voice" />
+                </SelectTrigger>
+                <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+                  {TEN_VOICE_TYPES.map((vt) => (
+                    <SelectItem key={vt} value={vt} className="capitalize focus:bg-zinc-800">
+                      {vt}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </>
           )}
         </div>
 
