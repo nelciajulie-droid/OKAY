@@ -2206,3 +2206,47 @@ Stage Summary:
   2. Open the page, click the TEN provider button — 3 new dropdowns appear (Graph, Language, Voice type).
   3. For English/Chinese/Japanese/Korean: pick the matching language → Connect → speak → the AI transcribes correctly + responds in the chosen language.
   4. For French (or any unsupported language): switch to the **ZAI** provider button (it uses the Web Speech API respecting `navigator.language` — a French browser transcribes French).
+
+---
+Task ID: 11
+Agent: main (continuation)
+Task: User reported finding the theten.ai Settings panel with "Greeting" + "Prompt" fields, provided the full Nelth-IA persona spec (a 17,406-byte French/English multilingual prompt for an Optix AI assistant developed in Madagascar), and asked if the microphone language filter (English US, etc.) can be removed for auto-detect multilingual STT.
+
+Work Log:
+- Probed theten.ai API via the existing /api/ten/start route with greeting + prompt fields at the top level: all returned HTTP 200 (theten.ai is lenient — accepts extra fields without erroring). Confirmed top-level `greeting` + `prompt` are the correct field names (nested `properties` object is rejected with `code:10000, msg:"params invalid"`).
+- Binary-searched the prompt-size limit: prompt field max ~7,950 bytes (the full 17,406-byte Nelth-IA prompt returns HTTP 403). The limit is on the JSON body total (~8,150 bytes), not the prompt alone.
+- Tested language auto-detect options directly against agent.theten.ai/api/agents/start:
+  - `language:"en-US"` / `"zh-CN"` / `"ja-JP"` / `"ko-KR"` → 200 success (consistent across both graphs + both voice_types)
+  - `language:""` (empty string) → 500
+  - field OMITTED → 500
+  - `language:"auto"` / `"multilingual"` → 500
+  - `language:"fr-FR"` / `"es-ES"` / `"de-DE"` / etc. → 500 (unsupported)
+  - CONCLUSION: theten.ai REQUIRES a non-empty language field — there is NO auto-detect multilingual mode via the public API. The STT filter is mandatory and must be one of the 4 supported languages.
+  - For French (and any unsupported language), the user should use the ZAI provider instead (it uses the Web Speech API which respects `navigator.language` — a French browser transcribes French).
+- Replaced the full 17,406-byte Nelth-IA prompt (in `TEN_PROMPT_DEFAULT` in page.tsx lines 243-587) with a CONDENSED 7,746-byte version that preserves all 17 sections' intent (identity, emotional intelligence, natural laughter, tearful delivery, vocal expression, multilingual understanding, intelligent transcription correction, realtime listening/turn-taking, natural voice delivery, conversational continuity, tool use, respect/privacy/safety, avoid repetitive responses, Azure OpenAI Realtime API compatibility, final priorities + directive). The condensation merged sections into prose + removed example phrases + condensed the final priorities into a single line.
+- Confirmed end-to-end: read the ACTUAL default prompt from page.tsx (via python regex), POST to /api/ten/start with greeting + en-US → 200 success (8144 bytes total payload, fits theten.ai's ~8150-byte limit). Also confirmed zh-CN → 200 and ja-JP → 200 with the same prompt.
+- The UI already had: 3 dropdowns (Graph: Azure OpenAI / OpenAI; Language: English (US) / 中文 (简体) / 日本語 / 한국어; Voice: male / female), a "Settings — Greeting & Prompt custom" collapsible button, Greeting textarea (pre-filled with the Nelth-IA French greeting "Bonjour ! Je suis Nelth-IA. 😊 Je suis là, je t'écoute..."), Prompt textarea (pre-filled with the condensed Nelth-IA prompt), "Reset to Nelth-IA defaults" + "Clear (use graph defaults)" buttons, + a byte counter under the Prompt textarea.
+- Updated the TEN_LANGUAGES comment block to state the language field is MANDATORY and there is no auto-detect mode (with the full empirical findings — which values return 200 vs 500).
+- Updated the /api/ten/start route comment block with the same empirical findings.
+- Reverted the brief experiment of "omit language when empty" (theten.ai rejects omitted language with 500 — the field is required, not optional). The route now keeps the `(body.language as string) || "en-US"` default behavior.
+- Updated the TEN_PROMPT_DEFAULT comment to explain the condensation + the byte limit + that users can edit the textarea (a byte counter is shown).
+- `bun run lint` → 0 errors / 0 warnings (exit code 0).
+- Agent Browser verification: TEN provider selected → 3 dropdowns render (Graph: Azure OpenAI, Language: English (US), Voice: male) + "Settings — Greeting & Prompt custom" collapsible button (ref=e289). Opening the Settings shows the Greeting textarea (ref=e293) pre-filled with "Bonjour ! Je suis Nelth-IA. 😊..." and the Prompt textarea (ref=e294) pre-filled with the condensed Nelth-IA prompt. "Reset to Nelth-IA defaults" (disabled because already defaults) + "Clear (use graph defaults)" buttons present. Connect reaches "Joined Agora RTC channel" (mic DEVICE_NOT_FOUND in headless browser is expected — step 7 agent start is not reached, but the curl tests confirm the route forwards the prompt + greeting correctly).
+- Committed + pushed: `d54d429..bcc72c3 main -> main` (commit `bcc72c3` — "feat(ten): pre-fill condensed Nelth-IA greeting + prompt; confirm language field is MANDATORY"). Vercel will auto-rebuild.
+
+Stage Summary:
+- The TEN provider now ships with the Nelth-IA persona pre-filled (greeting + prompt) in the UI, so clicking Connect immediately starts the custom persona.
+- The full 17,406-byte Nelth-IA prompt was CONDENSED to 7,746 bytes to fit theten.ai's ~8,150-byte request body limit (the full version returns HTTP 403). The condensed version preserves all 17 sections' intent.
+- IMPORTANT: the theten.ai public API REQUIRES a non-empty `language` field — there is NO auto-detect multilingual mode. The 4 supported STT languages are: en-US, zh-CN, ja-JP, ko-KR. For French (and any other unsupported language), the user should use the ZAI provider instead (it uses the Web Speech API which respects `navigator.language` — a French browser transcribes French). The Nelth-IA prompt instructs the AI to infer the user's intended language from context, but the STT layer still needs a supported language filter.
+- Files modified:
+  - `src/app/page.tsx` (+260/-18 lines net — the condensed prompt replaces the full version, comments updated with empirical findings):
+    - `TEN_PROMPT_DEFAULT` (lines 251-?): condensed Nelth-IA prompt (7,746 bytes, 17 sections preserved as condensed prose).
+    - `TEN_LANGUAGES` comment: states the field is MANDATORY + the 4 supported values + ZAI recommendation for unsupported languages.
+    - `TEN_PROMPT_DEFAULT` comment: explains the condensation + byte limit + that users can edit the textarea.
+  - `src/app/api/ten/start/route.ts` (comment block updated with empirical findings; reverted the "omit language when empty" experiment).
+- What the user needs to do:
+  1. Wait for Vercel auto-deploy of commit `bcc72c3` (or run `bun run dev` locally).
+  2. Open the page, click the TEN provider button — 3 dropdowns + the "Settings — Greeting & Prompt custom" button appear.
+  3. The Greeting is pre-filled with "Bonjour ! Je suis Nelth-IA. 😊..." and the Prompt is pre-filled with the condensed Nelth-IA prompt — click Connect to start the Nelth-IA persona.
+  4. Pick a language (English / 中文 / 日本語 / 한국어) that matches what you'll speak — theten.ai does NOT auto-detect.
+  5. For French, switch to the ZAI provider instead (it respects navigator.language).
