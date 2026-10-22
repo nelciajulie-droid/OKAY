@@ -164,7 +164,8 @@ type RealtimeProvider =
   | "inworld"
   | "qwen"
   | "zai"
-  | "vosk";
+  | "vosk"
+  | "ten";
 
 // The 9 ChatGPT Realtime voices (the consumer chatgpt.com session.update
 // event accepts any of these). Perplexity, Gemini, and Inworld have their
@@ -289,6 +290,23 @@ function RealtimeChat() {
   const voskTtsChunksRef = useRef<ArrayBuffer[]>([]);
   const voskTtsActiveRef = useRef<boolean>(false);
   const voskAudioElRef = useRef<HTMLAudioElement | null>(null);
+  // `tenClientRef` holds the AgoraRTC client instance for the TEN Agent
+  // (theten.ai) provider — the 8th realtime voice provider. The SDK is
+  // dynamically imported inside `connectTen` (it uses browser-only APIs
+  // like `navigator.mediaDevices` + `RTCPeerConnection` so it cannot
+  // be imported at module top-level — Next.js SSR would fail). We use
+  // a loose `any` type because the SDK is loaded via dynamic `import()`
+  // and its types are not easily reachable at the ref declaration site.
+  // `tenAudioTrackRef` holds the local mic audio track created by
+  // `AgoraRTC.createMicrophoneAudioTrack()` — `teardown` calls
+  // `close()` on it to release the mic.
+  // `tenRemoteAudioRef` is the hidden `HTMLAudioElement` playing the
+  // AI's remote audio track (the AI's audio arrives via Agora's
+  // `user-published` event — we subscribe + play through a
+  // `MediaStream`). `teardown` pauses + nulls it.
+  const tenClientRef = useRef<any>(null);
+  const tenAudioTrackRef = useRef<any>(null);
+  const tenRemoteAudioRef = useRef<HTMLAudioElement | null>(null);
   useEffect(() => {
     voiceRef.current = voice;
   }, [voice]);
@@ -431,6 +449,30 @@ function RealtimeChat() {
     }
     voskTtsChunksRef.current = [];
     voskTtsActiveRef.current = false;
+    // --- TEN Agent (theten.ai) — Agora RTC ---
+    // Leave the channel FIRST (stops all remote subscriptions +
+    // unpublishes our mic audio), then close the local mic audio track
+    // (releases the mic hardware), then pause + null the hidden audio
+    // element playing the AI's remote audio. Clear refs so a reconnect
+    // starts fresh. `client.leave()` is async + we fire-and-forget it
+    // with `.catch(() => {})` so a rejected promise doesn't crash the
+    // React app. Clearing the ref first means a duplicate teardown
+    // (e.g. on unmount after explicit disconnect) is a no-op.
+    if (tenClientRef.current) {
+      const cli = tenClientRef.current;
+      tenClientRef.current = null;
+      try { void cli.leave().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+      try { cli.removeAllListeners(); } catch { /* ignore */ }
+    }
+    if (tenAudioTrackRef.current) {
+      try { tenAudioTrackRef.current.close(); } catch { /* ignore */ }
+      tenAudioTrackRef.current = null;
+    }
+    if (tenRemoteAudioRef.current) {
+      try { tenRemoteAudioRef.current.pause(); } catch { /* ignore */ }
+      try { tenRemoteAudioRef.current.srcObject = null; } catch { /* ignore */ }
+      tenRemoteAudioRef.current = null;
+    }
     // --- Shared mic ---
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -2626,11 +2668,265 @@ function RealtimeChat() {
     log("Connected. Speak when ready.");
   }, [float32ToInt16, log, status, upsertUserLine]);
 
+  /** Connect via the TEN Agent (theten.ai) — Agora RTC + OpenAI voice
+   *  assistant. This is the 8th realtime voice provider.
+   *
+   *  Architecture (reverse-engineered from agent.theten.ai network
+   *  traffic):
+   *    1. POST /api/ten/token → { appId, token, channel, uid } (Agora
+   *       RTC credentials — our backend route proxies to
+   *       https://agent.theten.ai/api/token/generate which proxies to
+   *       astra-agents-api.agora.io/token/generate).
+   *    2. Dynamically `import("agora-rtc-sdk-ng")` — the SDK uses
+   *       browser-only APIs (navigator.mediaDevices,
+   *       RTCPeerConnection, MediaStream, MediaStreamTrack, etc.) so
+   *       it MUST be loaded via dynamic `import()` — importing it at
+   *       module top-level would crash Next.js SSR (those APIs don't
+   *       exist on the server). The dynamic import also keeps the
+   *       SDK out of the main page bundle — it loads as a separate
+   *       chunk only when the user clicks Connect with TEN selected.
+   *    3. `AgoraRTC.createClient({ mode: "rtc", codec: "vp8" })` →
+   *       `client.join(appId, channel, token, uid)` → joins the Agora
+   *       RTC channel.
+   *    4. `AgoraRTC.createMicrophoneAudioTrack()` → creates the mic
+   *       audio track. We store it in `tenAudioTrackRef` + derive a
+   *       `MediaStream` for the shared `localStreamRef` so the
+   *       existing `toggleMute` (which reads `localStreamRef`) works
+   *       for TEN too (toggling `track.enabled` makes the source mic
+   *       produce silence — Agora sends that silence to the channel).
+   *    5. `client.publish([audioTrack])` → publishes mic audio to the
+   *       channel.
+   *    6. `client.on("user-published", ...)` → subscribe to the AI's
+   *       audio track + play it via a hidden `<audio>` element (the
+   *       `tenRemoteAudioRef`). The AI user joins the channel after
+   *       we start the agent (step 8).
+   *    7. `client.on("stream-message", ...)` → receive text data
+   *       (transcripts, AI responses) via the data channel. The
+   *       payload is a binary `Uint8Array` — we decode with
+   *       `TextDecoder` + `JSON.parse`, then dispatch on `msg.type` /
+   *       `msg.role` (user transcript → `upsertUserLine`; AI response
+   *       → append to the AI: line).
+   *    8. POST `https://agent.theten.ai/api/agents/start` with the
+   *       `va_openai_v2v` graph (OpenAI voice assistant) — starts the
+   *       AI agent which joins the channel as a remote user. Some
+   *       graphs auto-start on join, but the explicit start is
+   *       required for `va_openai_v2v`. Fire-and-forget — non-fatal
+   *       if it fails (the user can still hear any auto-started AI).
+   *
+   *  Teardown: handled by the shared `teardown` function — calls
+   *  `client.leave()` (leaves the channel + unpublishes + unsubscribes),
+   *  `audioTrack.close()` (releases the mic), and pauses + nulls the
+   *  hidden audio element.
+   *
+   *  Mute: falls through to the shared `localStreamRef` path
+   *  (toggles `track.enabled` on the mic tracks — Agora reads the
+   *  underlying MediaStreamTrack + sends silence when disabled). No
+   *  TEN-specific mute state is needed.
+   */
+  const connectTen = useCallback(async () => {
+    // 1. Fetch the Agora RTC credentials from the backend route.
+    //    The route proxies to agent.theten.ai which proxies to
+    //    astra-agents-api.agora.io. Returns { appId, token, channel, uid }.
+    log("POST /api/ten/token…");
+    const tokenRes = await fetch("/api/ten/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!tokenRes.ok) {
+      const text = await tokenRes.text().catch(() => "");
+      throw new Error(`TEN token fetch ${tokenRes.status}: ${text.slice(0, 300)}`);
+    }
+    const tokenData = (await tokenRes.json()) as {
+      ok?: boolean;
+      appId?: string;
+      token?: string;
+      channel?: string;
+      uid?: number;
+      error?: string;
+    };
+    if (!tokenData.ok || !tokenData.appId || !tokenData.token || !tokenData.channel) {
+      throw new Error(tokenData.error ?? "TEN token route returned no Agora credentials.");
+    }
+    log(
+      `TEN token acquired (channel=${tokenData.channel}, uid=${tokenData.uid}, app_id=${tokenData.appId.slice(0, 8)}…).`,
+    );
+
+    // 2. Dynamically import AgoraRTC. The SDK uses browser-only APIs
+    //    (navigator.mediaDevices, RTCPeerConnection, MediaStream,
+    //    MediaStreamTrack, etc.) so it MUST be loaded via dynamic
+    //    `import()` — importing it at module top-level would crash
+    //    Next.js SSR. The dynamic import also keeps the SDK out of
+    //    the main page bundle — it loads as a separate chunk only
+    //    when the user clicks Connect with TEN selected.
+    log("Loading Agora RTC SDK…");
+    let AgoraRTC: any;
+    try {
+      const mod = await import("agora-rtc-sdk-ng");
+      AgoraRTC = mod.default;
+    } catch (err) {
+      throw new Error(
+        `Failed to load Agora RTC SDK: ${(err as Error).message}. ` +
+        "The `agora-rtc-sdk-ng` package is installed; run `bun install` if missing.",
+      );
+    }
+    if (!AgoraRTC || typeof AgoraRTC.createClient !== "function") {
+      throw new Error(
+        "Agora RTC SDK loaded but `createClient` is missing — the " +
+        "package may be corrupted. Try `bun remove agora-rtc-sdk-ng && bun add agora-rtc-sdk-ng`.",
+      );
+    }
+
+    // 3. Create the Agora client + join the channel. Defensive: if a
+    //    previous TEN session left a client dangling (e.g. the user
+    //    clicked Connect twice without Disconnect), leave + null it
+    //    first. Clearing the ref first means a duplicate connect call
+    //    is a no-op safety net (the connect dispatcher disables the
+    //    Connect button while connected, so this shouldn't fire).
+    if (tenClientRef.current) {
+      try { void tenClientRef.current.leave().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+      tenClientRef.current = null;
+    }
+    const client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+    tenClientRef.current = client;
+    log(`Joining Agora RTC channel ${tokenData.channel} (uid=${tokenData.uid})…`);
+    try {
+      await client.join(tokenData.appId, tokenData.channel, tokenData.token, tokenData.uid);
+    } catch (err) {
+      throw new Error(
+        `Failed to join Agora RTC channel: ${(err as Error).message}. ` +
+        "The token may be expired or the channel may be full.",
+      );
+    }
+    log("Joined Agora RTC channel.");
+
+    // 4. Create + publish the mic audio track. The Agora SDK handles
+    //    getUserMedia internally — we don't need to call
+    //    navigator.mediaDevices.getUserMedia ourselves. We store the
+    //    track in `tenAudioTrackRef` + derive a `MediaStream` from its
+    //    underlying `MediaStreamTrack` for the shared `localStreamRef`
+    //    so the existing `toggleMute` (which reads `localStreamRef`)
+    //    works for TEN too (toggling `track.enabled` makes the source
+    //    mic produce silence — Agora sends that silence to the channel).
+    const audioTrack = await AgoraRTC.createMicrophoneAudioTrack();
+    tenAudioTrackRef.current = audioTrack;
+    localStreamRef.current = new MediaStream([audioTrack.getMediaStreamTrack()]);
+    await client.publish([audioTrack]);
+    log("[ten] publishing local mic audio.");
+
+    // 5. Listen for the AI's audio track. `user-published` fires when
+    //    a remote user (the AI agent) publishes a track. We subscribe
+    //    to audio tracks + play them via a hidden `<audio>` element
+    //    (reuses `tenRemoteAudioRef` so `teardown` can pause it).
+    //    The AI user joins the channel after we start the agent
+    //    (step 7) — this handler stays wired + fires when the AI's
+    //    audio track arrives.
+    client.on("user-published", async (user: any, mediaType: "audio" | "video") => {
+      if (mediaType !== "audio") return;
+      try {
+        await client.subscribe(user, mediaType);
+        const remoteAudioTrack = user.audioTrack;
+        if (!remoteAudioTrack) return;
+        if (!tenRemoteAudioRef.current) {
+          tenRemoteAudioRef.current = new Audio();
+          tenRemoteAudioRef.current.autoplay = true;
+        }
+        const stream = new MediaStream([remoteAudioTrack.getMediaStreamTrack()]);
+        tenRemoteAudioRef.current.srcObject = stream;
+        await tenRemoteAudioRef.current.play().catch(() => {
+          /* autoplay may need a user gesture — the Connect click counts */
+        });
+        log(`[ten] remote audio track playing (uid=${user.uid}).`);
+      } catch (err) {
+        log(`[ten] failed to play remote audio: ${(err as Error).message}`);
+      }
+    });
+
+    // 6. Listen for text data via the Agora data channel. TEN sends
+    //    JSON messages with transcripts + AI responses as binary
+    //    `Uint8Array` payloads. We decode with `TextDecoder` +
+    //    `JSON.parse`, then dispatch on `msg.type` / `msg.role`:
+    //      - `type: "transcript"` or `role: "user"` → user transcript
+    //        → `upsertUserLine` (collapses all partials for one speech
+    //        into ONE growing "You:" line — matches the pattern used
+    //        by Inworld/Gemini/Qwen/Vosk).
+    //      - Otherwise → AI response → append to the last "AI:" line
+    //        (or create a new one if the last line isn't an AI: line).
+    //        Matches the `appendAiDelta` pattern from Inworld/Qwen.
+    //    The text field may be named `text`, `transcript`, or `delta`
+    //    (different graphs use different field names) — we normalize.
+    client.on("stream-message", (_uid: number | string, data: Uint8Array) => {
+      try {
+        const text = new TextDecoder().decode(data);
+        const msg = JSON.parse(text) as {
+          type?: string;
+          role?: string;
+          text?: string;
+          transcript?: string;
+          delta?: string;
+        };
+        const content = msg.text ?? msg.transcript ?? msg.delta ?? "";
+        if (!content) return;
+        if (msg.type === "transcript" || msg.role === "user") {
+          // User mic transcript → upsert the "You:" line.
+          upsertUserLine(content);
+          return;
+        }
+        // AI response → append to the last AI: line (or create one).
+        setTranscript((t) => {
+          const next = [...t];
+          const last = next[next.length - 1] ?? "";
+          if (last.includes("] AI:")) {
+            next[next.length - 1] = last + content;
+          } else {
+            next.push(`[${new Date().toLocaleTimeString()}] AI: ${content}`);
+          }
+          return next.slice(-200);
+        });
+      } catch {
+        // Non-JSON message — ignore. Some graphs send binary control
+        // frames that aren't valid JSON.
+      }
+    });
+
+    // 7. Start the AI agent. Some graphs auto-start on channel join,
+    //    but the explicit start is required for `va_openai_v2v`
+    //    (the OpenAI voice assistant graph). The agent joins the
+    //    channel as a remote user after a brief delay + fires the
+    //    `user-published` handler above. Fire-and-forget — non-fatal
+    //    if it fails (some deployments auto-start on join).
+    try {
+      await fetch("https://agent.theten.ai/api/agents/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          request_id: crypto.randomUUID(),
+          channel_name: tokenData.channel,
+          user_uid: tokenData.uid,
+          graph_name: "va_openai_v2v", // OpenAI voice assistant
+          language: "en-US",
+          voice_type: "male",
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      log("[ten] started AI agent (graph: va_openai_v2v).");
+    } catch (err) {
+      // Non-fatal — some graphs auto-start on join. Log + continue.
+      log(`[ten] agent start request failed (non-fatal): ${(err as Error).message}`);
+    }
+
+    setStatus("connected");
+    log("Connected. Speak when ready.");
+  }, [log, upsertUserLine]);
+
   /** Connect to the selected provider's realtime endpoint. Dispatches to
    * the WebRTC path (ChatGPT / Perplexity / Qwen), the Gemini bidi path,
    * the Inworld WebSocket path, the ZAI turn-based pipeline (Web Speech
-   * API STT + z-ai LLM + Edge TTS), or the Vosk streaming pipeline
-   * (local Vosk STT + Microsoft Edge TTS over a WebSocket to port 3005). */
+   * API STT + z-ai LLM + Edge TTS), the Vosk streaming pipeline (local
+   * Vosk STT + Microsoft Edge TTS over a WebSocket to port 3005), or
+   * the TEN Agent path (Agora RTC + OpenAI voice assistant from
+   * theten.ai). */
   const connect = useCallback(async () => {
     setError(null);
     setStatus("connecting");
@@ -2647,6 +2943,8 @@ function RealtimeChat() {
         await connectZai();
       } else if (providerRef.current === "vosk") {
         await connectVosk();
+      } else if (providerRef.current === "ten") {
+        await connectTen();
       } else {
         await connectWebRtc();
       }
@@ -2657,7 +2955,7 @@ function RealtimeChat() {
       log(`Error: ${message}`);
       teardown();
     }
-  }, [connectGemini, connectInworld, connectQwen, connectVosk, connectWebRtc, connectZai, log, teardown]);
+  }, [connectGemini, connectInworld, connectQwen, connectTen, connectVosk, connectWebRtc, connectZai, log, teardown]);
 
   /** Toggle the mic on/off (mutes the local audio track). Works for the
    * WebRTC path (localStream), the Gemini/Inworld/Vosk paths (micStream),
@@ -2667,7 +2965,9 @@ function RealtimeChat() {
    * `zaiStartTurnRef`). For Vosk, muting just disables the shared
    * MediaStream tracks — the ScriptProcessor keeps firing but its
    * output is silent, so the server's Vosk recognizer receives zero PCM
-   * + produces no partials/finals. */
+   * + produces no partials/finals. For TEN, muting toggles the shared
+   * `localStreamRef` tracks' `enabled` property — Agora reads the
+   * underlying MediaStreamTrack + sends silence when disabled. */
   const toggleMute = useCallback(() => {
     const next = !muted;
     // Qwen path — the Aliyun RTC SDK owns the mic stream.
@@ -2701,8 +3001,8 @@ function RealtimeChat() {
       log(next ? "Mic muted." : "Mic unmuted.");
       return;
     }
-    // ChatGPT / Perplexity / Gemini / Inworld / Vosk path — toggle the
-    // shared MediaStream tracks' `enabled` property.
+    // ChatGPT / Perplexity / Gemini / Inworld / Vosk / TEN path — toggle
+    // the shared MediaStream tracks' `enabled` property.
     const stream = localStreamRef.current;
     if (!stream) return;
     stream.getAudioTracks().forEach((t) => (t.enabled = !next));
@@ -2714,7 +3014,8 @@ function RealtimeChat() {
    * stop call to the backend; for Inworld + Vosk the WebSocket close
    * (handled inside `teardown`) IS the stop; for the WebRTC providers
    * there's no explicit teardown call — closing the peer connection is
-   * enough. */
+   * enough; for TEN the `client.leave()` inside `teardown` IS the stop
+   * (Agora leaves the channel + unpublishes + unsubscribes). */
   const disconnect = useCallback(() => {
     // Best-effort stop call for Gemini (the server doesn't really need a
     // stop — we just stop long-polling — but it's polite).
@@ -2775,12 +3076,18 @@ function RealtimeChat() {
           needed; Vosk is a real-time streaming pipeline (local Vosk
           STT at 16 kHz + Microsoft Edge TTS) over a WebSocket to the
           voice-ai mini-service on port 3005 — no external API keys,
-          no Web Speech API, with barge-in (speaking interrupts TTS).
+          no Web Speech API, with barge-in (speaking interrupts TTS);
+          TEN (theten.ai) uses Agora RTC + an OpenAI voice assistant
+          (graph `va_openai_v2v`) — the browser joins an Agora channel,
+          publishes mic audio, subscribes to the AI's audio, and
+          receives transcripts + AI responses via the data channel.
           ChatGPT needs a JWT in the vault; Perplexity + Gemini need
           their session cookies there (refreshed by the Chrome
           extension); Inworld needs an `INWORLD_TOKEN` env var (or a
           token in the vault); Qwen needs a `QWEN_ACCESS_TOKEN` env var
-          (the chat.qwen.ai JWT); ZAI + Vosk need nothing.
+          (the chat.qwen.ai JWT); ZAI + Vosk need nothing; TEN needs
+          nothing (the backend route proxies to agent.theten.ai which
+          issues the Agora token + starts the agent).
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -2842,6 +3149,13 @@ function RealtimeChat() {
               disabled={connected || status === "connecting"}
             >
               Vosk
+            </ProviderButton>
+            <ProviderButton
+              active={provider === "ten"}
+              onClick={() => setProvider("ten")}
+              disabled={connected || status === "connecting"}
+            >
+              TEN
             </ProviderButton>
           </div>
 
