@@ -2033,3 +2033,74 @@ Stage Summary:
   3. **Barge-in sensitivity** — v1 triggers barge-in on ANY new mic audio (even silence — the ScriptProcessor fires regardless of whether the user is actually speaking). False triggers are rare in practice (echo cancellation + noise suppression filter out the AI's TTS), but a proper VAD (energy threshold, e.g. RMS > -40dB) would be more robust.
   4. **Multilingual Vosk model** — v1 uses the French small model. For multilingual support, swap the model directory (English small: `vosk-model-small-en-us-0.15`, etc.) — the server code is model-agnostic. A language selector in the UI would be a nice addition.
   5. **Voice selection UI** — the TTS voice is hardcoded to `fr-FR-DeniseNeural` in `tts.py`. A dropdown to manually override (e.g. "en-US-AriaNeural", "zh-CN-XiaoxiaoNeural", "ja-JP-NanamiNeural") would be a nice addition. The `tts.py` would need to accept a `--voice` argument.
+
+---
+Task ID: 76
+Agent: main (Z.ai Code)
+Task: Add the TEN Agent (theten.ai) as the 8th realtime voice provider in `src/app/page.tsx` — Agora RTC + OpenAI voice assistant (graph `va_openai_v2v`).
+
+Work Log:
+- Read `/home/z/my-project/src/app/page.tsx` (3157 lines before changes) end-to-end to understand the existing 7 providers (ChatGPT, Perplexity, Gemini, Inworld, Qwen, ZAI, Vosk) + the shared refs (`audioCtxRef`, `micStreamRef`, `scriptNodeRef`, `localStreamRef`, `audioElRef`), the `teardown` function, the `connect` dispatcher, the `toggleMute` function, the `ProviderButton` radiogroup, and the `CardDescription`.
+- Read `/home/z/my-project/agent-ctx/68-full-stack-developer.md` to understand the previous Qwen integration pattern (Task 68) — used as a template for the TEN integration (dynamic import → joinChannel → publish mic → subscribe to AI audio → handle data channel events → teardown).
+- Verified the prerequisites (per task spec):
+  - `RealtimeProvider` type at line 168 already includes `"ten"` (pre-existing from a previous task).
+  - Backend route `POST /api/ten/token` (in `src/app/api/ten/token/route.ts`) already works — proxies to `https://agent.theten.ai/api/token/generate` → returns `{ ok, appId, token, channel, uid }`. Verified by `curl -X POST http://localhost:3000/api/ten/token -d "{}"` → 200 with valid Agora credentials (appId `b8d13d3e1ed74347b21ec75d170e87ea`, channel `ten-1792692378598`, uid 741947, token `007eJxSYNhfO...`).
+  - `agora-rtc-sdk-ng` npm package v4.24.9 is installed (`package.json` line 52, `node_modules/agora-rtc-sdk-ng/AgoraRTC_N-production.esm.mjs` exists).
+- Implemented the TEN provider integration in `src/app/page.tsx` (8 modifications, +324 / -10):
+  1. **Refs**: added 3 new refs after `voskAudioElRef` (line 292): `tenClientRef = useRef<any>(null)` (AgoraRTC client), `tenAudioTrackRef = useRef<any>(null)` (local mic audio track), `tenRemoteAudioRef = useRef<HTMLAudioElement | null>(null)` (hidden audio element playing AI's remote audio). Detailed comment block explaining the dynamic-import pattern + the teardown semantics.
+  2. **teardown**: added a new TEN block (after the Vosk block, before the shared mic cleanup) — calls `client.leave()` (leaves channel + unpublishes + unsubscribes — fire-and-forget with `.catch(() => {})`), `audioTrack.close()` (releases mic hardware), `pause()` + `srcObject = null` on the hidden audio element. Clearing the ref first means a duplicate teardown is a no-op. Also calls `client.removeAllListeners()` defensively.
+  3. **connectTen** (new `useCallback`, ~195 lines, before the `connect` dispatcher): the full flow:
+     1. `POST /api/ten/token {}` → `{ ok, appId, token, channel, uid }` (15s timeout, clear error messages on failure).
+     2. Dynamic `import("agora-rtc-sdk-ng")` — the SDK uses browser-only APIs (`navigator.mediaDevices`, `RTCPeerConnection`, `MediaStream`, `MediaStreamTrack`) so it MUST be loaded via dynamic `import()` (Next.js SSR would crash). Detailed error messages if the SDK fails to load or is corrupted.
+     3. `AgoraRTC.createClient({ mode: "rtc", codec: "vp8" })` → `client.join(appId, channel, token, uid)` → joins the Agora RTC channel.
+     4. `AgoraRTC.createMicrophoneAudioTrack()` → creates the mic audio track. Store in `tenAudioTrackRef` + derive a `MediaStream` from its underlying `MediaStreamTrack` for `localStreamRef` so the existing `toggleMute` works (toggling `track.enabled` makes the source mic produce silence — Agora sends that silence to the channel).
+     5. `client.publish([audioTrack])` → publishes mic audio to the channel.
+     6. `client.on("user-published", ...)` → subscribe to the AI's audio track + play via a hidden `<audio>` element (reuses `tenRemoteAudioRef` so `teardown` can pause it). Logs the remote uid.
+     7. `client.on("stream-message", ...)` → receive text data via the Agora data channel. Decode the binary `Uint8Array` payload with `TextDecoder` + `JSON.parse`, then dispatch on `msg.type` / `msg.role`:
+        - `type: "transcript"` OR `role: "user"` → user transcript → `upsertUserLine(content)` (collapses all partials for one speech into ONE growing "You:" line — matches Inworld/Gemini/Qwen/Vosk pattern).
+        - Otherwise → AI response → append to the last "AI:" line (or create a new one if the last line isn't an AI: line). Matches the `appendAiDelta` pattern from Inworld/Qwen.
+        - The text field may be named `text`, `transcript`, or `delta` (different graphs use different field names) — we normalize.
+     8. `POST https://agent.theten.ai/api/agents/start` with `{ request_id, channel_name, user_uid, graph_name: "va_openai_v2v", language: "en-US", voice_type: "male" }` — starts the OpenAI voice assistant graph. Fire-and-forget — non-fatal if it fails (some deployments auto-start on join).
+  4. **connect dispatcher**: added `else if (providerRef.current === "ten") { await connectTen(); }` branch + added `connectTen` to the `useCallback` deps array (alphabetical order: between `connectQwen` and `connectVosk`). Updated the JSDoc comment to mention the TEN Agent path.
+  5. **toggleMute JSDoc**: added a sentence explaining TEN mute semantics (toggles the shared `localStreamRef` tracks' `enabled` property — Agora reads the underlying MediaStreamTrack + sends silence when disabled). Updated the inline comment to include "/ TEN" in the shared path.
+  6. **disconnect JSDoc**: added a sentence noting "for TEN the `client.leave()` inside `teardown` IS the stop (Agora leaves the channel + unpublishes + unsubscribes)".
+  7. **CardDescription**: added a new sentence describing TEN ("TEN (theten.ai) uses Agora RTC + an OpenAI voice assistant (graph `va_openai_v2v`) — the browser joins an Agora channel, publishes mic audio, subscribes to the AI's audio, and receives transcripts + AI responses via the data channel") + updated the trailing auth-requirements sentence to "ZAI + Vosk need nothing; TEN needs nothing (the backend route proxies to agent.theten.ai which issues the Agora token + starts the agent)".
+  8. **ProviderButton**: added a new "TEN" provider button (8th in the row, after Vosk) with the same `active` / `onClick` / `disabled` props as the other 7.
+- `bun run lint` → 0 errors / 0 warnings (exit code 0).
+- Dev server log verified: `POST /api/ten/token 200 in 1115ms` (the endpoint works + returns valid Agora credentials). Page compiles + serves successfully (`GET / 200 in ~15-75ms`).
+- Verified all TEN markers are in the file: `tenClientRef` × 4, `tenAudioTrackRef` × 3, `tenRemoteAudioRef` × 6, `connectTen` × 4, `provider === "ten"` × 1, `va_openai_v2v` × 2, `agora-rtc-sdk-ng` × 2, `user-published` × 1, `stream-message` × 1, `createMicrophoneAudioTrack` × 1, `client.publish` × 1, `client.subscribe` × 1, `client.leave` × 2, `audioTrack.close` × 1, `removeAllListeners` × 1.
+- Committed + pushed: `d51eac1..431f8fe main -> main`.
+
+Stage Summary:
+- TEN (theten.ai) is now the 8th realtime voice provider, fully integrated end-to-end across 2 layers:
+  1. **Backend** (already in place from a previous task — committed in this task):
+     - `POST /api/ten/token` — accepts `{ channel?, uid? }` (both optional — defaults generated), proxies to `https://agent.theten.ai/api/token/generate` (which proxies to `astra-agents-api.agora.io/token/generate`), returns `{ ok: true, appId, token, channel, uid }`. The route uses `crypto.randomUUID()` for the `request_id`. Falls back to a 502 with a clear error message if the upstream call fails.
+     - `agora-rtc-sdk-ng` v4.24.9 added to `package.json` (line 52) — installed in `node_modules`.
+  2. **Frontend** (new in this task): `src/app/page.tsx` `connectTen` function (~195 lines):
+     - Fetches Agora credentials from `/api/ten/token`.
+     - Dynamic-imports `agora-rtc-sdk-ng` (browser-only SDK — must NOT be imported at module top-level).
+     - Creates an Agora RTC client (mode "rtc", codec "vp8") + joins the channel.
+     - Creates a mic audio track via `AgoraRTC.createMicrophoneAudioTrack()` + publishes it.
+     - Stores the mic track's `MediaStreamTrack` in the shared `localStreamRef` so `toggleMute` works (toggling `track.enabled` makes Agora send silence).
+     - Subscribes to the AI's audio track via `client.on("user-published", ...)` + plays it via a hidden `<audio>` element.
+     - Receives text data (transcripts, AI responses) via `client.on("stream-message", ...)` — decodes binary `Uint8Array` with `TextDecoder` + JSON.parse, dispatches on `msg.type` / `msg.role` (user transcript → `upsertUserLine`; AI response → append to AI: line).
+     - Starts the OpenAI voice assistant graph (`va_openai_v2v`) via POST `https://agent.theten.ai/api/agents/start` (fire-and-forget — non-fatal if it fails).
+     - Teardown (shared `teardown` function, new TEN block): leaves the channel (`client.leave()` fire-and-forget), closes the mic audio track (`audioTrack.close()`), pauses + nulls the hidden audio element.
+- The other 7 providers (ChatGPT, Perplexity, Gemini, Inworld, Qwen, ZAI, Vosk) are UNAFFECTED — only the `provider === "ten"` branch in `connect` dispatches to the new `connectTen`. The shared `teardown` and `toggleMute` functions check `qwenEngineRef.current` first (Qwen path), then the ZAI refs (ZAI path), then fall through to the existing `localStreamRef` path (which TEN uses because we store the Agora audio track's MediaStreamTrack there).
+- What the user needs to do to test TEN Voice end-to-end:
+  1. Open the Preview Panel, click the new "TEN" provider button (8th in the row, after Vosk), click Connect.
+  2. The browser will: (a) fetch Agora credentials from `/api/ten/token` (which proxies to agent.theten.ai), (b) dynamic-import `agora-rtc-sdk-ng` (loads as a separate chunk — keeps the main page bundle small), (c) join the Agora RTC channel, (d) create + publish the mic audio track (Agora handles getUserMedia internally), (e) wire the `user-published` + `stream-message` event handlers, (f) POST to `agent.theten.ai/api/agents/start` to start the OpenAI voice assistant graph.
+  3. Speak a sentence. The OpenAI voice assistant (running in the TEN Agent cloud) transcribes the mic audio + responds with spoken audio + text.
+  4. The AI's audio arrives via the `user-published` event → the browser subscribes + plays it via the hidden `<audio>` element. The AI's text (transcripts + AI responses) arrives via the `stream-message` event → the transcript panel shows "You: <user transcript>" (growing in real-time as the AI transcribes) + "AI: <AI response>" (growing as the AI streams).
+  5. Click Disconnect to tear down (leave the Agora channel + close the mic audio track + pause the hidden audio element).
+- Follow-ups:
+  1. **Live end-to-end test** — the implementation is verified to compile + lint clean + the `/api/ten/token` endpoint returns valid credentials. The actual voice call requires a real Agora channel + the OpenAI voice assistant graph to be reachable from `agent.theten.ai/api/agents/start` (may require a TEN account / API key — the current implementation uses the public endpoint).
+  2. **Graph selection UI** — v1 hardcodes the `va_openai_v2v` graph (OpenAI voice assistant). A dropdown to select other graphs (e.g. `va_elevenlabs_v2v` for ElevenLabs voice, `va_coqui_v2v` for Coqui TTS) would be a nice addition. The backend route + the `/api/agents/start` body would need a `graph_name` field.
+  3. **Language + voice selection** — v1 hardcodes `language: "en-US"` + `voice_type: "male"`. Dropdowns to select the language (e.g. "fr-FR", "zh-CN", "ja-JP") + voice type ("male" / "female") would be a nice addition.
+  4. **Barge-in** — v1 has no explicit barge-in handling. The OpenAI voice assistant graph has server-side VAD + auto-interrupts on user speech, but the client doesn't stop the AI's audio playback when the user starts speaking. Could implement by listening for a "speech_started" message in the `stream-message` handler + pausing the hidden audio element. NOT implemented in v1.
+  5. **Token caching** — v1 fetches a fresh Agora token on every Connect. Could cache the token + channel in `localStorage` (with a TTL based on the Agora token expiry — typically 24h) so reconnects are faster. NOT implemented in v1.
+- Files modified:
+  - `src/app/page.tsx` (~324 net additions across 8 modifications — refs, teardown, connectTen, connect dispatcher + JSDoc, toggleMute JSDoc, disconnect JSDoc, CardDescription, ProviderButton).
+  - `src/app/api/ten/token/route.ts` (committed in this task — was untracked before).
+  - `package.json` (+1 line: `"agora-rtc-sdk-ng": "^4.24.9"` — was already in working tree, committed in this task).
+- `git push origin main` → `d51eac1..431f8fe main -> main` (success).

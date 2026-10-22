@@ -1,0 +1,32 @@
+# Cloudflare Worker — Boppy FireProx-compatible proxy
+#
+# Deploy this Worker to get a https://boppy-fireprox.<your-subdomain>.workers.dev
+# URL that you can paste into Boppy Studio → Settings → "FireProx URL".
+#
+# ⚠️ IMPORTANT: this Worker does NOT rotate the source IP (Cloudflare Workers
+# share an egress pool). It only mimics FireProx's interface so the same
+# boppy.ts code path is used. For real IP rotation, deploy FireProx on AWS:
+# see fireprox/DEPLOY-BOPPY.md
+#
+# DEPLOY (3 commands on your machine, no AWS needed):
+#   npm install -g wrangler
+#   wrangler login                  # browser opens, sign in to Cloudflare
+#   wrangler deploy
+#
+# After deploy, wrangler prints your Worker URL. Paste it in Boppy Studio
+# → Settings → "FireProx URL (advanced)" → Save.
+
+name = "boppy-fireprox"
+main = "worker.js"
+compatibility_date = "2024-12-01"
+
+# Free tier: 100,000 requests/day. No paid plan needed.
+# If you hit the limit, requests fail with 429 from Cloudflare (not boppy).
+
+# Optional: restrict who can use your Worker (otherwise it's public).
+# Uncomment and set your Boppy Studio backend's IP or a secret header check
+# in worker.js to prevent strangers from using your proxy quota.
+# [vars]
+# ALLOWED_CALLER_IP = "your.boppy.studio.backend.ip"
+
+# Logs: `wrangler tail` shows the [worker] lines in real time.
