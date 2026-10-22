@@ -15,7 +15,17 @@
  *
  * Body (forwarded to agent.theten.ai with a fresh `request_id`):
  *   `{ channel_name: string, user_uid: number, graph_name?: string,
- *      language?: string, voice_type?: string }`
+ *      language?: string, voice_type?: string, greeting?: string,
+ *      prompt?: string }`
+ *
+ * The `greeting` + `prompt` fields configure the AI persona's first
+ * spoken line + system instructions — they correspond to the
+ * "Greeting" + "Prompt" fields in the theten.ai Settings panel. We
+ * send them as TOP-LEVEL fields ONLY — theten.ai REJECTS a nested
+ * `properties` object with `code:"10000", msg:"params invalid"`
+ * (tested directly against agent.theten.ai/api/agents/start). Empty /
+ * missing fields = use the graph defaults (the theten.ai labels say
+ * "leave it blank if you want to use default one").
  *
  * Response: the raw JSON returned by agent.theten.ai (passed through
  * unchanged) on success, or `{ ok: false, error }` on failure.
@@ -58,8 +68,33 @@ export async function POST(req: Request) {
     );
   }
 
-  // Defaults match the original browser-side request body in connectTen.
-  const payload = {
+  // Build the payload. Core fields always present; optional greeting /
+  // prompt forwarded only when the client sent a non-empty value (so
+  // we don't pollute the body with empty strings + override graph
+  // defaults — the theten.ai labels say "leave it blank to use the
+  // default"). We send them as TOP-LEVEL `greeting` / `prompt` ONLY.
+  // IMPORTANT: theten.ai REJECTS a nested `properties` object with
+  // `code:"10000", msg:"params invalid"` (tested directly against
+  // agent.theten.ai/api/agents/start). So we do NOT add a `properties`
+  // field — only the top-level `greeting` + `prompt` are accepted.
+  //
+  // `language`: theten.ai REQUIRES a non-empty BCP-47 language tag —
+  // tested directly against agent.theten.ai/api/agents/start:
+  //   - "en-US" / "zh-CN" / "ja-JP" / "ko-KR" → 200 success
+  //   - "" (empty string)                   → 500
+  //   - field OMITTED                        → 500
+  //   - "auto" / "multilingual"             → 500
+  //   - "fr-FR" / "es-ES" / "de-DE" / etc.   → 500 (unsupported)
+  // So there is NO auto-detect multilingual mode via the public API —
+  // the STT filter is mandatory and must be one of the 4 supported
+  // languages. For French (or any unsupported language), users should
+  // use the ZAI provider instead (it uses the Web Speech API which
+  // respects navigator.language → a French browser transcribes French).
+  // We default to "en-US" if the field is missing/empty (backwards
+  // compat with the previous hardcoded behavior). The UI dropdown only
+  // offers the 4 supported languages, so the client always sends a
+  // valid value.
+  const payload: Record<string, unknown> = {
     request_id: crypto.randomUUID(),
     channel_name: channelName,
     user_uid: userUid,
@@ -67,6 +102,13 @@ export async function POST(req: Request) {
     language: (body.language as string) || "en-US",
     voice_type: (body.voice_type as string) || "male",
   };
+
+  // Top-level greeting + prompt (only if non-empty). We IGNORE any
+  // `properties` object the client sent (theten.ai rejects it).
+  const greeting = typeof body.greeting === "string" ? body.greeting.trim() : "";
+  const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+  if (greeting) payload.greeting = greeting;
+  if (prompt) payload.prompt = prompt;
 
   try {
     const res = await fetch(TEN_START_URL, {

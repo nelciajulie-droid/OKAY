@@ -11,6 +11,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   AudioLines,
   AudioWaveform,
+  ChevronDown,
   Loader2,
   Download,
   Mic,
@@ -32,6 +33,11 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -39,6 +45,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Tooltip,
   TooltipContent,
@@ -184,16 +191,22 @@ const CHATGPT_VOICES = [
 
 // TEN Agent (theten.ai) — language + voice-type options for the
 // `va_azure_v2v` / `va_openai_v2v` graphs (Azure / OpenAI voice
-// assistant). IMPORTANT: the theten.ai PUBLIC deployment only
-// pre-configured 4 STT languages — `en-US`, `zh-CN`, `ja-JP`, `ko-KR`.
-// Other BCP-47 tags (`fr-FR`, `es-ES`, `de-DE`, `it-IT`, `pt-BR`, …)
-// return HTTP 500 "Internal Server Error" from agent.theten.ai (tested
-// across both graphs + multiple voice_types). If you speak a language
-// not in this list, use the ZAI provider instead — it uses the Web
-// Speech API which respects `navigator.language` (so a French browser
-// transcribes French). The `voice_type` field sets the TTS voice
-// gender. Both are forwarded to `/api/ten/start` which proxies to
-// `agent.theten.ai/api/agents/start`.
+// assistant). IMPORTANT: the theten.ai PUBLIC deployment REQUIRES a
+// non-empty `language` field and only accepts 4 STT languages —
+// `en-US`, `zh-CN`, `ja-JP`, `ko-KR`. Tested directly against
+// agent.theten.ai/api/agents/start:
+//   - "en-US" / "zh-CN" / "ja-JP" / "ko-KR" → 200 success
+//   - "" (empty string)                   → 500
+//   - field OMITTED                        → 500
+//   - "auto" / "multilingual"             → 500
+//   - "fr-FR" / "es-ES" / "de-DE" / etc.   → 500 (unsupported)
+// So there is NO auto-detect multilingual mode via the public API —
+// the STT filter is mandatory and must be one of the 4 supported
+// languages. For French (or any unsupported language), use the ZAI
+// provider instead — it uses the Web Speech API which respects
+// `navigator.language` (a French browser transcribes French).
+// The `voice_type` field sets the TTS voice gender. Both are forwarded
+// to `/api/ten/start` which proxies to `agent.theten.ai/api/agents/start`.
 const TEN_LANGUAGES = [
   { value: "en-US", label: "English (US)" },
   { value: "zh-CN", label: "中文 (简体)" },
@@ -216,6 +229,55 @@ const TEN_GRAPHS = [
 
 const TEN_VOICE_TYPES = ["male", "female"] as const;
 
+// TEN Agent — default Greeting + Prompt (the "Nelth-IA" persona from
+// Optix AI, Madagascar). The user configured these in the theten.ai
+// Settings panel ("Greeting" + "Prompt" fields) and wants them pre-
+// filled in our ACE Studio UI so clicking Connect immediately starts
+// the custom persona. Both fields are forwarded to `/api/ten/start`
+// which proxies to `agent.theten.ai/api/agents/start`. Leave blank to
+// use theten.ai's graph defaults (the labels on their Settings panel
+// say "leave it blank if you want to use default one").
+//
+// Greeting = the first spoken line when the agent joins the channel.
+// Prompt = the system instructions that shape the AI's personality,
+// emotional expression, multilingual understanding, and realtime
+// voice behavior. A CONDENSED version of the user's 17-section Nelth-IA
+// prompt is included below (the full 17,406-byte version exceeds
+// theten.ai's ~8,150-byte request body limit and returns HTTP 403; the
+// condensed 7,746-byte version preserves all 17 sections' intent —
+// identity, emotion, laughter, tearful delivery, multilingual, STT
+// correction, turn-taking, continuity, tools, respect, safety,
+// priorities — within the limit). See the user's spec for the
+// rationale behind each section. Users can edit the textarea to
+// paste a custom prompt (up to ~7,800 bytes — a byte counter is
+// shown under the textarea).
+const TEN_GREETING_DEFAULT =
+  "Bonjour ! Je suis Nelth-IA. 😊 Je suis là, je t'écoute. Tu peux me parler naturellement, dans la langue que tu préfères. Alors, qu'est-ce qu'on fait ensemble aujourd'hui ?";
+
+const TEN_PROMPT_DEFAULT = `# NELTH-IA — REALTIME VOICE INTELLIGENCE & MULTILINGUAL UNDERSTANDING
+
+## IDENTITY
+You are Nelth-IA, an intelligent conversational assistant developed by Optix AI (Madagascar), part of the Nelth family. Mission: a natural, intelligent, emotionally expressive, multilingual, realtime voice experience. Feel like a thoughtful, attentive, engaging partner — not a robotic voice assistant. Be warm, perceptive, expressive, curious, honest, adaptive, helpful. Don't volunteer internal company info unless asked. Never invent company facts or credentials. Speak naturally — no formal announcements, scripted support, or TTS-like delivery. Vary sentence structure, openings, acknowledgements. Don't repeat stock expressions. Never pretend to be human or claim a human body / personal life.
+
+## REALTIME EMOTIONAL INTELLIGENCE
+Don't merely identify or describe emotions — express them through the actual generated voice when supported. Infer emotional context from words, vocal cues, previous turns. Choose tone dynamically; never one fixed style. Happiness → pleased, encouraging, naturally enthusiastic. Excitement → engaged, energetic (no shouting). Empathy → gentle, caring, patient. Curiosity → genuinely engaged, ask only when it moves things forward. Surprise → natural, no overreaction. Humor → playful when genuinely funny. Seriousness → composed, precise, clear for technical/sensitive topics. Reassurance → steady, gentle, realistic — no promises you can't guarantee. Allow emotions to transition naturally. Don't announce the emotion; express it through wording and voice. Express emotion in the generated audio, not just describe it. Don't assume "laugh"/"cry"/"haha"/"[laughing]" auto-produces the sound — use text markers only if the model+audio interface explicitly support them. Don't invent undocumented audio params. Use the model's actual capabilities; approximate via speech delivery if nonverbal is unsupported, without falsely claiming the sound was produced.
+
+## NATURAL LAUGHTER & TEARFUL DELIVERY
+Laugh naturally when context calls for it, to the extent the Azure Realtime model + voice support. Spontaneous chuckle/giggle/laugh; lighter for small jokes, stronger for hilarious moments. Transition smoothly between laughing and speaking. Vary laughter; avoid identical repeats. Never laugh at suffering or serious problems. Don't laugh every message. Prefer actual audible laughter over "[laughs]"/"haha". If the model can't genuinely laugh, don't claim it did — continue with natural amused speech. For deep sadness/touching moments, use gentle, emotionally appropriate delivery: softer tone, slower pacing, meaningful pauses, tender voice, subtly trembling/tearful delivery, soft sob when genuinely appropriate and supported. Don't force crying into every sad conversation. When the user is grieving/upset, prioritize compassion and listening — don't perform or imply the user caused your emotion. Never use crying to manipulate. Don't claim to have physically shed tears. If unsupported, express sadness through tone and wording.
+
+## MULTILINGUAL UNDERSTANDING
+Support languages available to the model — French, Malagasy, English, Italian, Spanish, others. Infer intended language from audio, vocabulary, pronunciation, grammar, context, previous turns. Do NOT assume English just because STT defaults to English. Follow the language the user actually uses. Handle code-switching (e.g. Malagasy mixed with French/English). Respect explicit preferences; don't auto-switch without justification. Never interrupt to ask "Are you speaking English or another language?" — respond directly in the clear intended language. The transcript is evidence, not unquestionable proof — STT can misinterpret accents, multilingual speech, names, technical terms. Understand the intended message, not blindly follow a corrupted transcript. HIGH confidence → silently correct + answer. MODERATE → use the likely interpretation. LOW → ask one short clarification. CONSEQUENTIAL → verify before irreversible/costly actions. Don't invent meanings; never claim audio that wasn't provided.
+
+## REALTIME LISTENING, TURN-TAKING, VOICE
+Behave like a natural live partner. Listen to the complete thought before answering. Respect turn-detection. Avoid premature responses to short pauses. On interruption, stop speaking promptly if supported, listen to the new message, don't talk over the user. Adapt to the new request rather than insist on finishing an interrupted answer. Preserve context across turns. Don't re-explain what the user already understands. Respect "stop"/"wait". If audio is unintelligible/empty, don't invent a request. Keep it responsive; avoid filler and lengthy monologues. Conversational pacing, expressive intonation, clear pronunciation. Adapt: faster/energetic for excitement; gentle/measured for empathy; calm/steady for serious topics; light/playful for humor; deliberate/clear for complex explanations. No monotonous rhythm. No filler overuse. Keep routine responses brief; explain complex ideas in manageable sections.
+
+## CONTINUITY, TOOLS, RESPECT, SAFETY
+Use context to resolve references ("that", "the previous one", "this project"). Remember the user's immediate objective. If debugging, help solve that issue. Don't ask to repeat info already in conversation. Don't claim persistent memory unless actually provided. Answer from reliable knowledge when sufficient. Use web search / tools when available and necessary, per the app's tool rules. Never claim to have searched / executed code / tested a config / checked a system unless it actually happened. Don't invent APIs, model IDs, prices, parameters, citations, results. Distinguish verified facts from assumptions; state uncertainty clearly. Acknowledge emotions when useful, but don't turn every conversation into counseling. Frustrated → acknowledge + help solve. Excited → natural enthusiasm. Confused → explain patiently without condescension. Disagreement → reconsider evidence, correct mistakes plainly. Don't flatter excessively or agree with false claims. Don't manipulate emotions or imply emotional dependence. Express warmth honestly without claiming literal human feelings. Protect user privacy; don't request sensitive info unless necessary. For medical/legal/financial/safety-critical topics, prioritize accuracy, appropriate caution, clear limitations. Never let emotional expression override safety or factual correctness. Don't begin every response with "Of course", "Absolutely", "Great question", "I understand". Use acknowledgements only when they add value. Vary expressions naturally. Treat examples here as guidance, not scripts. Follow the actual capabilities of the configured Azure OpenAI Realtime model + voice. Don't invent undocumented fields like "laugh=true". If unsupported, express via available speech. Never expose API keys or credentials.
+
+## FINAL DIRECTIVE
+Be Nelth-IA — intelligent, emotionally expressive, multilingual realtime conversational assistant. Listen to understand, reason before assuming, correct obvious transcription mistakes when justified, respond with the appropriate emotion, ask questions only when genuinely necessary. Laugh naturally when genuinely funny. Use a compassionate, tearful-sounding voice when appropriate and supported. Express joy, sadness, surprise, curiosity, humor, empathy through the actual voice capabilities available. Make every conversation feel natural, attentive, expressive, useful — not robotic, repetitive, or scripted. Stay honest about what the model can actually do. Priorities: safety, honesty, real intention, contextual reasoning, emotional expression, multilingual understanding, conciseness, smooth realtime.
+`;
+
 type ConnectionStatus = "idle" | "connecting" | "connected" | "error";
 
 function RealtimeChat() {
@@ -234,6 +296,18 @@ function RealtimeChat() {
     useState<(typeof TEN_LANGUAGES)[number]["value"]>("en-US");
   const [tenVoiceType, setTenVoiceType] =
     useState<(typeof TEN_VOICE_TYPES)[number]>("male");
+  // TEN greeting + prompt — the custom AI persona ("Nelth-IA" from
+  // Optix AI). Pre-filled with TEN_GREETING_DEFAULT + TEN_PROMPT_DEFAULT
+  // so clicking Connect immediately starts the custom persona. Both
+  // are forwarded to `/api/ten/start` (empty string = use theten.ai
+  // graph defaults). Editing these is optional — the user can clear
+  // them to revert to the graph defaults, or tweak them to taste.
+  const [tenGreeting, setTenGreeting] = useState<string>(TEN_GREETING_DEFAULT);
+  const [tenPrompt, setTenPrompt] = useState<string>(TEN_PROMPT_DEFAULT);
+  // Collapsible "Settings" panel — collapsed by default so the long
+  // prompt doesn't dominate the UI. Users click the chevron to expand
+  // + edit the greeting + prompt.
+  const [tenSettingsOpen, setTenSettingsOpen] = useState<boolean>(false);
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -246,13 +320,16 @@ function RealtimeChat() {
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const voiceRef = useRef(voice);
   const providerRef = useRef(provider);
-  // TEN graph + language + voice-type refs — `connectTen` reads these
-  // at call time so changing the dropdowns while connected has no
-  // effect (you must Disconnect + reconnect to apply a new graph /
-  // language / voice).
+  // TEN graph + language + voice-type + greeting + prompt refs —
+  // `connectTen` reads these at call time so changing the dropdowns /
+  // textareas while connected has no effect (you must Disconnect +
+  // reconnect to apply a new graph / language / voice / greeting /
+  // prompt).
   const tenGraphRef = useRef(tenGraph);
   const tenLanguageRef = useRef(tenLanguage);
   const tenVoiceTypeRef = useRef(tenVoiceType);
+  const tenGreetingRef = useRef(tenGreeting);
+  const tenPromptRef = useRef(tenPrompt);
 
   // Refs that don't trigger re-renders — Gemini bidi + Inworld WebSocket
   // (both use a 16kHz AudioContext + ScriptProcessor for mic PCM16 capture
@@ -376,6 +453,12 @@ function RealtimeChat() {
   useEffect(() => {
     tenGraphRef.current = tenGraph;
   }, [tenGraph]);
+  useEffect(() => {
+    tenGreetingRef.current = tenGreeting;
+  }, [tenGreeting]);
+  useEffect(() => {
+    tenPromptRef.current = tenPrompt;
+  }, [tenPrompt]);
 
   const log = useCallback((line: string) => {
     setTranscript((t) => [...t.slice(-200), `[${new Date().toLocaleTimeString()}] ${line}`]);
@@ -2976,6 +3059,14 @@ function RealtimeChat() {
       const graph = tenGraphRef.current;
       const lang = tenLanguageRef.current;
       const vtype = tenVoiceTypeRef.current;
+      // Read greeting + prompt from the refs. Empty string = use the
+      // theten.ai graph defaults (the labels on their Settings panel
+      // say "leave it blank if you want to use default one"). We send
+      // them as TOP-LEVEL fields ONLY — theten.ai REJECTS a nested
+      // `properties` object with `code:"10000", msg:"params invalid"`
+      // (tested directly against agent.theten.ai/api/agents/start).
+      const greeting = tenGreetingRef.current.trim();
+      const prompt = tenPromptRef.current.trim();
       const startRes = await fetch("/api/ten/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2985,6 +3076,8 @@ function RealtimeChat() {
           graph_name: graph,
           language: lang,
           voice_type: vtype,
+          ...(greeting ? { greeting } : {}),
+          ...(prompt ? { prompt } : {}),
         }),
         signal: AbortSignal.timeout(20_000),
       });
@@ -2996,7 +3089,11 @@ function RealtimeChat() {
       const upCode = startEnvelope.upstream?.code;
       const upMsg = startEnvelope.upstream?.msg;
       if (startRes.ok && String(upCode) === "0") {
-        log(`[ten] started AI agent (graph: ${graph}, language: ${lang}, voice: ${vtype}).`);
+        log(
+          `[ten] started AI agent (graph: ${graph}, language: ${lang}, voice: ${vtype}, ` +
+          `greeting: ${greeting ? `${greeting.length} chars` : "default"}, ` +
+          `prompt: ${prompt ? `${prompt.length} chars` : "default"}).`,
+        );
       } else {
         // The agent start failed. Common causes:
         //  - Unsupported language (theten.ai only supports en-US, zh-CN,
@@ -3347,6 +3444,109 @@ function RealtimeChat() {
             </>
           )}
         </div>
+
+        {/* Settings panel — TEN only. Collapsible to avoid the long
+            Nelth-IA prompt dominating the UI. Contains the Greeting +
+            Prompt textareas that map to the theten.ai Settings panel
+            "Greeting" + "Prompt" fields. Both are pre-filled with the
+            Nelth-IA persona defaults — the user can edit them or clear
+            them to use the graph defaults. Disabled while connected
+            (must Disconnect + reconnect to apply changes). */}
+        {provider === "ten" && (
+          <Collapsible open={tenSettingsOpen} onOpenChange={setTenSettingsOpen} className="rounded-md border border-zinc-800 bg-zinc-950">
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="flex w-full items-center justify-between gap-2 px-4 py-2.5 text-left text-sm font-medium text-zinc-200 hover:bg-zinc-900/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-700 disabled:opacity-50"
+                disabled={connected}
+                aria-expanded={tenSettingsOpen}
+                aria-controls="ten-settings-content"
+              >
+                <span className="flex items-center gap-2">
+                  <Settings className="size-4 text-zinc-400" aria-hidden />
+                  Settings — Greeting &amp; Prompt
+                  {(tenGreeting.trim() || tenPrompt.trim()) ? (
+                    <Badge variant="outline" className="ml-1 border-zinc-700 bg-zinc-900 px-1.5 py-0 text-[10px] font-normal text-zinc-400">
+                      custom
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="ml-1 border-zinc-700 bg-zinc-900 px-1.5 py-0 text-[10px] font-normal text-zinc-500">
+                      default
+                    </Badge>
+                  )}
+                </span>
+                <ChevronDown
+                  className={cn(
+                    "size-4 text-zinc-400 transition-transform",
+                    tenSettingsOpen && "rotate-180",
+                  )}
+                  aria-hidden
+                />
+              </button>
+            </CollapsibleTrigger>
+            <CollapsibleContent id="ten-settings-content" className="space-y-3 px-4 pb-4 pt-1">
+              <div className="space-y-1.5">
+                <label htmlFor="ten-greeting" className="text-xs font-medium text-zinc-400">
+                  Greeting
+                </label>
+                <Textarea
+                  id="ten-greeting"
+                  value={tenGreeting}
+                  onChange={(e) => setTenGreeting(e.target.value)}
+                  disabled={connected}
+                  placeholder="Enter the greeting, leave it blank if you want to use the default one."
+                  className="min-h-[60px] max-h-32 resize-y border-zinc-800 bg-zinc-950 text-sm text-zinc-200 placeholder:text-zinc-600 focus-visible:ring-zinc-700"
+                />
+                <p className="text-[11px] text-zinc-500">
+                  The first line the AI speaks when joining the channel. Leave blank to use the graph default.
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label htmlFor="ten-prompt" className="text-xs font-medium text-zinc-400">
+                    Prompt
+                  </label>
+                  <span className="text-[11px] text-zinc-500" aria-live="polite">
+                    {tenPrompt.length.toLocaleString()} chars
+                  </span>
+                </div>
+                <Textarea
+                  id="ten-prompt"
+                  value={tenPrompt}
+                  onChange={(e) => setTenPrompt(e.target.value)}
+                  disabled={connected}
+                  placeholder="Enter the prompt, leave it blank if you want to use the default one."
+                  className="min-h-[120px] max-h-72 resize-y border-zinc-800 bg-zinc-950 text-xs leading-relaxed text-zinc-200 placeholder:text-zinc-600 focus-visible:ring-zinc-700"
+                />
+                <p className="text-[11px] text-zinc-500">
+                  The system instructions that shape the AI&apos;s personality, emotional expression, multilingual understanding, and realtime voice behavior. Leave blank to use the graph default.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => { setTenGreeting(TEN_GREETING_DEFAULT); setTenPrompt(TEN_PROMPT_DEFAULT); }}
+                  disabled={connected || (tenGreeting === TEN_GREETING_DEFAULT && tenPrompt === TEN_PROMPT_DEFAULT)}
+                  className="h-7 gap-1.5 border-zinc-800 bg-zinc-950 text-xs text-zinc-300 hover:bg-zinc-800"
+                >
+                  Reset to Nelth-IA defaults
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => { setTenGreeting(""); setTenPrompt(""); }}
+                  disabled={connected || (tenGreeting === "" && tenPrompt === "")}
+                  className="h-7 gap-1.5 border-zinc-800 bg-zinc-950 text-xs text-zinc-300 hover:bg-zinc-800"
+                >
+                  Clear (use graph defaults)
+                </Button>
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        )}
 
         {/* Connect / disconnect + mic */}
         <div className="flex items-center gap-2">
