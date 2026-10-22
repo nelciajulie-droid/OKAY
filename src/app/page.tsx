@@ -189,39 +189,116 @@ const CHATGPT_VOICES = [
   "verse",
 ] as const;
 
-// TEN Agent (theten.ai) — language + voice-type options for the
+// TEN Agent (theten.ai) — language options for the
 // `va_azure_v2v` / `va_openai_v2v` graphs (Azure / OpenAI voice
-// assistant). IMPORTANT: the theten.ai PUBLIC deployment REQUIRES a
-// non-empty `language` field and only accepts 4 STT languages —
+// assistant). The theten.ai PUBLIC deployment validates the top-level
+// `language` field against a whitelist of 4 STT languages —
 // `en-US`, `zh-CN`, `ja-JP`, `ko-KR`. Tested directly against
 // agent.theten.ai/api/agents/start:
-//   - "en-US" / "zh-CN" / "ja-JP" / "ko-KR" → 200 success
-//   - "" (empty string)                   → 500
-//   - field OMITTED                        → 500
-//   - "auto" / "multilingual"             → 500
-//   - "fr-FR" / "es-ES" / "de-DE" / etc.   → 500 (unsupported)
-// So there is NO auto-detect multilingual mode via the public API —
-// the STT filter is mandatory and must be one of the 4 supported
-// languages. For French (or any unsupported language), use the ZAI
-// provider instead — it uses the Web Speech API which respects
-// `navigator.language` (a French browser transcribes French).
-// The `voice_type` field sets the TTS voice gender. Both are forwarded
-// to `/api/ten/start` which proxies to `agent.theten.ai/api/agents/start`.
+//   - top-level "en-US"/"zh-CN"/"ja-JP"/"ko-KR" → 200 success
+//   - top-level "" (empty) / field OMITTED → 500 (mandatory)
+//   - top-level "auto"/"multilingual" → 500
+//   - top-level "fr-FR"/"es-ES"/"de-DE"/etc. → 500 (whitelist rejects)
+//
+// SOLUTION for other languages (French, Spanish, German, etc.):
+// The graph definition (see github.com/TEN-framework/ten-framework,
+// `voice-assistant-realtime/tenapp/property.json`) shows the `v2v`
+// node (using `openai_mllm_python` — the OpenAI Realtime API with
+// gpt-realtime + Whisper-1 STT) has a `language` property (default
+// "en"). Whisper-1 supports 90+ languages. Passing
+// `properties.v2v.language = "<ISO 639-1>"` bypasses the top-level
+// whitelist (tested directly: fr/es/de/it/pt → 200 success on
+// `va_openai_v2v`; the server validates the properties STRUCTURE as
+// node_name → property_dict but NOT the values — so any ISO 639-1
+// code is accepted).
+//
+// IMPORTANT caveats:
+//   1. The override only works on `va_openai_v2v` (which has the `v2v`
+//      node with a `language` property). The `va_azure_v2v` graph uses
+//      `azure_asr_python` which has no `language` field — the override
+//      may be silently ignored. So non-native languages auto-switch
+//      to `va_openai_v2v` (see connectTen).
+//   2. The override uses ISO 639-1 codes (e.g. "fr", "es", "de"), NOT
+//      BCP-47 (fr-FR, es-ES). The top-level `language` is still one of
+//      the 4 supported values (en-US as a fallback that passes the
+//      whitelist — the override takes precedence in the graph).
+//   3. The 200 success means the graph start was accepted, but the
+//      actual STT behavior should be verified by speaking the chosen
+//      language (Whisper-1 + gpt-realtime support the listed languages).
+//   4. theten.ai has aggressive rate-limiting (~1 request / 30s per
+//      IP) — rapid Connect/Disconnect cycles may return 500.
+//
+// For languages NOT listed here, use the ZAI provider instead — it
+// uses the Web Speech API which respects `navigator.language`.
+//
+// Each entry has:
+//   - `value` — the UNIQUE identifier used by the Select dropdown
+//     (the BCP-47 tag for native languages, the ISO 639-1 code for
+//     non-native languages). This is NOT sent to theten.ai directly —
+//     the route derives the top-level `language` + the `properties.v2v.language`
+//     override from this identifier (see the `TEN_LANGUAGE_TO_REQUEST`
+//     map below).
+//   - `v2v` — the ISO 639-1 code for `properties.v2v.language`
+//     (undefined for native languages → use top-level `language` only;
+//     a 2-letter code for non-native languages → bypass the whitelist).
+//   - `label` — the display name in the dropdown.
 const TEN_LANGUAGES = [
-  { value: "en-US", label: "English (US)" },
-  { value: "zh-CN", label: "中文 (简体)" },
-  { value: "ja-JP", label: "日本語" },
-  { value: "ko-KR", label: "한국어" },
+  // Natively supported by theten.ai (use top-level `language` only)
+  { value: "en-US", label: "English (US)", v2v: undefined },
+  { value: "zh-CN", label: "中文 (简体)", v2v: undefined },
+  { value: "ja-JP", label: "日本語", v2v: undefined },
+  { value: "ko-KR", label: "한국어", v2v: undefined },
+  // Non-native — use properties.v2v.language override (ISO 639-1)
+  // + top-level "en-US" as a whitelist-passing fallback.
+  { value: "fr", label: "Français", v2v: "fr" },
+  { value: "es", label: "Español", v2v: "es" },
+  { value: "de", label: "Deutsch", v2v: "de" },
+  { value: "it", label: "Italiano", v2v: "it" },
+  { value: "pt", label: "Português", v2v: "pt" },
+  { value: "nl", label: "Nederlands", v2v: "nl" },
+  { value: "ru", label: "Русский", v2v: "ru" },
+  { value: "ar", label: "العربية", v2v: "ar" },
+  { value: "hi", label: "हिन्दी", v2v: "hi" },
+  { value: "tr", label: "Türkçe", v2v: "tr" },
+  { value: "pl", label: "Polski", v2v: "pl" },
+  { value: "sv", label: "Svenska", v2v: "sv" },
+  { value: "id", label: "Bahasa Indonesia", v2v: "id" },
+  { value: "vi", label: "Tiếng Việt", v2v: "vi" },
+  { value: "th", label: "ไทย", v2v: "th" },
+  { value: "mg", label: "Malagasy", v2v: "mg" },
 ] as const;
 
-// TEN voice graphs offered by theten.ai that accept the same
-// `{ channel_name, user_uid, graph_name, language, voice_type }` body
-// shape. `va_azure_v2v` = Azure OpenAI voice assistant (default);
-// `va_openai_v2v` = OpenAI voice assistant. Both support the same 4
-// languages listed above. Other graphs (`va_elevenlabs_v2v`,
-// `va_coqui_v2v`) need a different body shape (`voice_id` instead of
-// `voice_type`) and are NOT included here — they return
-// `code:10100, msg:"process property json failed"` with this body.
+// Helper: convert a TEN_LANGUAGES entry's `value` (the unique dropdown
+// identifier) to the request fields the /api/ten/start route expects:
+//   - `language` — the top-level `language` sent to theten.ai (must be
+//     one of the 4 whitelisted BCP-47 values: en-US, zh-CN, ja-JP, ko-KR)
+//   - `v2v_language` — the ISO 639-1 code for `properties.v2v.language`
+//     (empty string for native languages → the route omits the override;
+//     2-letter code for non-native languages → the route sends the override)
+// Native languages pass their BCP-47 value through as the top-level
+// `language` + no override. Non-native languages use "en-US" as the
+// top-level `language` (whitelist-passing fallback) + their ISO 639-1
+// code as the `v2v_language` override.
+const NATIVE_LANGUAGES = new Set(["en-US", "zh-CN", "ja-JP", "ko-KR"]);
+function tenLanguageToRequest(value: string): { language: string; v2v_language: string } {
+  if (NATIVE_LANGUAGES.has(value)) {
+    // Native language — use the BCP-47 value as the top-level language, no override.
+    return { language: value, v2v_language: "" };
+  }
+  // Non-native language — `value` IS the ISO 639-1 code (e.g. "fr", "es").
+  // Use "en-US" as the whitelist-passing top-level fallback + the ISO 639-1
+  // code as the properties.v2v.language override.
+  return { language: "en-US", v2v_language: value };
+}
+
+// TEN voice graphs offered by theten.ai. `va_azure_v2v` = Azure OpenAI
+// voice assistant (default; only supports the 4 native languages);
+// `va_openai_v2v` = OpenAI voice assistant (gpt-realtime + Whisper-1
+// STT — supports the 4 native languages + the 16 non-native languages
+// via the `properties.v2v.language` override). Other graphs
+// (`va_elevenlabs_v2v`, `va_coqui_v2v`) need a different body shape
+// (`voice_id` instead of `voice_type`) and are NOT included here —
+// they return `code:10100, msg:"process property json failed"`.
 const TEN_GRAPHS = [
   { value: "va_azure_v2v", label: "Azure OpenAI" },
   { value: "va_openai_v2v", label: "OpenAI" },
@@ -3056,9 +3133,23 @@ function RealtimeChat() {
     //    Fire-and-forget — non-fatal if it fails (some graphs
     //    auto-start on join).
     try {
-      const graph = tenGraphRef.current;
       const lang = tenLanguageRef.current;
       const vtype = tenVoiceTypeRef.current;
+      // Convert the dropdown value to the request fields the route expects.
+      // For native languages (en-US, zh-CN, ja-JP, ko-KR), the top-level
+      // `language` is the BCP-47 value + no override. For non-native
+      // languages (fr, es, de, ...), the top-level `language` is "en-US"
+      // (a whitelist-passing fallback) + the ISO 639-1 code is sent as
+      // `v2v_language` → the route forwards it as `properties.v2v.language`
+      // which bypasses the whitelist (tested directly against theten.ai).
+      const { language, v2v_language } = tenLanguageToRequest(lang);
+      // Non-native languages ONLY work on the `va_openai_v2v` graph (which
+      // has the `v2v` node with a `language` property using openai_mllm_python
+      // / gpt-realtime + Whisper-1 STT). The `va_azure_v2v` graph uses
+      // `azure_asr_python` which has no `language` field → the override may
+      // be silently ignored. So auto-switch to `va_openai_v2v` when a
+      // non-native language is selected (v2v_language is non-empty).
+      const graph = v2v_language ? "va_openai_v2v" : tenGraphRef.current;
       // Read greeting + prompt from the refs. Empty string = use the
       // theten.ai graph defaults (the labels on their Settings panel
       // say "leave it blank if you want to use default one"). We send
@@ -3074,8 +3165,9 @@ function RealtimeChat() {
           channel_name: tokenData.channel,
           user_uid: tokenData.uid,
           graph_name: graph,
-          language: lang,
+          language,
           voice_type: vtype,
+          ...(v2v_language ? { v2v_language } : {}),
           ...(greeting ? { greeting } : {}),
           ...(prompt ? { prompt } : {}),
         }),
@@ -3090,15 +3182,17 @@ function RealtimeChat() {
       const upMsg = startEnvelope.upstream?.msg;
       if (startRes.ok && String(upCode) === "0") {
         log(
-          `[ten] started AI agent (graph: ${graph}, language: ${lang}, voice: ${vtype}, ` +
+          `[ten] started AI agent (graph: ${graph}, language: ${lang}${v2v_language ? ` (v2v override: ${v2v_language})` : ""}, voice: ${vtype}, ` +
           `greeting: ${greeting ? `${greeting.length} chars` : "default"}, ` +
           `prompt: ${prompt ? `${prompt.length} chars` : "default"}).`,
         );
       } else {
         // The agent start failed. Common causes:
-        //  - Unsupported language (theten.ai only supports en-US, zh-CN,
-        //    ja-JP, ko-KR — see TEN_LANGUAGES). French/Spanish/etc.
-        //    return 500 "Internal Server Error".
+        //  - Rate-limiting (theten.ai allows ~1 request / 30s per IP —
+        //    wait ~30s before clicking Connect again).
+        //  - Unsupported language at the top level (the whitelist only
+        //    accepts en-US, zh-CN, ja-JP, ko-KR; non-native languages use
+        //    the v2v override + en-US fallback — see TEN_LANGUAGES).
         //  - Unsupported graph (va_elevenlabs_v2v / va_coqui_v2v need a
         //    different body shape — not offered in the dropdown).
         log(

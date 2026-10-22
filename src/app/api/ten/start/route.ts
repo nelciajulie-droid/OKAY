@@ -16,16 +16,31 @@
  * Body (forwarded to agent.theten.ai with a fresh `request_id`):
  *   `{ channel_name: string, user_uid: number, graph_name?: string,
  *      language?: string, voice_type?: string, greeting?: string,
- *      prompt?: string }`
+ *      prompt?: string, v2v_language?: string }`
  *
  * The `greeting` + `prompt` fields configure the AI persona's first
  * spoken line + system instructions — they correspond to the
  * "Greeting" + "Prompt" fields in the theten.ai Settings panel. We
- * send them as TOP-LEVEL fields ONLY — theten.ai REJECTS a nested
- * `properties` object with `code:"10000", msg:"params invalid"`
- * (tested directly against agent.theten.ai/api/agents/start). Empty /
- * missing fields = use the graph defaults (the theten.ai labels say
- * "leave it blank if you want to use default one").
+ * send them as TOP-LEVEL fields. Empty / missing fields = use the
+ * graph defaults (the theten.ai labels say "leave it blank if you
+ * want to use default one").
+ *
+ * The `v2v_language` field (ISO 639-1 code, e.g. "fr", "es", "de") is
+ * forwarded to theten.ai as `properties.v2v.language` — this BYPASSES
+ * the top-level `language` whitelist (which only accepts en-US, zh-CN,
+ * ja-JP, ko-KR). The graph definition shows the `v2v` node (using
+ * `openai_mllm_python` — gpt-realtime + Whisper-1 STT) has a `language`
+ * property. Whisper-1 supports 90+ languages. Tested directly:
+ * fr/es/de/it/pt → 200 success on `va_openai_v2v`. Only works on
+ * `va_openai_v2v` (the client auto-switches to that graph when
+ * v2v_language is non-empty). When v2v_language is empty/absent, the
+ * route does NOT send a `properties` object (the top-level `language`
+ * is used directly — must be one of the 4 whitelisted values).
+ *
+ * NOTE: theten.ai rejects a FLAT `properties.language` string with
+ * `code:"10000", msg:"params invalid"` — the `properties` object MUST
+ * be a dict of dicts (node_name → property_dict). We build it
+ * carefully: `properties: { v2v: { language: "<ISO 639-1>" } }`.
  *
  * Response: the raw JSON returned by agent.theten.ai (passed through
  * unchanged) on success, or `{ ok: false, error }` on failure.
@@ -104,11 +119,35 @@ export async function POST(req: Request) {
   };
 
   // Top-level greeting + prompt (only if non-empty). We IGNORE any
-  // `properties` object the client sent (theten.ai rejects it).
+  // `properties` object the client sent directly (theten.ai rejects a
+  // client-supplied `properties` object with `code:"10000", msg:"params
+  // invalid"` for flat keys — but ACCEPTS a nested `properties.v2v`
+  // object — see the v2v_language override below).
   const greeting = typeof body.greeting === "string" ? body.greeting.trim() : "";
   const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
   if (greeting) payload.greeting = greeting;
   if (prompt) payload.prompt = prompt;
+
+  // `v2v_language` — the ISO 639-1 code (e.g. "fr", "es", "de") for the
+  // `properties.v2v.language` override. This BYPASSES the top-level
+  // `language` whitelist (which only accepts en-US, zh-CN, ja-JP, ko-KR).
+  // The graph definition (github.com/TEN-framework/ten-framework,
+  // `voice-assistant-realtime/tenapp/property.json`) shows the `v2v`
+  // node (using `openai_mllm_python` — gpt-realtime + Whisper-1 STT)
+  // has a `language` property. Whisper-1 supports 90+ languages. The
+  // theten.ai server validates the `properties` STRUCTURE (node_name →
+  // property_dict) but NOT the values — so any ISO 639-1 code is
+  // accepted (tested directly: fr/es/de/it/pt → 200 success on
+  // `va_openai_v2v`). Only works on `va_openai_v2v` (the client
+  // auto-switches to that graph when v2v_language is non-empty).
+  // IMPORTANT: theten.ai rejects a FLAT `properties.language` string
+  // with `code:"10000", msg:"params invalid"` — the properties object
+  // MUST be a dict of dicts (node_name → property_dict). We build it
+  // carefully: `properties: { v2v: { language: "<ISO 639-1>" } }`.
+  const v2vLanguage = typeof body.v2v_language === "string" ? body.v2v_language.trim() : "";
+  if (v2vLanguage) {
+    payload.properties = { v2v: { language: v2vLanguage } };
+  }
 
   try {
     const res = await fetch(TEN_START_URL, {
