@@ -2707,10 +2707,10 @@ function RealtimeChat() {
    *       `msg.role` (user transcript → `upsertUserLine`; AI response
    *       → append to the AI: line).
    *    8. POST `https://agent.theten.ai/api/agents/start` with the
-   *       `va_openai_v2v` graph (OpenAI voice assistant) — starts the
+   *       `va_azure_v2v` graph (Azure OpenAI voice assistant) — starts the
    *       AI agent which joins the channel as a remote user. Some
    *       graphs auto-start on join, but the explicit start is
-   *       required for `va_openai_v2v`. Fire-and-forget — non-fatal
+   *       required for `va_azure_v2v`. Fire-and-forget — non-fatal
    *       if it fails (the user can still hear any auto-started AI).
    *
    *  Teardown: handled by the shared `teardown` function — calls
@@ -2891,7 +2891,7 @@ function RealtimeChat() {
     });
 
     // 7. Start the AI agent. Some graphs auto-start on channel join,
-    //    but the explicit start is required for `va_openai_v2v`
+    //    but the explicit start is required for `va_azure_v2v`
     //    (the OpenAI voice assistant graph). The agent joins the
     //    channel as a remote user after a brief delay + fires the
     //    `user-published` handler above. Fire-and-forget — non-fatal
@@ -2904,13 +2904,13 @@ function RealtimeChat() {
           request_id: crypto.randomUUID(),
           channel_name: tokenData.channel,
           user_uid: tokenData.uid,
-          graph_name: "va_openai_v2v", // OpenAI voice assistant
+          graph_name: "va_azure_v2v", // Azure OpenAI voice assistant (default)
           language: "en-US",
           voice_type: "male",
         }),
         signal: AbortSignal.timeout(15_000),
       });
-      log("[ten] started AI agent (graph: va_openai_v2v).");
+      log("[ten] started AI agent (graph: va_azure_v2v).");
     } catch (err) {
       // Non-fatal — some graphs auto-start on join. Log + continue.
       log(`[ten] agent start request failed (non-fatal): ${(err as Error).message}`);
@@ -3078,7 +3078,7 @@ function RealtimeChat() {
           voice-ai mini-service on port 3005 — no external API keys,
           no Web Speech API, with barge-in (speaking interrupts TTS);
           TEN (theten.ai) uses Agora RTC + an OpenAI voice assistant
-          (graph `va_openai_v2v`) — the browser joins an Agora channel,
+          (graph `va_azure_v2v`) — the browser joins an Agora channel,
           publishes mic audio, subscribes to the AI's audio, and
           receives transcripts + AI responses via the data channel.
           ChatGPT needs a JWT in the vault; Perplexity + Gemini need
