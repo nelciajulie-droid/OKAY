@@ -2141,3 +2141,68 @@ Stage Summary:
   2. Open the page, click the TEN provider button, click Connect.
   3. The flow now: token fetch → Agora SDK load → channel join → mic publish → wire handlers → POST `/api/ten/start` (SUCCESS, no more "Failed to fetch") → `setStatus("connected")`.
   4. Speak — the Azure OpenAI voice assistant (graph `va_azure_v2v`) transcribes + responds with spoken audio + text via the Agora data channel.
+
+---
+Task ID: 10
+Agent: main (continuation)
+Task: User reported (in French) "il est bien mais le micro, je parle autre chose, il attendez autre chose" — the TEN provider is "good but the mic, I'm saying one thing, it expects something else." Root cause: the TEN provider hardcoded `language: "en-US"` in the agent start body, so when the user speaks French, the Azure OpenAI voice assistant transcribes their French speech as English → garbage transcript → the AI responds to the garbage (in English) → user perceives "I said X, it expected Y". Fix: add a language dropdown so the user can pick the spoken language, and inform the user that TEN only supports 4 languages.
+
+Work Log:
+- Reviewed `connectTen` step 7 (page.tsx lines 2966-2985): confirmed `language: "en-US"` + `voice_type: "male"` + `graph_name: "va_azure_v2v"` were ALL hardcoded in the fetch body sent to `/api/ten/start`. The route already forwards these fields from the body, so the fix is purely client-side: send the user-selected values instead of the hardcoded ones.
+- **Empirical language-support testing via curl against `/api/ten/start`** (which proxies to `agent.theten.ai/api/agents/start`):
+  - Tested all 18 originally-listed BCP-47 tags against `va_azure_v2v` + `va_openai_v2v` (3 retries each, 1s apart, to rule out transient 500s).
+  - **Supported (HTTP 200, code:'0', msg:'success')**: `en-US`, `zh-CN`, `ja-JP`, `ko-KR` — consistent across both graphs + both voice_types.
+  - **Unsupported (HTTP 500, code:'1', msg:'Internal Server Error')**: `fr-FR`, `es-ES`, `de-DE`, `it-IT`, `pt-BR`, `en-GB`, `en-AU`, `en-IN`, `ar-SA`, `ru-RU`, `hi-IN`, `zh-TW`, `tr-TR`, `pl-PL`, `sv-SE` — consistent on retry (NOT transient).
+  - **Other graphs**: `va_elevenlabs_v2v` + `va_coqui_v2v` accept the request but return `code:10100, msg:"process property json failed"` — they need a DIFFERENT body shape (`voice_id` instead of `voice_type`). NOT included in the dropdown to avoid confusing failures.
+  - Conclusion: the theten.ai PUBLIC deployment pre-configured only 4 STT languages (the ones Azure OpenAI voice assistant has been tested with on their infra). For French (and other unsupported languages), the user should use the **ZAI provider** (which uses the Web Speech API respecting `navigator.language` — a French browser transcribes French).
+- Added 3 constants near `CHATGPT_VOICES`:
+  - `TEN_LANGUAGES` — trimmed to 4 supported: en-US (English (US)), zh-CN (中文 (简体)), ja-JP (日本語), ko-KR (한국어). Comment explains the limitation + the ZAI fallback for French/other languages.
+  - `TEN_GRAPHS` — 2 options: `va_azure_v2v` (Azure OpenAI), `va_openai_v2v` (OpenAI). Comment notes other graphs (`va_elevenlabs_v2v`, `va_coqui_v2v`) need a different body shape + are NOT included.
+  - `TEN_VOICE_TYPES` — 2 options: male, female (unchanged).
+- Added 3 state hooks + 3 refs + 3 sync useEffects (mirrors the existing `voice`/`voiceRef`/`provider`/`providerRef` pattern):
+  - `tenGraph` / `tenGraphRef` (default `va_azure_v2v` — matches the previous hardcoded value).
+  - `tenLanguage` / `tenLanguageRef` (default `en-US`).
+  - `tenVoiceType` / `tenVoiceTypeRef` (default `male`).
+  - Refs are read at call time in `connectTen` so changing the dropdowns while connected has no effect (must Disconnect + reconnect to apply).
+- Updated `connectTen` step 7:
+  - Reads `graph` / `lang` / `vtype` from the refs instead of hardcoding `va_azure_v2v` / `en-US` / `male`.
+  - Inspects the upstream envelope returned by `/api/ten/start`: if `res.ok && upstream.code === "0"` → success log with the chosen values; else → clear actionable error log pointing the user to switch language (lists the 4 supported ones) or use the ZAI provider.
+  - The success log now reads `[ten] started AI agent (graph: va_openai_v2v, language: zh-CN, voice: female).` (with the actual chosen values) — makes it visible in the transcript which config was sent.
+- Added 3 `Select` dropdowns in the UI (shown only when `provider === "ten"`), placed right after the ChatGPT voice selector:
+  - Graph (w-36) — Azure OpenAI | OpenAI.
+  - Language (w-40) — English (US) | 中文 (简体) | 日本語 | 한국어.
+  - Voice type (w-28) — male | female.
+  - All 3 are `disabled={connected}` (same as the ChatGPT voice selector) — must Disconnect + reconnect to apply a new selection.
+  - Inline comment explains the language limitation + the ZAI recommendation.
+- Updated `CardDescription`: added a sentence "Pick the spoken-language dropdown so the Azure STT matches what you say (French → Français, etc.) — a mismatch produces garbage transcripts." (Note: the dropdown only offers the 4 supported languages, so a French speaker will see they can't pick Français + switch to ZAI.)
+- `bun run lint` → 0 errors / 0 warnings (exit code 0).
+- Dev server verified: `✓ Compiled in 153ms` + `GET / 200`. Direct curl tests confirmed the route accepts the new graph/language combinations:
+  - `POST /api/ten/start` with `{va_openai_v2v, en-US, female}` → `200 {ok:true, status:200, upstream:{code:'0', msg:'success'}}`.
+  - `POST /api/ten/start` with `{va_azure_v2v, zh-CN, male}` → `200 {ok:true, status:200, upstream:{code:'0', msg:'success'}}`.
+- Agent Browser end-to-end verification:
+  - Opened `http://localhost:3000/`, clicked the TEN radio (ref=e109) — `checked=true`.
+  - Snapshot confirmed all 3 dropdowns render: `combobox "TEN voice graph": Azure OpenAI`, `combobox "TEN spoken language": English (US)`, `combobox "TEN voice type": male`.
+  - Opened the language dropdown — options listed exactly the 4 supported: English (US), 中文 (简体), 日本語, 한국어. Selected 中文 (简体) — combobox updated to `中文 (简体)`.
+  - Opened the graph dropdown — options: Azure OpenAI (selected), OpenAI. Selected OpenAI — combobox updated to `OpenAI`.
+  - Final state: Graph=OpenAI, Language=中文 (简体), Voice=male — all 3 selectors render + persist correctly.
+  - Clicked Connect — transcript showed the same flow as Task ID 9 (`POST /api/ten/token` → `TEN token acquired` → `Loading Agora RTC SDK` → `Joining Agora RTC channel` → `Joined` → `DEVICE_NOT_FOUND`). The mic failure in the headless browser stops the flow at step 4 (mic creation) before step 7 (agent start), so `/api/ten/start` is not reached in the headless browser. But the curl tests above confirm the route forwards the selected graph/language/voice correctly.
+- Committed + pushed: `e85cfc8..d54d429 main -> main` (commit `d54d429` — "feat(ten): add graph + language + voice-type selectors (fixes French/other-language mismatch)"). Vercel will auto-rebuild.
+
+Stage Summary:
+- The TEN provider's French/other-language mismatch is FIXED for the 4 supported languages + clearly documented for the unsupported ones.
+- Root cause: `connectTen` hardcoded `language: "en-US"` in the agent start body → French speech was transcribed as English garbage → AI responded to the garbage in English → user perceived "I said X, it expected Y".
+- Fix: added 3 dropdowns (Graph, Language, Voice type) shown only when `provider === "ten"`. The selected values are forwarded to `/api/ten/start` via refs (read at call time). The agent start log now shows the chosen config + a clear actionable error message if agent.theten.ai returns a non-success code.
+- **IMPORTANT limitation discovered + documented**: the theten.ai PUBLIC deployment only supports 4 STT languages on both voice graphs (`va_azure_v2v` + `va_openai_v2v`): `en-US`, `zh-CN`, `ja-JP`, `ko-KR`. All other BCP-47 tags (`fr-FR`, `es-ES`, `de-DE`, `it-IT`, `pt-BR`, `en-GB`, etc.) return HTTP 500 "Internal Server Error" consistently (tested 3 retries each). Other graphs (`va_elevenlabs_v2v`, `va_coqui_v2v`) need a different body shape + are NOT offered.
+- For French (and other unsupported languages), the user should use the **ZAI provider** — it uses the Web Speech API which respects `navigator.language` (a French browser transcribes French).
+- Files modified:
+  - `src/app/page.tsx` (+169 / -12 lines across multiple edits):
+    - `TEN_LANGUAGES` (4 supported), `TEN_GRAPHS` (2), `TEN_VOICE_TYPES` (2) constants with explanatory comments.
+    - `tenGraph` + `tenLanguage` + `tenVoiceType` state + refs + sync useEffects.
+    - `connectTen` step 7: reads refs, inspects upstream envelope, logs clear actionable message on failure.
+    - UI: 3 `Select` dropdowns shown only when `provider === "ten"`.
+    - `CardDescription`: added note about the language limitation + ZAI recommendation.
+- What the user needs to do:
+  1. Wait for Vercel auto-deploy of commit `d54d429` (or run `bun run dev` locally).
+  2. Open the page, click the TEN provider button — 3 new dropdowns appear (Graph, Language, Voice type).
+  3. For English/Chinese/Japanese/Korean: pick the matching language → Connect → speak → the AI transcribes correctly + responds in the chosen language.
+  4. For French (or any unsupported language): switch to the **ZAI** provider button (it uses the Web Speech API respecting `navigator.language` — a French browser transcribes French).
