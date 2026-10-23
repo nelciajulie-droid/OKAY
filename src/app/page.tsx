@@ -3176,15 +3176,45 @@ function RealtimeChat() {
       // Inspect the upstream envelope — if agent.theten.ai returned a
       // non-success code (e.g. an unsupported language returns 500),
       // log a clear, actionable message instead of pretending success.
-      let startEnvelope: { ok?: boolean; status?: number; upstream?: { code?: string; msg?: string } } = {};
+      // The theten.ai API returns SUCCESS in 3 different formats (tested
+      // directly):
+      //   1. JSON `{code:"0", msg:"success"}` — the normal format (most
+      //      requests).
+      //   2. JSON `{code:200, msg:"OK"}` — HTTP-style format (sometimes
+      //      returned for the v2v override path).
+      //   3. Non-JSON body with HTTP 200 — the upstream returned an
+      //      empty body or plain text "OK" with HTTP 200. Our route
+      //      parses this as `{raw: "..."}`, so `upstream.code` is
+      //      undefined. This is STILL a success (the agent start was
+      //      accepted at the HTTP level) — treat it as success.
+      // KNOWN FAILURE codes (treat as failure regardless of HTTP status):
+      //   - "1"     → Internal Server Error (e.g. unsupported language)
+      //   - "10000" → params invalid (e.g. flat properties.language)
+      //   - "10100" → process property json failed (e.g. wrong body shape)
+      let startEnvelope: {
+        ok?: boolean;
+        status?: number;
+        upstream?: { code?: string | number; msg?: string; raw?: string };
+      } = {};
       try { startEnvelope = await startRes.json(); } catch { /* ignore parse error */ }
       const upCode = startEnvelope.upstream?.code;
       const upMsg = startEnvelope.upstream?.msg;
-      if (startRes.ok && String(upCode) === "0") {
+      const upRaw = startEnvelope.upstream?.raw;
+      const FAILURE_CODES = new Set(["1", "10000", "10100"]);
+      const isFailure = !startRes.ok || (upCode !== undefined && FAILURE_CODES.has(String(upCode)));
+      if (!isFailure) {
+        // Success — the agent started (or was already running). Log
+        // a clear success message with the chosen config + note the
+        // response format so we can diagnose future format changes.
+        const fmt =
+          String(upCode) === "0" ? "theten.ok" :
+          String(upCode) === "200" ? "http-style" :
+          upCode === undefined && upRaw !== undefined ? "non-json" :
+          "unknown";
         log(
           `[ten] started AI agent (graph: ${graph}, language: ${lang}${v2v_language ? ` (v2v override: ${v2v_language})` : ""}, voice: ${vtype}, ` +
           `greeting: ${greeting ? `${greeting.length} chars` : "default"}, ` +
-          `prompt: ${prompt ? `${prompt.length} chars` : "default"}).`,
+          `prompt: ${prompt ? `${prompt.length} chars` : "default"}, resp: ${fmt}).`,
         );
       } else {
         // The agent start failed. Common causes:
@@ -3196,8 +3226,9 @@ function RealtimeChat() {
         //  - Unsupported graph (va_elevenlabs_v2v / va_coqui_v2v need a
         //    different body shape — not offered in the dropdown).
         log(
-          `[ten] agent start failed (code=${upCode ?? startRes.status}, msg=${upMsg ?? startRes.statusText}). ` +
-          `If the language is unsupported, switch to en-US / 中文 / 日本語 / 한국어 or use the ZAI provider for other languages.`,
+          `[ten] agent start failed (HTTP ${startRes.status}, code=${upCode ?? "n/a"}, msg=${upMsg ?? startRes.statusText}). ` +
+          `If the language is unsupported, switch to en-US / 中文 / 日本語 / 한국어 or use the ZAI provider for other languages. ` +
+          `If you just disconnected, wait ~30s before reconnecting (theten.ai rate-limit).`,
         );
       }
     } catch (err) {
