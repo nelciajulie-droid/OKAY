@@ -103,19 +103,19 @@ export async function POST(req: Request) {
   // `voice-assistant-realtime/tenapp/property.json` + tested against
   // theten.ai's `va_openai_v2v` graph):
   //   - node `v2v` (addon openai_mllm_python / azure_mllm_python):
-  //       language (ISO 639-1 like "fr", or BCP-47 "en-US"),
-  //       voice (the OpenAI voice name, e.g. "alloy"),
-  //       prompt (the system instructions — yes, `v2v.prompt` IS a
-  //         real field in OpenAIRealtimeConfig + AzureRealtimeConfig,
-  //         sent to the Realtime API session.update instructions),
+  //       language (BCP-47 like "en-US", or ISO 639-1 like "fr"),
+  //       voice (the OpenAI voice NAME, e.g. "ash", "nova"),
+  //       prompt (the system instructions — `v2v.prompt` IS a real
+  //         field in OpenAIRealtimeConfig, sent to the Realtime API
+  //         session.update instructions),
   //       temperature, model, max_tokens, vad_type, vad_eagerness, ...
   //   - node `main_control` (addon main_python): greeting (the first
   //       spoken line). NO prompt field on main_control.
   //
   // So we send:
-  //   properties.v2v.language = the STT language (ISO 639-1 for non-native
-  //     languages like "fr", or BCP-47 "en-US" for native).
-  //   properties.v2v.prompt = the system instructions (Nelth-IA persona).
+  //   properties.v2v.language = the STT language (default "en-US").
+  //   properties.v2v.voice    = the OpenAI voice name (male→ash, female→nova).
+  //   properties.v2v.prompt   = the system instructions (Nelth-IA persona).
   //   properties.main_control.greeting = the first spoken line.
   //
   // We ALSO still send the top-level `language` + `voice_type` for
@@ -125,23 +125,25 @@ export async function POST(req: Request) {
   // takes precedence in the graph (the server MERGES it into the node's
   // default property dict, replacing existing values).
   //
-  // For native languages (en-US, zh-CN, ja-JP, ko-KR), we still send
-  // `properties.v2v.language` with the BCP-47 value — the graph's
-  // default is "en"/"en-US", so for zh-CN/ja-JP/ko-KR we MUST override
-  // or the STT will default to English. (Previously the top-level
-  // `language` was the ONLY signal — which the server ignored — so
-  // zh-CN/ja-JP/ko-KR likely also didn't work before this fix!)
-  const graphName = (body.graph_name as string) || "va_azure_v2v";
+  // Per user request, the defaults are FIXED: graph = va_openai_v2v,
+  // language = "en-US" (NO navigator.language auto-detection). The
+  // voice type (male/female) is the only user-facing choice; it's
+  // mapped to an OpenAI Realtime voice name (ash = male, nova = female).
+  const graphName = (body.graph_name as string) || "va_openai_v2v";
   const topLanguage = (body.language as string) || "en-US";
   const voiceType = (body.voice_type as string) || "male";
-  const v2vLanguage = typeof body.v2v_language === "string" ? body.v2v_language.trim() : "";
-  // The v2v.language: use the v2v override if provided (non-native
-  // languages like "fr"), else fall back to the top-level language (for
-  // native languages like "en-US" / "zh-CN" / "ja-JP" / "ko-KR"). This
-  // ensures zh-CN/ja-JP/ko-KR also override the graph's "en" default.
-  const v2vLangFinal = v2vLanguage || topLanguage;
   const greeting = typeof body.greeting === "string" ? body.greeting.trim() : "";
   const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+
+  // Map the UI "male"/"female" voice type to an OpenAI Realtime voice
+  // name. Per OpenAI docs, the Realtime API voices are: alloy, ash,
+  // ballad, coral, echo, nova, sage, shimmer, verse. "ash" is a male
+  // voice, "nova" is a female voice (both natural + expressive). If
+  // the client sends an unknown voice_type, fall back to "ash".
+  const openaiVoice =
+    voiceType === "female" ? "nova" :
+    voiceType === "male" ? "ash" :
+    "ash";
 
   const payload: Record<string, unknown> = {
     request_id: crypto.randomUUID(),
@@ -160,21 +162,17 @@ export async function POST(req: Request) {
   // `properties` object must be `map[node_name]map[property_name]value`
   // — flat keys are rejected with `code:"10000", msg:"params invalid"`.
   const properties: Record<string, Record<string, unknown>> = {};
-  // v2v node: language + prompt + voice. The `voice` field on
-  // openai_mllm_python is the OpenAI voice NAME (e.g. "alloy", "ash",
-  // "ballad", "coral", "echo", "nova", "sage", "shimmer", "verse") —
-  // NOT "male"/"female". theten.ai's graph default voice is "alloy".
-  // We don't currently expose voice selection in the TEN UI dropdown
-  // (only "male"/"female"), so we leave the voice to the graph default.
-  // (The openai_mllm voice is already a specific male/female voice —
-  // "male"/"female" aren't valid OpenAI voice names.)
+  // v2v node: language + voice + prompt. The `voice` field on
+  // openai_mllm_python is the OpenAI voice NAME (ash/nova/etc.) — NOT
+  // "male"/"female". We map the UI's male/female to ash/nova above.
   const v2vProps: Record<string, unknown> = {};
-  if (v2vLangFinal) v2vProps.language = v2vLangFinal;
+  if (topLanguage) v2vProps.language = topLanguage;
+  v2vProps.voice = openaiVoice;
   if (prompt) v2vProps.prompt = prompt;
-  if (Object.keys(v2vProps).length > 0) properties.v2v = v2vProps;
+  properties.v2v = v2vProps;
   // main_control node: greeting (the first spoken line).
   if (greeting) properties.main_control = { greeting };
-  if (Object.keys(properties).length > 0) payload.properties = properties;
+  payload.properties = properties;
 
   try {
     const res = await fetch(TEN_START_URL, {
