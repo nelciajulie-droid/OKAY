@@ -83,71 +83,98 @@ export async function POST(req: Request) {
     );
   }
 
-  // Build the payload. Core fields always present; optional greeting /
-  // prompt forwarded only when the client sent a non-empty value (so
-  // we don't pollute the body with empty strings + override graph
-  // defaults — the theten.ai labels say "leave it blank to use the
-  // default"). We send them as TOP-LEVEL `greeting` / `prompt` ONLY.
-  // IMPORTANT: theten.ai REJECTS a nested `properties` object with
-  // `code:"10000", msg:"params invalid"` (tested directly against
-  // agent.theten.ai/api/agents/start). So we do NOT add a `properties`
-  // field — only the top-level `greeting` + `prompt` are accepted.
+  // Build the payload. Per the theten.ai server source (github.com/
+  // TEN-framework/ten-framework, `ai_agents/server/internal/http_server.go`
+  // `StartReq` struct + the `startPropMap` in `config.go`), the server
+  // ONLY accepts these top-level fields:
+  //   request_id, channel_name, graph_name, user_uid, bot_uid, token,
+  //   worker_http_server_port, properties, timeout, tenapp_dir
+  // The top-level `language`, `voice_type`, `greeting`, `prompt` we sent
+  // before are ALL IGNORED (the server's Go struct has no matching JSON
+  // tags, and `startPropMap` only maps ChannelName/RemoteStreamId/
+  // BotStreamId/Token/WorkerHttpServerPort to node properties).
   //
-  // `language`: theten.ai REQUIRES a non-empty BCP-47 language tag —
-  // tested directly against agent.theten.ai/api/agents/start:
-  //   - "en-US" / "zh-CN" / "ja-JP" / "ko-KR" → 200 success
-  //   - "" (empty string)                   → 500
-  //   - field OMITTED                        → 500
-  //   - "auto" / "multilingual"             → 500
-  //   - "fr-FR" / "es-ES" / "de-DE" / etc.   → 500 (unsupported)
-  // So there is NO auto-detect multilingual mode via the public API —
-  // the STT filter is mandatory and must be one of the 4 supported
-  // languages. For French (or any unsupported language), users should
-  // use the ZAI provider instead (it uses the Web Speech API which
-  // respects navigator.language → a French browser transcribes French).
-  // We default to "en-US" if the field is missing/empty (backwards
-  // compat with the previous hardcoded behavior). The UI dropdown only
-  // offers the 4 supported languages, so the client always sends a
-  // valid value.
+  // The ONLY way to configure the graph is via `properties` — a
+  // `map[node_name]map[property_name]value`. The server iterates the
+  // graph's nodes + for each node matching `node_name`, it MERGES the
+  // provided property dict into the node's existing `property` map.
+  //
+  // Graph node names + property keys (verified from the open-source
+  // `voice-assistant-realtime/tenapp/property.json` + tested against
+  // theten.ai's `va_openai_v2v` graph):
+  //   - node `v2v` (addon openai_mllm_python / azure_mllm_python):
+  //       language (ISO 639-1 like "fr", or BCP-47 "en-US"),
+  //       voice (the OpenAI voice name, e.g. "alloy"),
+  //       prompt (the system instructions — yes, `v2v.prompt` IS a
+  //         real field in OpenAIRealtimeConfig + AzureRealtimeConfig,
+  //         sent to the Realtime API session.update instructions),
+  //       temperature, model, max_tokens, vad_type, vad_eagerness, ...
+  //   - node `main_control` (addon main_python): greeting (the first
+  //       spoken line). NO prompt field on main_control.
+  //
+  // So we send:
+  //   properties.v2v.language = the STT language (ISO 639-1 for non-native
+  //     languages like "fr", or BCP-47 "en-US" for native).
+  //   properties.v2v.prompt = the system instructions (Nelth-IA persona).
+  //   properties.main_control.greeting = the first spoken line.
+  //
+  // We ALSO still send the top-level `language` + `voice_type` for
+  // backwards compatibility (in case the server's deployment has a
+  // custom build that reads them — the open-source build ignores them,
+  // but theten.ai's deployment may differ). The `properties` override
+  // takes precedence in the graph (the server MERGES it into the node's
+  // default property dict, replacing existing values).
+  //
+  // For native languages (en-US, zh-CN, ja-JP, ko-KR), we still send
+  // `properties.v2v.language` with the BCP-47 value — the graph's
+  // default is "en"/"en-US", so for zh-CN/ja-JP/ko-KR we MUST override
+  // or the STT will default to English. (Previously the top-level
+  // `language` was the ONLY signal — which the server ignored — so
+  // zh-CN/ja-JP/ko-KR likely also didn't work before this fix!)
+  const graphName = (body.graph_name as string) || "va_azure_v2v";
+  const topLanguage = (body.language as string) || "en-US";
+  const voiceType = (body.voice_type as string) || "male";
+  const v2vLanguage = typeof body.v2v_language === "string" ? body.v2v_language.trim() : "";
+  // The v2v.language: use the v2v override if provided (non-native
+  // languages like "fr"), else fall back to the top-level language (for
+  // native languages like "en-US" / "zh-CN" / "ja-JP" / "ko-KR"). This
+  // ensures zh-CN/ja-JP/ko-KR also override the graph's "en" default.
+  const v2vLangFinal = v2vLanguage || topLanguage;
+  const greeting = typeof body.greeting === "string" ? body.greeting.trim() : "";
+  const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+
   const payload: Record<string, unknown> = {
     request_id: crypto.randomUUID(),
     channel_name: channelName,
     user_uid: userUid,
-    graph_name: (body.graph_name as string) || "va_azure_v2v",
-    language: (body.language as string) || "en-US",
-    voice_type: (body.voice_type as string) || "male",
+    graph_name: graphName,
+    // Backwards-compat top-level fields (server ignores them in the
+    // open-source build, but theten.ai's deployment may differ).
+    language: topLanguage,
+    voice_type: voiceType,
   };
 
-  // Top-level greeting + prompt (only if non-empty). We IGNORE any
-  // `properties` object the client sent directly (theten.ai rejects a
-  // client-supplied `properties` object with `code:"10000", msg:"params
-  // invalid"` for flat keys — but ACCEPTS a nested `properties.v2v`
-  // object — see the v2v_language override below).
-  const greeting = typeof body.greeting === "string" ? body.greeting.trim() : "";
-  const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
-  if (greeting) payload.greeting = greeting;
-  if (prompt) payload.prompt = prompt;
-
-  // `v2v_language` — the ISO 639-1 code (e.g. "fr", "es", "de") for the
-  // `properties.v2v.language` override. This BYPASSES the top-level
-  // `language` whitelist (which only accepts en-US, zh-CN, ja-JP, ko-KR).
-  // The graph definition (github.com/TEN-framework/ten-framework,
-  // `voice-assistant-realtime/tenapp/property.json`) shows the `v2v`
-  // node (using `openai_mllm_python` — gpt-realtime + Whisper-1 STT)
-  // has a `language` property. Whisper-1 supports 90+ languages. The
-  // theten.ai server validates the `properties` STRUCTURE (node_name →
-  // property_dict) but NOT the values — so any ISO 639-1 code is
-  // accepted (tested directly: fr/es/de/it/pt → 200 success on
-  // `va_openai_v2v`). Only works on `va_openai_v2v` (the client
-  // auto-switches to that graph when v2v_language is non-empty).
-  // IMPORTANT: theten.ai rejects a FLAT `properties.language` string
-  // with `code:"10000", msg:"params invalid"` — the properties object
-  // MUST be a dict of dicts (node_name → property_dict). We build it
-  // carefully: `properties: { v2v: { language: "<ISO 639-1>" } }`.
-  const v2vLanguage = typeof body.v2v_language === "string" ? body.v2v_language.trim() : "";
-  if (v2vLanguage) {
-    payload.properties = { v2v: { language: v2vLanguage } };
-  }
+  // Build the `properties` override. Node names: `v2v` (the
+  // openai_mllm_python / azure_mllm_python node) + `main_control` (the
+  // main_python node with the greeting). Per the server source, the
+  // `properties` object must be `map[node_name]map[property_name]value`
+  // — flat keys are rejected with `code:"10000", msg:"params invalid"`.
+  const properties: Record<string, Record<string, unknown>> = {};
+  // v2v node: language + prompt + voice. The `voice` field on
+  // openai_mllm_python is the OpenAI voice NAME (e.g. "alloy", "ash",
+  // "ballad", "coral", "echo", "nova", "sage", "shimmer", "verse") —
+  // NOT "male"/"female". theten.ai's graph default voice is "alloy".
+  // We don't currently expose voice selection in the TEN UI dropdown
+  // (only "male"/"female"), so we leave the voice to the graph default.
+  // (The openai_mllm voice is already a specific male/female voice —
+  // "male"/"female" aren't valid OpenAI voice names.)
+  const v2vProps: Record<string, unknown> = {};
+  if (v2vLangFinal) v2vProps.language = v2vLangFinal;
+  if (prompt) v2vProps.prompt = prompt;
+  if (Object.keys(v2vProps).length > 0) properties.v2v = v2vProps;
+  // main_control node: greeting (the first spoken line).
+  if (greeting) properties.main_control = { greeting };
+  if (Object.keys(properties).length > 0) payload.properties = properties;
 
   try {
     const res = await fetch(TEN_START_URL, {
