@@ -2410,3 +2410,32 @@ Stage Summary:
 - French (and all 20 languages) now work: OpenAI graph gets Whisper STT language + prompt-driven French replies; Azure graph gets Multilingual voices (fr-FR Remy/Vivienne for French).
 - Hard constraints documented in code: 4,096-byte body limit, top-level language must be one of the 4, prompt ≤ ~3,600 bytes, response language = prompt, node names v2v/main_control.
 - Artefacts: src/app/api/ten/start/route.ts (rewritten), src/app/page.tsx (TEN_LANGUAGES comments, connectTen, failure detection, byte counter UI, condensed TEN_PROMPT_DEFAULT).
+
+---
+Task ID: ten-french-e2e
+Agent: main (Z.ai Code)
+Task: User reported the TEN agent stays silent with French selected ("il ne parle pas et n'attend pas ma voix") despite the start API returning success.
+
+Work Log:
+- Read worklog + current code (src/app/api/ten/start/route.ts, src/app/page.tsx connectTen). Found the sparse-cloned TEN repo at /tmp/ten-graphs (ai_agents/).
+- Source analysis of the deployed path: agent.theten.ai/api/agents/start (demo Next.js route) builds default properties via getGraphProperties() then merges OUR properties with a SHALLOW spread — our `v2v` object REPLACES its {model, voice, language, prompt}. The Go server then merges per-property into the graph's property.json (defaults like api_key survive).
+- Probe of the LIVE deployed service: GET /api/agents/graphs works — 19 graphs deployed incl. va_openai_v2v, va_azure_v2v, va_openai_v2v_mini. The dev-tmp default-properties endpoint 502s (no deployed defaults visible).
+- Added audio-liveness instrumentation to page.tsx: remote-track getVolumeLevel() poller (first-detection log + "AI speaking…" pill), client.enableAudioVolumeIndicator + audio-volume fallback, first data-channel message latch, 25s no-audio watchdog log, teardown cleanup, window.__tenDebug handle (client/localTrack/remoteTrack).
+- Live experiment matrix via agent-browser (headless Chromium, getUserMedia patched to an injectable MediaStreamDestination, spaced >30s for the theten.ai rate limit):
+  - T1 fr on va_openai_v2v (current payload): start ok → agent joins → 25s digital silence (peak 0.000), zero data messages → REPRODUCED the user's bug.
+  - T2 same + model:"gpt-realtime" added: still silent → missing model was NOT the cause.
+  - T0 BARE demo-defaults payload (190B, no properties, en-US) on va_openai_v2v: STILL silent → the deployed va_openai_v2v graph is broken for EVERYONE (dead v2v node; RTC publisher joins + publishes silence).
+  - T3 fr on va_azure_v2v (fr-FR-RemyMultilingualNeural + prompt): AI audio detected (level 0.83) ~1s after join → the greeting PLAYS.
+  - T4 full round-trip on va_azure_v2v + fr: generated French speech via z-ai TTS CLI, served it from public/, injected into the patched mic dst, measured levels via __tenDebug: local track peak 84 during speech → remote track levels 57-85 for ~9s + speaking pill lit → THE AI RESPONDED IN FRENCH AUDIO. End-to-end verified.
+- Fix applied:
+  - page.tsx connectTen: non-native languages auto-switch to va_azure_v2v (was va_openai_v2v) — Azure auto-detects spoken language; Multilingual voices cover ~29 locales; prompt drives reply language.
+  - route.ts Azure branch: also sends v2v.model:"gpt-4o" explicitly (shallow-spread replaces the whole v2v object); documented the shallow-spread + broken-graph findings in the header.
+  - TEN_GRAPHS dropdown: OpenAI option labeled "OpenAI (⚠ broken on theten.ai)" until their deployment is fixed.
+- bun run lint clean; dev.log healthy (token/start routes 200). Committed d820de3 + pushed to origin/main.
+
+Stage Summary:
+- ROOT CAUSE: the deployed va_openai_v2v graph on theten.ai is DEAD for everyone (verified with the bare demo-defaults payload — the exact request the official demo sends). Every "fr" connect since the auto-switch to va_openai_v2v joined a silent, deaf agent while the start API returned success. The 4,096-byte body fix (6de3133) was necessary but exposed this deeper breakage.
+- FIX: French (and all 16 non-native languages) now ride va_azure_v2v with Azure Multilingual voices (fr: Remy/Vivienne) + auto-detected STT + prompt-driven replies. VERIFIED end-to-end with real audio: French speech in → French audio response out (~9s), greeting plays on join.
+- New capabilities shipped: "AI speaking…" indicator, no-audio watchdog (tells the user the graph failed vs. just hanging), first data-message latch, __tenDebug console handle.
+- Files: src/app/page.tsx (auto-switch to Azure, audio-liveness instrumentation, speaking pill, graph warning label, __tenDebug), src/app/api/ten/start/route.ts (Azure model:"gpt-4o" + header docs).
+- User flow: pick Français → Connect → French greeting plays → speak French → French responses. OpenAI graph option is labeled broken until theten.ai fixes it.
