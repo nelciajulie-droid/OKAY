@@ -2342,3 +2342,47 @@ Stage Summary:
   2. Open the page, click TEN, pick "Français" from the Language dropdown (auto-switches to OpenAI graph).
   3. Click Connect, speak French — Whisper-1 STT now actually transcribes French (the override is sent via `properties.v2v.language`, which the server applies to the graph), and the Nelth-IA greeting + prompt are now actually applied (sent via `properties.main_control.greeting` + `properties.v2v.prompt`).
   4. The greeting + prompt from the Settings panel are now actually used (previously ignored).
+
+---
+Task ID: 15
+Agent: main (continuation)
+Task: User request: "faire restore retourner de chose que vous supprimer et fix que langue fr fonctionne" — restore the deleted config UI (Graph/Language dropdowns) + fix so French works.
+
+Work Log:
+- Discovered the sandbox environment had been rolled back to the state of commit 5cbf6fa (Task 12) — the later commits (188418f success-check fix, 1a58ca7 properties fix, 0e46fa3 simplify-to-defaults) existed on the git REMOTE but the working tree was at the older state. The git pull --rebase during push surfaced this (remote had 0e46fa3 on top).
+- The working tree (5cbf6fa state) still had the Graph + Language + Voice type dropdowns + the Settings (Greeting & Prompt) panel + TEN_LANGUAGES (20 languages) + tenLanguageToRequest() — i.e. the "restore" was already in the file; what was MISSING was the properties-based sending fix (Task 13's 1a58ca7) + the success-check fix (188418f).
+- Re-applied the properties fix to /api/ten/start/route.ts:
+  - properties.v2v.language = v2v_language override (ISO 639-1 "fr") OR the top-level language (zh-CN/ja-JP/ko-KR) — ALWAYS set, so it both bypasses the top-level whitelist for non-native languages AND overrides the graph's "en" default for native zh-CN/ja-JP/ko-KR (the graph default is "en"!).
+  - properties.v2v.voice = male→ash, female→nova (OpenAI Realtime voice names).
+  - properties.v2v.prompt = the Nelth-IA system instructions.
+  - properties.main_control.greeting = the Nelth-IA first spoken line.
+  - Top-level language/voice_type/greeting/prompt still sent for backwards compat (a custom theten.ai build might read them) — the properties override takes precedence (the server MERGES it into the node's property dict).
+- Re-applied the success-check fix to connectTen (page.tsx): isFailure = !startRes.ok || upCode in {"1","10000","10100"}. HTTP 200 + non-JSON body (resp: "non-json") or code:200 (resp: "http-style") are SUCCESS. Fixes the "[ten] agent start failed (code=200, msg=OK)" false negative. The success log includes "resp: <format>".
+- Updated connectTen step 7 comment: the route takes the top-level greeting/prompt/voice_type/v2v_language from the request body + rebuilds them as the properties object server-side.
+- Resolved the rebase conflicts (dev.pid, worklog.md, route.ts, page.tsx) — took "theirs" (my commit's versions) for route.ts + page.tsx since they contain the full fix (restored dropdowns + properties-based sending).
+- `bun run lint` → 0 errors / 0 warnings.
+- End-to-end verification via curl through the route:
+  - {v2v_language:"fr", voice_type:"male"} → {code:"0", msg:"success"} (200).
+  - {language:"zh-CN" native} → {code:"0", msg:"success"} (200).
+  - {v2v_language:"fr", voice_type:"female"} → {code:"0", msg:"success"} (200).
+- Agent Browser verification: TEN selected → all 3 dropdowns render (Graph: Azure OpenAI, Language: English (US), Voice: male) + the Settings button. The Language dropdown lists all 20 languages (English, 中文, 日本語, 한국어, Français, Español, Deutsch, Italiano, Português, Nederlands, Русский, العربية, हिन्दी, Türkçe, Polski, Svenska, Bahasa Indonesia, Tiếng Việt, ไทย, Malagasy). Selected "Français" — the combobox shows "Français"; connectTen will auto-switch to va_openai_v2v + send the v2v override.
+- Committed + pushed: `0e46fa3..3ae9ca6 main -> main` (commit `3ae9ca6` — "fix(ten): restore Graph/Language dropdowns + make French actually work via properties"). Vercel will auto-rebuild.
+
+Stage Summary:
+- RESTORED: all 3 TEN dropdowns (Graph: Azure OpenAI/OpenAI; Language: 20 options incl. Français; Voice type: male/female) + the Settings (Greeting & Prompt) panel with the Nelth-IA defaults. The user can fully configure TEN again.
+- FIXED French (and greeting/prompt/voice actually applying): the route now sends ALL config via `properties` (the ONLY form the theten.ai server applies to the graph — top-level fields are ignored by the server's StartReq Go struct):
+    properties.v2v.language = v2v override ("fr") or top-level (zh-CN/ja-JP/ko-KR) — ALWAYS set
+    properties.v2v.voice = male→ash / female→nova
+    properties.v2v.prompt = the Nelth-IA system instructions
+    properties.main_control.greeting = the Nelth-IA first spoken line
+- FIXED the success-check false negative: isFailure = !res.ok || upCode in {1, 10000, 10100}. HTTP 200 + non-JSON body is SUCCESS (resp: "non-json").
+- When the user picks a non-native language (Français, Español, ...), connectTen auto-switches to va_openai_v2v (the only graph whose v2v node has a language property) + sends the ISO 639-1 code as the v2v_language override. Native languages (zh-CN/ja-JP/ko-KR) now ALSO override the graph's "en" default via properties.v2v.language.
+- Files modified:
+  - src/app/api/ten/start/route.ts (+139/-69): payload construction rewritten — ALL config via properties + voice mapping male→ash/female→nova.
+  - src/app/page.tsx (+139/-69 net): connectTen success-check fix + step-7 comment update.
+- What the user needs to do:
+  1. Wait for Vercel auto-deploy of commit `3ae9ca6`.
+  2. Open the page, click TEN, pick "Français" from the Language dropdown (auto-switches to the OpenAI graph + sends the v2v override).
+  3. (Optional) pick a Voice type (male→ash / female→nova) + edit the Greeting/Prompt in Settings (pre-filled with Nelth-IA).
+  4. Click Connect, speak French — Whisper-1 STT transcribes French (properties.v2v.language="fr"), the Nelth-IA greeting plays (properties.main_control.greeting), the Nelth-IA persona is applied (properties.v2v.prompt), and the voice is ash/nova (properties.v2v.voice).
+  5. Wait ~30s between Connect/Disconnect cycles (theten.ai rate-limit ~1 request/30s per IP).
