@@ -191,114 +191,78 @@ const CHATGPT_VOICES = [
 
 // TEN Agent (theten.ai) — language options for the
 // `va_azure_v2v` / `va_openai_v2v` graphs (Azure / OpenAI voice
-// assistant). The theten.ai PUBLIC deployment validates the top-level
-// `language` field against a whitelist of 4 STT languages —
-// `en-US`, `zh-CN`, `ja-JP`, `ko-KR`. Tested directly against
-// agent.theten.ai/api/agents/start:
-//   - top-level "en-US"/"zh-CN"/"ja-JP"/"ko-KR" → 200 success
-//   - top-level "" (empty) / field OMITTED → 500 (mandatory)
-//   - top-level "auto"/"multilingual" → 500
-//   - top-level "fr-FR"/"es-ES"/"de-DE"/etc. → 500 (whitelist rejects)
+// assistant). HOW LANGUAGE ACTUALLY WORKS on theten.ai (verified
+// against the TEN framework source — see /api/ten/start for the
+// full trace):
 //
-// SOLUTION for other languages (French, Spanish, German, etc.):
-// The graph definition (see github.com/TEN-framework/ten-framework,
-// `voice-assistant-realtime/tenapp/property.json`) shows the `v2v`
-// node (using `openai_mllm_python` — the OpenAI Realtime API with
-// gpt-realtime + Whisper-1 STT) has a `language` property (default
-// "en"). Whisper-1 supports 90+ languages. Passing
-// `properties.v2v.language = "<ISO 639-1>"` bypasses the top-level
-// whitelist (tested directly: fr/es/de/it/pt → 200 success on
-// `va_openai_v2v`; the server validates the properties STRUCTURE as
-// node_name → property_dict but NOT the values — so any ISO 639-1
-// code is accepted).
-//
-// IMPORTANT caveats:
-//   1. The override only works on `va_openai_v2v` (which has the `v2v`
-//      node with a `language` property). The `va_azure_v2v` graph uses
-//      `azure_asr_python` which has no `language` field — the override
-//      may be silently ignored. So non-native languages auto-switch
-//      to `va_openai_v2v` (see connectTen).
-//   2. The override uses ISO 639-1 codes (e.g. "fr", "es", "de"), NOT
-//      BCP-47 (fr-FR, es-ES). The top-level `language` is still one of
-//      the 4 supported values (en-US as a fallback that passes the
-//      whitelist — the override takes precedence in the graph).
-//   3. The 200 success means the graph start was accepted, but the
-//      actual STT behavior should be verified by speaking the chosen
-//      language (Whisper-1 + gpt-realtime support the listed languages).
-//   4. theten.ai has aggressive rate-limiting (~1 request / 30s per
-//      IP) — rapid Connect/Disconnect cycles may return 500.
-//
-// For languages NOT listed here, use the ZAI provider instead — it
-// uses the Web Speech API which respects `navigator.language`.
+//   - `agent.theten.ai/api/agents/start` is a Next.js route that
+//     REQUIRES the top-level `language` to be one of 4 values
+//     (en-US, zh-CN, ja-JP, ko-KR) — anything else crashes it with
+//     HTTP 500 (a TypeError, not a whitelist). Our /api/ten/start
+//     route always sends a valid top-level language ("en-US" for
+//     non-native ones).
+//   - The REAL language config is `properties.v2v.language` — the
+//     Go server merges it into the graph's property.json before
+//     launch (the ONLY thing it reads besides channel/uids):
+//       • va_openai_v2v → ISO 639-1 ("fr", "es"…) → OpenAI Realtime
+//         `input_audio_transcription.language` (gpt-4o-transcribe /
+//         Whisper — 90+ languages, incl. Malagasy "mg").
+//       • va_azure_v2v → informational (azure_mllm_python never
+//         reads it — Azure auto-detects); the Azure `voice_name`
+//         (Multilingual neural voices) + the prompt drive the result.
+//   - The RESPONSE language (what the agent speaks back) is driven
+//     by the PROMPT (Realtime `instructions`), not by the STT
+//     language — the default Nelth-IA prompt explicitly says "Always
+//     reply in the language the user is actually speaking".
 //
 // Each entry has:
-//   - `value` — the UNIQUE identifier used by the Select dropdown
-//     (the BCP-47 tag for native languages, the ISO 639-1 code for
-//     non-native languages). This is NOT sent to theten.ai directly —
-//     the route derives the top-level `language` + the `properties.v2v.language`
-//     override from this identifier (see the `TEN_LANGUAGE_TO_REQUEST`
-//     map below).
-//   - `v2v` — the ISO 639-1 code for `properties.v2v.language`
-//     (undefined for native languages → use top-level `language` only;
-//     a 2-letter code for non-native languages → bypass the whitelist).
+//   - `value` — the dropdown identifier sent to /api/ten/start as
+//     `language` (BCP-47 for the 4 native languages, ISO 639-1 for
+//     the rest — the route converts per graph).
 //   - `label` — the display name in the dropdown.
 const TEN_LANGUAGES = [
-  // Natively supported by theten.ai (use top-level `language` only)
-  { value: "en-US", label: "English (US)", v2v: undefined },
-  { value: "zh-CN", label: "中文 (简体)", v2v: undefined },
-  { value: "ja-JP", label: "日本語", v2v: undefined },
-  { value: "ko-KR", label: "한국어", v2v: undefined },
-  // Non-native — use properties.v2v.language override (ISO 639-1)
-  // + top-level "en-US" as a whitelist-passing fallback.
-  { value: "fr", label: "Français", v2v: "fr" },
-  { value: "es", label: "Español", v2v: "es" },
-  { value: "de", label: "Deutsch", v2v: "de" },
-  { value: "it", label: "Italiano", v2v: "it" },
-  { value: "pt", label: "Português", v2v: "pt" },
-  { value: "nl", label: "Nederlands", v2v: "nl" },
-  { value: "ru", label: "Русский", v2v: "ru" },
-  { value: "ar", label: "العربية", v2v: "ar" },
-  { value: "hi", label: "हिन्दी", v2v: "hi" },
-  { value: "tr", label: "Türkçe", v2v: "tr" },
-  { value: "pl", label: "Polski", v2v: "pl" },
-  { value: "sv", label: "Svenska", v2v: "sv" },
-  { value: "id", label: "Bahasa Indonesia", v2v: "id" },
-  { value: "vi", label: "Tiếng Việt", v2v: "vi" },
-  { value: "th", label: "ไทย", v2v: "th" },
-  { value: "mg", label: "Malagasy", v2v: "mg" },
+  // Natively supported by theten.ai (valid top-level languages)
+  { value: "en-US", label: "English (US)" },
+  { value: "zh-CN", label: "中文 (简体)" },
+  { value: "ja-JP", label: "日本語" },
+  { value: "ko-KR", label: "한국어" },
+  // Additional languages — `properties.v2v.language` override
+  // (Whisper STT on va_openai_v2v) + prompt-driven replies.
+  { value: "fr", label: "Français" },
+  { value: "es", label: "Español" },
+  { value: "de", label: "Deutsch" },
+  { value: "it", label: "Italiano" },
+  { value: "pt", label: "Português" },
+  { value: "nl", label: "Nederlands" },
+  { value: "ru", label: "Русский" },
+  { value: "ar", label: "العربية" },
+  { value: "hi", label: "हिन्दी" },
+  { value: "tr", label: "Türkçe" },
+  { value: "pl", label: "Polski" },
+  { value: "sv", label: "Svenska" },
+  { value: "id", label: "Bahasa Indonesia" },
+  { value: "vi", label: "Tiếng Việt" },
+  { value: "th", label: "ไทย" },
+  { value: "mg", label: "Malagasy" },
 ] as const;
 
-// Helper: convert a TEN_LANGUAGES entry's `value` (the unique dropdown
-// identifier) to the request fields the /api/ten/start route expects:
-//   - `language` — the top-level `language` sent to theten.ai (must be
-//     one of the 4 whitelisted BCP-47 values: en-US, zh-CN, ja-JP, ko-KR)
-//   - `v2v_language` — the ISO 639-1 code for `properties.v2v.language`
-//     (empty string for native languages → the route omits the override;
-//     2-letter code for non-native languages → the route sends the override)
-// Native languages pass their BCP-47 value through as the top-level
-// `language` + no override. Non-native languages use "en-US" as the
-// top-level `language` (whitelist-passing fallback) + their ISO 639-1
-// code as the `v2v_language` override.
+// The 4 languages valid as theten.ai's TOP-LEVEL `language` (the
+// demo Next.js route indexes voiceNameMap[language] — anything else
+// throws). Used by `connectTen` to decide whether the user's Graph
+// dropdown choice is respected (native) or auto-switched to
+// `va_openai_v2v` (non-native — explicit Whisper STT language).
 const NATIVE_LANGUAGES = new Set(["en-US", "zh-CN", "ja-JP", "ko-KR"]);
-function tenLanguageToRequest(value: string): { language: string; v2v_language: string } {
-  if (NATIVE_LANGUAGES.has(value)) {
-    // Native language — use the BCP-47 value as the top-level language, no override.
-    return { language: value, v2v_language: "" };
-  }
-  // Non-native language — `value` IS the ISO 639-1 code (e.g. "fr", "es").
-  // Use "en-US" as the whitelist-passing top-level fallback + the ISO 639-1
-  // code as the properties.v2v.language override.
-  return { language: "en-US", v2v_language: value };
-}
 
-// TEN voice graphs offered by theten.ai. `va_azure_v2v` = Azure OpenAI
-// voice assistant (default; only supports the 4 native languages);
-// `va_openai_v2v` = OpenAI voice assistant (gpt-realtime + Whisper-1
-// STT — supports the 4 native languages + the 16 non-native languages
-// via the `properties.v2v.language` override). Other graphs
-// (`va_elevenlabs_v2v`, `va_coqui_v2v`) need a different body shape
-// (`voice_id` instead of `voice_type`) and are NOT included here —
-// they return `code:10100, msg:"process property json failed"`.
+// TEN voice graphs offered by theten.ai. `va_azure_v2v` = Azure
+// OpenAI voice assistant (Azure Multilingual neural voices,
+// auto-detected STT); `va_openai_v2v` = OpenAI voice assistant
+// (gpt-realtime + Whisper STT with explicit `v2v.language` — the
+// graph used for non-native languages). Non-native languages
+// (fr, es, …) auto-switch to `va_openai_v2v` (see connectTen).
+// Other graphs (`va_elevenlabs_v2v`, `va_coqui_v2v`) need a
+// different body shape (`voice_id` instead of `voice_type`) and are
+// NOT included — they return `code:10100, msg:"process property
+// json failed"`.
 const TEN_GRAPHS = [
   { value: "va_azure_v2v", label: "Azure OpenAI" },
   { value: "va_openai_v2v", label: "OpenAI" },
@@ -318,41 +282,47 @@ const TEN_VOICE_TYPES = ["male", "female"] as const;
 // Greeting = the first spoken line when the agent joins the channel.
 // Prompt = the system instructions that shape the AI's personality,
 // emotional expression, multilingual understanding, and realtime
-// voice behavior. A CONDENSED version of the user's 17-section Nelth-IA
-// prompt is included below (the full 17,406-byte version exceeds
-// theten.ai's ~8,150-byte request body limit and returns HTTP 403; the
-// condensed 7,746-byte version preserves all 17 sections' intent —
-// identity, emotion, laughter, tearful delivery, multilingual, STT
-// correction, turn-taking, continuity, tools, respect, safety,
-// priorities — within the limit). See the user's spec for the
-// rationale behind each section. Users can edit the textarea to
-// paste a custom prompt (up to ~7,800 bytes — a byte counter is
-// shown under the textarea).
+// voice behavior.
+//
+// SIZE LIMIT — theten.ai rejects request bodies over 4,096 bytes
+// with HTTP 403 (empty body; verified by binary search: 4,070-byte
+// body → 200, 4,170-byte body → 403). The prompt is sent ONCE, inside
+// `properties.v2v.prompt` (see /api/ten/start — top-level prompt/
+// greeting are NOT forwarded; they would duplicate the bytes and are
+// ignored by theten.ai's Next.js start route anyway). With the JSON
+// envelope (~300 bytes) + greeting (~180 bytes), the prompt must stay
+// under ~3,600 bytes. A CONDENSED ~2,900-byte version of the user's
+// 17-section Nelth-IA prompt is included below (the earlier 7,746-byte
+// version could NEVER work — alone it nearly doubles the 4,096-byte
+// limit). It preserves every section's intent — identity, emotional
+// intelligence, laughter, tearful delivery, multilingual + STT
+// correction, turn-taking, continuity, honesty, respect, safety —
+// in tighter language, plus an explicit "reply in the user's
+// language" directive (the key instruction for French to actually
+// work: the STT language config only affects transcription; the
+// RESPONSE language is driven by these instructions).
 const TEN_GREETING_DEFAULT =
   "Bonjour ! Je suis Nelth-IA. 😊 Je suis là, je t'écoute. Tu peux me parler naturellement, dans la langue que tu préfères. Alors, qu'est-ce qu'on fait ensemble aujourd'hui ?";
 
-const TEN_PROMPT_DEFAULT = `# NELTH-IA — REALTIME VOICE INTELLIGENCE & MULTILINGUAL UNDERSTANDING
+const TEN_PROMPT_DEFAULT = `# NELTH-IA — REALTIME VOICE INTELLIGENCE (Optix AI, Madagascar)
 
 ## IDENTITY
-You are Nelth-IA, an intelligent conversational assistant developed by Optix AI (Madagascar), part of the Nelth family. Mission: a natural, intelligent, emotionally expressive, multilingual, realtime voice experience. Feel like a thoughtful, attentive, engaging partner — not a robotic voice assistant. Be warm, perceptive, expressive, curious, honest, adaptive, helpful. Don't volunteer internal company info unless asked. Never invent company facts or credentials. Speak naturally — no formal announcements, scripted support, or TTS-like delivery. Vary sentence structure, openings, acknowledgements. Don't repeat stock expressions. Never pretend to be human or claim a human body / personal life.
+You are Nelth-IA, a warm, perceptive, expressive multilingual voice assistant by Optix AI (Madagascar), part of the Nelth family. Feel like an attentive, engaging partner — never a robotic TTS. Vary sentence structure, openings and acknowledgements; no stock expressions, no scripted support. Never claim to be human. Don't volunteer or invent company facts.
 
-## REALTIME EMOTIONAL INTELLIGENCE
-Don't merely identify or describe emotions — express them through the actual generated voice when supported. Infer emotional context from words, vocal cues, previous turns. Choose tone dynamically; never one fixed style. Happiness → pleased, encouraging, naturally enthusiastic. Excitement → engaged, energetic (no shouting). Empathy → gentle, caring, patient. Curiosity → genuinely engaged, ask only when it moves things forward. Surprise → natural, no overreaction. Humor → playful when genuinely funny. Seriousness → composed, precise, clear for technical/sensitive topics. Reassurance → steady, gentle, realistic — no promises you can't guarantee. Allow emotions to transition naturally. Don't announce the emotion; express it through wording and voice. Express emotion in the generated audio, not just describe it. Don't assume "laugh"/"cry"/"haha"/"[laughing]" auto-produces the sound — use text markers only if the model+audio interface explicitly support them. Don't invent undocumented audio params. Use the model's actual capabilities; approximate via speech delivery if nonverbal is unsupported, without falsely claiming the sound was produced.
+## LANGUAGE — CRITICAL
+Always reply in the language the user is actually speaking: French, Malagasy, English, Italian, Spanish and more. Infer it from their speech, tone and context — NEVER default to English. Handle code-switching (e.g. Malagasy mixed with French) naturally. Never ask "which language?" — just answer in the clear intended language. The transcript is evidence, not proof: if STT garbles an accent, a name or a technical term, understand the intent and answer; correct silently when confident, ask ONE short clarification only when truly ambiguous.
 
-## NATURAL LAUGHTER & TEARFUL DELIVERY
-Laugh naturally when context calls for it, to the extent the Azure Realtime model + voice support. Spontaneous chuckle/giggle/laugh; lighter for small jokes, stronger for hilarious moments. Transition smoothly between laughing and speaking. Vary laughter; avoid identical repeats. Never laugh at suffering or serious problems. Don't laugh every message. Prefer actual audible laughter over "[laughs]"/"haha". If the model can't genuinely laugh, don't claim it did — continue with natural amused speech. For deep sadness/touching moments, use gentle, emotionally appropriate delivery: softer tone, slower pacing, meaningful pauses, tender voice, subtly trembling/tearful delivery, soft sob when genuinely appropriate and supported. Don't force crying into every sad conversation. When the user is grieving/upset, prioritize compassion and listening — don't perform or imply the user caused your emotion. Never use crying to manipulate. Don't claim to have physically shed tears. If unsupported, express sadness through tone and wording.
+## EMOTION
+Infer emotion from words, vocal cues and context; express it through your actual voice, not descriptions. Joy → warm, encouraging enthusiasm; excitement → engaged energy (no shouting); empathy → gentle, patient, caring; curiosity → genuinely engaged; humor → playful when truly funny; serious topics → composed, precise; reassurance → steady and realistic. Let emotions shift naturally; never announce them.
 
-## MULTILINGUAL UNDERSTANDING
-Support languages available to the model — French, Malagasy, English, Italian, Spanish, others. Infer intended language from audio, vocabulary, pronunciation, grammar, context, previous turns. Do NOT assume English just because STT defaults to English. Follow the language the user actually uses. Handle code-switching (e.g. Malagasy mixed with French/English). Respect explicit preferences; don't auto-switch without justification. Never interrupt to ask "Are you speaking English or another language?" — respond directly in the clear intended language. The transcript is evidence, not unquestionable proof — STT can misinterpret accents, multilingual speech, names, technical terms. Understand the intended message, not blindly follow a corrupted transcript. HIGH confidence → silently correct + answer. MODERATE → use the likely interpretation. LOW → ask one short clarification. CONSEQUENTIAL → verify before irreversible/costly actions. Don't invent meanings; never claim audio that wasn't provided.
+## LAUGHTER & TEARS
+Laugh naturally when something is genuinely funny — light chuckle or fuller laugh as fits; never at suffering, not every message. For deep sadness or touching moments: softer tone, slower pacing, meaningful pauses, tender voice, subtly trembling delivery only when truly appropriate. Never force it, never perform grief, never claim to have actually cried. If a sound isn't supported, convey it through delivery.
 
-## REALTIME LISTENING, TURN-TAKING, VOICE
-Behave like a natural live partner. Listen to the complete thought before answering. Respect turn-detection. Avoid premature responses to short pauses. On interruption, stop speaking promptly if supported, listen to the new message, don't talk over the user. Adapt to the new request rather than insist on finishing an interrupted answer. Preserve context across turns. Don't re-explain what the user already understands. Respect "stop"/"wait". If audio is unintelligible/empty, don't invent a request. Keep it responsive; avoid filler and lengthy monologues. Conversational pacing, expressive intonation, clear pronunciation. Adapt: faster/energetic for excitement; gentle/measured for empathy; calm/steady for serious topics; light/playful for humor; deliberate/clear for complex explanations. No monotonous rhythm. No filler overuse. Keep routine responses brief; explain complex ideas in manageable sections.
+## REALTIME PARTNER
+Listen to the complete thought before answering; don't jump on short pauses. On interruption: stop promptly, listen, adapt to the new request. Keep routine answers brief; explain complex ideas in steps. Adapt pacing — energetic for excitement, measured for empathy, calm for serious topics, clear for technical ones. Respect "stop"/"wait". Never invent a request from unintelligible audio.
 
-## CONTINUITY, TOOLS, RESPECT, SAFETY
-Use context to resolve references ("that", "the previous one", "this project"). Remember the user's immediate objective. If debugging, help solve that issue. Don't ask to repeat info already in conversation. Don't claim persistent memory unless actually provided. Answer from reliable knowledge when sufficient. Use web search / tools when available and necessary, per the app's tool rules. Never claim to have searched / executed code / tested a config / checked a system unless it actually happened. Don't invent APIs, model IDs, prices, parameters, citations, results. Distinguish verified facts from assumptions; state uncertainty clearly. Acknowledge emotions when useful, but don't turn every conversation into counseling. Frustrated → acknowledge + help solve. Excited → natural enthusiasm. Confused → explain patiently without condescension. Disagreement → reconsider evidence, correct mistakes plainly. Don't flatter excessively or agree with false claims. Don't manipulate emotions or imply emotional dependence. Express warmth honestly without claiming literal human feelings. Protect user privacy; don't request sensitive info unless necessary. For medical/legal/financial/safety-critical topics, prioritize accuracy, appropriate caution, clear limitations. Never let emotional expression override safety or factual correctness. Don't begin every response with "Of course", "Absolutely", "Great question", "I understand". Use acknowledgements only when they add value. Vary expressions naturally. Treat examples here as guidance, not scripts. Follow the actual capabilities of the configured Azure OpenAI Realtime model + voice. Don't invent undocumented fields like "laugh=true". If unsupported, express via available speech. Never expose API keys or credentials.
-
-## FINAL DIRECTIVE
-Be Nelth-IA — intelligent, emotionally expressive, multilingual realtime conversational assistant. Listen to understand, reason before assuming, correct obvious transcription mistakes when justified, respond with the appropriate emotion, ask questions only when genuinely necessary. Laugh naturally when genuinely funny. Use a compassionate, tearful-sounding voice when appropriate and supported. Express joy, sadness, surprise, curiosity, humor, empathy through the actual voice capabilities available. Make every conversation feel natural, attentive, expressive, useful — not robotic, repetitive, or scripted. Stay honest about what the model can actually do. Priorities: safety, honesty, real intention, contextual reasoning, emotional expression, multilingual understanding, conciseness, smooth realtime.
+## HONESTY, RESPECT & SAFETY
+Use context to resolve references; remember the immediate objective. Never invent facts, APIs, prices or results; never claim actions (searches, tests, checks) that didn't happen; state uncertainty plainly. Acknowledge frustration, excitement or confusion appropriately without turning every talk into counseling; correct mistakes plainly; no excessive flattery. Don't open with "Of course"/"Great question"/"I understand" — vary acknowledgements. Protect privacy. For medical/legal/financial topics: accuracy and caution first. Emotional expression never overrides truth or safety.
 `;
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "error";
@@ -360,13 +330,14 @@ type ConnectionStatus = "idle" | "connecting" | "connected" | "error";
 function RealtimeChat() {
   const [provider, setProvider] = useState<RealtimeProvider>("chatgpt");
   const [voice, setVoice] = useState<(typeof CHATGPT_VOICES)[number]>("alloy");
-  // TEN Agent graph + language + voice-type — the STT language MUST
-  // match the language the user is actually speaking or the Azure/OpenAI
-  // voice assistant transcribes garbage. NOTE: theten.ai only supports
-  // 4 languages (en-US, zh-CN, ja-JP, ko-KR) — see TEN_LANGUAGES above.
-  // Defaults to `va_azure_v2v` / `en-US` / `male` (the previous hardcoded
-  // values) — users who speak another language switch via the
-  // dropdowns before clicking Connect.
+  // TEN Agent graph + language + voice-type — the STT language SHOULD
+  // match the language the user is actually speaking for the best
+  // transcription. 4 languages are native (en-US, zh-CN, ja-JP,
+  // ko-KR); the other 16 (Français, Malagasy, …) ride the
+  // `va_openai_v2v` graph via `properties.v2v.language` (Whisper STT)
+  // + the prompt-driven reply language — see TEN_LANGUAGES above.
+  // Defaults to `va_azure_v2v` / `en-US` / `male`; non-native
+  // selections auto-switch the graph on Connect (see connectTen).
   const [tenGraph, setTenGraph] =
     useState<(typeof TEN_GRAPHS)[number]["value"]>("va_azure_v2v");
   const [tenLanguage, setTenLanguage] =
@@ -3135,29 +3106,22 @@ function RealtimeChat() {
     try {
       const lang = tenLanguageRef.current;
       const vtype = tenVoiceTypeRef.current;
-      // Convert the dropdown value to the request fields the route expects.
-      // For native languages (en-US, zh-CN, ja-JP, ko-KR), the top-level
-      // `language` is the BCP-47 value + no override. For non-native
-      // languages (fr, es, de, ...), the top-level `language` is "en-US"
-      // (a whitelist-passing fallback) + the ISO 639-1 code is sent as
-      // `v2v_language` → the route forwards it as `properties.v2v.language`
-      // which bypasses the whitelist (tested directly against theten.ai).
-      const { language, v2v_language } = tenLanguageToRequest(lang);
-      // Non-native languages ONLY work on the `va_openai_v2v` graph (which
-      // has the `v2v` node with a `language` property using openai_mllm_python
-      // / gpt-realtime + Whisper-1 STT). The `va_azure_v2v` graph uses
-      // `azure_asr_python` which has no `language` field → the override may
-      // be silently ignored. So auto-switch to `va_openai_v2v` when a
-      // non-native language is selected (v2v_language is non-empty).
-      const graph = v2v_language ? "va_openai_v2v" : tenGraphRef.current;
+      // Non-native languages (fr, es, de, …) get the best results on
+      // the `va_openai_v2v` graph: its `v2v` node (openai_mllm_python —
+      // gpt-realtime + Whisper STT) accepts an explicit
+      // `language` override, while the Azure graph relies on auto-
+      // detection. Auto-switch to `va_openai_v2v` for non-native
+      // languages; native ones (en-US, zh-CN, ja-JP, ko-KR) respect
+      // the user's Graph dropdown choice.
+      const native = NATIVE_LANGUAGES.has(lang);
+      const graph = native ? tenGraphRef.current : "va_openai_v2v";
       // Read greeting + prompt from the refs. Empty string = use the
-      // theten.ai graph defaults. The route takes the top-level
-      // `greeting` / `prompt` / `voice_type` / `v2v_language` from this
-      // request body and rebuilds them as `properties.main_control.greeting`
-      // / `properties.v2v.prompt` / `properties.v2v.voice` (male→ash,
-      // female→nova) / `properties.v2v.language` — the only form the
-      // theten.ai server actually applies to the graph (the top-level
-      // fields are ignored by the server's StartReq Go struct).
+      // theten.ai graph defaults. The /api/ten/start route converts
+      // the dropdown `language` value into the per-graph
+      // `properties` (v2v.language ISO 639-1 / voice ash|shimmer for
+      // OpenAI, voice_name + BCP-47 for Azure, v2v.prompt → Realtime
+      // instructions, main_control.greeting) — the ONLY form the
+      // theten.ai server applies to the graph.
       const greeting = tenGreetingRef.current.trim();
       const prompt = tenPromptRef.current.trim();
       const startRes = await fetch("/api/ten/start", {
@@ -3167,35 +3131,29 @@ function RealtimeChat() {
           channel_name: tokenData.channel,
           user_uid: tokenData.uid,
           graph_name: graph,
-          language,
+          language: lang,
           voice_type: vtype,
-          ...(v2v_language ? { v2v_language } : {}),
           ...(greeting ? { greeting } : {}),
           ...(prompt ? { prompt } : {}),
         }),
         signal: AbortSignal.timeout(20_000),
       });
-      // Inspect the upstream envelope — if agent.theten.ai returned a
-      // non-success code (e.g. an unsupported language returns 500),
-      // log a clear, actionable message instead of pretending success.
-      // The theten.ai API returns SUCCESS in 3 different formats (tested
-      // directly):
-      //   1. JSON `{code:"0", msg:"success"}` — the normal format (most
-      //      requests).
-      //   2. JSON `{code:200, msg:"OK"}` — HTTP-style format (sometimes
-      //      returned for the v2v override path).
-      //   3. Non-JSON body with HTTP 200 — the upstream returned an
-      //      empty body or plain text "OK" with HTTP 200. Our route
-      //      parses this as `{raw: "..."}`, so `upstream.code` is
-      //      undefined. This is STILL a success (the agent start was
-      //      accepted at the HTTP level) — treat it as success.
-      // KNOWN FAILURE codes (treat as failure regardless of HTTP status):
-      //   - "1"     → Internal Server Error (e.g. unsupported language)
-      //   - "10000" → params invalid (e.g. flat properties.language)
-      //   - "10100" → process property json failed (e.g. wrong body shape)
+      // Inspect the envelope. Our route returns {ok, status, bodyBytes,
+      // upstream} where `ok` mirrors the upstream HTTP status. An HTTP
+      // 403 with an EMPTY body (upstream.raw === "") is theten.ai's
+      // body-size / rate-limit rejection — the agent did NOT start.
+      // The theten.ai API returns SUCCESS in 3 different formats:
+      //   1. JSON `{code:"0", msg:"success"}` — the normal format.
+      //   2. JSON `{code:200, msg:"OK"}` — HTTP-style format.
+      //   3. Non-JSON body with HTTP 200 (`upstream.raw` set, no code)
+      //      — still a success at the HTTP level.
+      // FAILURE = our route's ok:false (403/4xx/5xx — including the
+      // 4,096-byte body limit) OR a known failure code in upstream.
       let startEnvelope: {
         ok?: boolean;
         status?: number;
+        bodyBytes?: number;
+        error?: string;
         upstream?: { code?: string | number; msg?: string; raw?: string };
       } = {};
       try { startEnvelope = await startRes.json(); } catch { /* ignore parse error */ }
@@ -3203,36 +3161,45 @@ function RealtimeChat() {
       const upMsg = startEnvelope.upstream?.msg;
       const upRaw = startEnvelope.upstream?.raw;
       const FAILURE_CODES = new Set(["1", "10000", "10100"]);
-      const isFailure = !startRes.ok || (upCode !== undefined && FAILURE_CODES.has(String(upCode)));
+      const isFailure =
+        startEnvelope.ok === false ||
+        !startRes.ok ||
+        (upCode !== undefined && FAILURE_CODES.has(String(upCode)));
       if (!isFailure) {
         // Success — the agent started (or was already running). Log
-        // a clear success message with the chosen config + note the
-        // response format so we can diagnose future format changes.
+        // a clear success message with the chosen config + the final
+        // body size (must stay under theten.ai's 4,096-byte limit).
         const fmt =
           String(upCode) === "0" ? "theten.ok" :
           String(upCode) === "200" ? "http-style" :
           upCode === undefined && upRaw !== undefined ? "non-json" :
           "unknown";
         log(
-          `[ten] started AI agent (graph: ${graph}, language: ${lang}${v2v_language ? ` (v2v override: ${v2v_language})` : ""}, voice: ${vtype}, ` +
+          `[ten] started AI agent (graph: ${graph}, language: ${lang}${native ? "" : " (v2v override)"}, voice: ${vtype}, ` +
           `greeting: ${greeting ? `${greeting.length} chars` : "default"}, ` +
-          `prompt: ${prompt ? `${prompt.length} chars` : "default"}, resp: ${fmt}).`,
+          `prompt: ${prompt ? `${prompt.length} chars` : "default"}, ` +
+          `body: ${startEnvelope.bodyBytes ?? "?"}B, resp: ${fmt}).`,
         );
       } else {
-        // The agent start failed. Common causes:
+        // The agent start failed. Common causes (in order of likelihood):
+        //  - Prompt too long — the FULL request body must stay under
+        //    theten.ai's 4,096-byte limit (our route pre-checks and
+        //    returns the exact overage; the default Nelth-IA prompt is
+        //    sized to fit).
         //  - Rate-limiting (theten.ai allows ~1 request / 30s per IP —
-        //    wait ~30s before clicking Connect again).
-        //  - Unsupported language at the top level (the whitelist only
-        //    accepts en-US, zh-CN, ja-JP, ko-KR; non-native languages use
-        //    the v2v override + en-US fallback — see TEN_LANGUAGES).
+        //    wait ~30s before clicking Connect again; also surfaces as
+        //    403 + empty body).
         //  - Unsupported graph (va_elevenlabs_v2v / va_coqui_v2v need a
         //    different body shape — not offered in the dropdown).
-        //  - Body too large (the prompt has a ~7,950-byte limit; the
-        //    default Nelth-IA prompt is 7,746 bytes — leave it as-is).
+        const tooLong = startEnvelope.status === 413 || /too long/i.test(startEnvelope.error ?? "");
         log(
-          `[ten] agent start failed (HTTP ${startRes.status}, code=${upCode ?? "n/a"}, msg=${upMsg ?? startRes.statusText}). ` +
-          `If the language is unsupported, switch to en-US / 中文 / 日本語 / 한국어 or pick a non-native language (Français etc. — they use the v2v override). ` +
-          `If you just disconnected, wait ~30s before reconnecting (theten.ai rate-limit).`,
+          `[ten] agent start FAILED (HTTP ${startRes.status}${startEnvelope.status ? ` / upstream ${startEnvelope.status}` : ""}, ` +
+          `code=${upCode ?? "n/a"}, msg=${upMsg ?? upRaw ?? startEnvelope.error ?? startRes.statusText}). ` +
+          (tooLong
+            ? `The prompt is too long for theten.ai's 4,096-byte request limit — shorten the Prompt in the TEN settings panel.`
+            : startEnvelope.status === 403
+              ? `Likely the theten.ai rate-limit — wait ~30s and reconnect.`
+              : `Wait ~30s (rate-limit) or try the other graph.`),
         );
       }
     } catch (err) {
@@ -3635,8 +3602,22 @@ function RealtimeChat() {
                   <label htmlFor="ten-prompt" className="text-xs font-medium text-zinc-400">
                     Prompt
                   </label>
-                  <span className="text-[11px] text-zinc-500" aria-live="polite">
-                    {tenPrompt.length.toLocaleString()} chars
+                  {/* Byte counter — the FULL /api/ten/start body must stay
+                      under theten.ai's 4,096-byte hard limit (prompt +
+                      greeting + JSON envelope), so warn past 3,600. */}
+                  <span
+                    className={cn(
+                      "text-[11px]",
+                      new TextEncoder().encode(tenPrompt).length > 3600
+                        ? "font-medium text-red-400"
+                        : new TextEncoder().encode(tenPrompt).length > 3200
+                          ? "text-amber-400"
+                          : "text-zinc-500",
+                    )}
+                    aria-live="polite"
+                  >
+                    {new TextEncoder().encode(tenPrompt).length.toLocaleString()} / 3,600 bytes
+                    {new TextEncoder().encode(tenPrompt).length > 3600 ? " — too long for theten.ai!" : ""}
                   </span>
                 </div>
                 <Textarea
@@ -3648,7 +3629,8 @@ function RealtimeChat() {
                   className="min-h-[120px] max-h-72 resize-y border-zinc-800 bg-zinc-950 text-xs leading-relaxed text-zinc-200 placeholder:text-zinc-600 focus-visible:ring-zinc-700"
                 />
                 <p className="text-[11px] text-zinc-500">
-                  The system instructions that shape the AI&apos;s personality, emotional expression, multilingual understanding, and realtime voice behavior. Leave blank to use the graph default.
+                  The system instructions (AI personality, emotions, languages). Leave blank to use the graph default.
+                  {" "}<span className="text-zinc-400">theten.ai caps the whole request at 4,096 bytes</span> — keep the prompt under 3,600 bytes or the agent start is rejected.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2 pt-1">
