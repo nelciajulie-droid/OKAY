@@ -34,11 +34,17 @@
  *
  *  4. Graph node names (from `examples/demo/tenapp/property.json`):
  *       - `v2v` — openai_mllm_python (va_openai_v2v) or
- *         azure_mllm_python (va_azure_v2v). Properties: `language`,
- *         `voice` (OpenAI voice name) / `voice_name` (Azure neural
- *         voice), `prompt` (→ Realtime API `instructions`).
+ *         azure_mllm_python (va_azure_v2v). Properties: `model`,
+ *         `language`, `voice` (OpenAI voice name) / `voice_name`
+ *         (Azure neural voice), `prompt` (→ Realtime API
+ *         `instructions`).
  *       - `main_control` — main_realtime_python. Property:
  *         `greeting` (first spoken line).
+ *     ⚠ The demo route merges our `properties` over its own with a
+ *     SHALLOW spread — our `v2v` object REPLACES its `{model, voice,
+ *     language, prompt}` entirely, so we repeat EVERY key we care
+ *     about (incl. `model`) or it falls back to the deployed graph's
+ *     baked-in default.
  *
  *  5. ⚠️ theten.ai rejects request bodies **> 4,096 bytes** with
  *     HTTP 403 + EMPTY body (binary-searched: 4,070 B → 200,
@@ -47,15 +53,20 @@
  *     NOT forwarded (they would duplicate the bytes for nothing).
  *
  *  6. Language formats per graph (from the addons' source):
- *       - va_openai_v2v → `v2v.language` = ISO 639-1 ("en", "fr",
- *         "zh"…) — passed to `input_audio_transcription.language`
- *         of the OpenAI Realtime session (gpt-4o-transcribe /
- *         Whisper — 90+ languages). BCP-47 like "en-US" is INVALID
- *         there, so we always strip the region.
- *       - va_azure_v2v → `v2v.language` = BCP-47 ("en-US",
- *         "fr-FR"…). NOTE: azure_mllm_python defines the field but
- *         never reads it (Azure auto-detects speech language); what
- *         matters is `voice_name` + the prompt (response language).
+ *       - va_azure_v2v → `v2v.voice_name` is what selects the TTS
+ *         language (Multilingual neural voices each speak ~29
+ *         locales); `v2v.language` (BCP-47) is informational (the
+ *         addon never reads it — Azure auto-detects the SPOKEN
+ *         language); the `v2v.prompt` drives the response language.
+ *         Non-native dropdown languages (fr, es, …) are routed HERE
+ *         by the client — verified working end-to-end (French speech
+ *         in → French audio response out).
+ *       - va_openai_v2v → `v2v.language` = ISO 639-1, but the graph is
+ *         CURRENTLY BROKEN on the deployed theten.ai build (verified
+ *         live: even the bare demo-defaults 190-byte payload joins
+ *         the channel then publishes digital silence forever — peak
+ *         audio level 0.000, no data-channel messages, for everyone,
+ *         not just our payload).
  *
  * ══════════════════════════════════════════════════════════════════
  *
@@ -86,6 +97,16 @@ const TEN_BODY_LIMIT = 4096;
  * languages are sent as "en-US" at the top level (the graph-level
  * `v2v.language` override is what actually selects the language). */
 const TOP_LEVEL_LANGUAGES = new Set(["en-US", "zh-CN", "ja-JP", "ko-KR"]);
+
+/** OpenAI Realtime model — MUST be sent explicitly. The demo Next.js
+ * route merges client `properties` over its own with a SHALLOW spread
+ * (`{...defaults, ...clientProps}`), so our `v2v` object REPLACES its
+ * `{model, voice, language, prompt}` — without `model` here, the graph
+ * falls back to its baked-in property.json default, which on the
+ * deployed theten.ai build is stale/deprecated → the OpenAI Realtime
+ * session fails → the agent joins the channel but stays silent + deaf
+ * forever (verified live: peak audio level 0.000 after 25s). */
+const OPENAI_V2V_MODEL = "gpt-realtime";
 
 /** OpenAI Realtime voices — the official demo maps male → "ash",
  * female → "shimmer" (graph.ts `voiceNameMap[lang].openai`). Both are
@@ -178,12 +199,22 @@ export async function POST(req: Request) {
 
   if (graphName === "va_azure_v2v") {
     // Azure OpenAI voice assistant — azure_mllm_python:
+    //   model     = the Azure OpenAI Realtime deployment model — sent
+    //               explicitly because the demo route's shallow-spread
+    //               merge REPLACES its whole `v2v` object with ours
+    //               (dropping keys we don't repeat).
     //   voice_name = the Azure neural voice (drives TTS language),
     //   language   = BCP-47 (informational — the addon never reads
     //                it; Azure auto-detects the spoken language),
     //   prompt     = Realtime instructions (drives response language).
+    // Non-native languages (fr, es, …) are routed HERE (see the client
+    // auto-switch): the Multilingual voices speak ~29 locales each, and
+    // va_openai_v2v is currently broken on the deployed theten.ai build
+    // (verified live: even the bare demo-defaults payload joins the
+    // channel then publishes digital silence forever).
     const voices = AZURE_VOICES[langValue] ?? AZURE_VOICE_FALLBACK;
     const v2vProps: Record<string, unknown> = {
+      model: "gpt-4o",
       voice_name: voices[voiceType],
       language: AZURE_BCP47[toIso6391(langValue)] ?? topLevelLanguage,
     };
@@ -191,12 +222,14 @@ export async function POST(req: Request) {
     properties.v2v = v2vProps;
   } else {
     // va_openai_v2v (and _mini) — openai_mllm_python:
+    //   model    = Realtime model — REQUIRED (see OPENAI_V2V_MODEL),
     //   language = ISO 639-1 → input_audio_transcription.language
     //              (gpt-4o-transcribe / Whisper — 90+ languages),
     //   voice    = OpenAI Realtime voice name (ash / shimmer —
     //              language-neutral),
     //   prompt   = Realtime instructions (drives response language).
     const v2vProps: Record<string, unknown> = {
+      model: OPENAI_V2V_MODEL,
       language: toIso6391(langValue),
       voice: voiceType === "female" ? OPENAI_VOICE.female : OPENAI_VOICE.male,
     };

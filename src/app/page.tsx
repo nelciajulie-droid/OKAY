@@ -21,6 +21,7 @@ import {
   Radio,
   RefreshCw,
   Settings,
+  Volume2,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -265,7 +266,12 @@ const NATIVE_LANGUAGES = new Set(["en-US", "zh-CN", "ja-JP", "ko-KR"]);
 // json failed"`.
 const TEN_GRAPHS = [
   { value: "va_azure_v2v", label: "Azure OpenAI" },
-  { value: "va_openai_v2v", label: "OpenAI" },
+  // ⚠ va_openai_v2v is currently BROKEN on the deployed theten.ai build
+  // (verified live: even the bare demo-defaults payload joins the channel
+  // then publishes digital silence forever — no greeting, no STT). Kept
+  // in the dropdown with a warning so users don't burn a connect cycle on
+  // it; remove the warning when theten.ai fixes their deployment.
+  { value: "va_openai_v2v", label: "OpenAI (⚠ broken on theten.ai)" },
 ] as const;
 
 const TEN_VOICE_TYPES = ["male", "female"] as const;
@@ -334,8 +340,9 @@ function RealtimeChat() {
   // match the language the user is actually speaking for the best
   // transcription. 4 languages are native (en-US, zh-CN, ja-JP,
   // ko-KR); the other 16 (Français, Malagasy, …) ride the
-  // `va_openai_v2v` graph via `properties.v2v.language` (Whisper STT)
-  // + the prompt-driven reply language — see TEN_LANGUAGES above.
+  // `va_azure_v2v` graph with Azure Multilingual voices (Remy /
+  // Vivienne for French) + auto-detected STT + the prompt-driven reply
+  // language — see TEN_LANGUAGES above.
   // Defaults to `va_azure_v2v` / `en-US` / `male`; non-native
   // selections auto-switch the graph on Connect (see connectTen).
   const [tenGraph, setTenGraph] =
@@ -356,6 +363,13 @@ function RealtimeChat() {
   // prompt doesn't dominate the UI. Users click the chevron to expand
   // + edit the greeting + prompt.
   const [tenSettingsOpen, setTenSettingsOpen] = useState<boolean>(false);
+  // True while the TEN agent's remote audio track is actually carrying
+  // audio (level > 0.02) — drives the "AI speaking…" pill. The agent's
+  // RTC publisher joins the channel + publishes a track even when its
+  // AI graph (the `v2v` node) has crashed server-side — a dead graph
+  // publishes digital silence forever, so the track alone proves
+  // nothing (see the level poller in connectTen).
+  const [tenAgentSpeaking, setTenAgentSpeaking] = useState<boolean>(false);
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -486,6 +500,18 @@ function RealtimeChat() {
   const tenClientRef = useRef<any>(null);
   const tenAudioTrackRef = useRef<any>(null);
   const tenRemoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  // TEN audio-liveness monitoring. `tenLevelPollRef` polls the remote
+  // AI track's `getVolumeLevel()` (0..1 — reads the actually-received
+  // samples) every 400ms; `tenAudioSeenRef` latches once real audio is
+  // heard; `tenLevelPeakRef` keeps the peak for the watchdog log;
+  // `tenDataSeenRef` latches on the first Agora data-channel message
+  // (transcripts / AI text — proves the graph's data path is alive even
+  // if audio metering is unavailable, e.g. headless browsers).
+  const tenLevelPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const tenAudioSeenRef = useRef(false);
+  const tenLevelPeakRef = useRef(0);
+  const tenSpeakingRef = useRef(false);
+  const tenDataSeenRef = useRef(false);
   useEffect(() => {
     voiceRef.current = voice;
   }, [voice]);
@@ -662,6 +688,12 @@ function RealtimeChat() {
       try { tenAudioTrackRef.current.close(); } catch { /* ignore */ }
       tenAudioTrackRef.current = null;
     }
+    if (tenLevelPollRef.current) {
+      clearInterval(tenLevelPollRef.current);
+      tenLevelPollRef.current = null;
+    }
+    tenSpeakingRef.current = false;
+    setTenAgentSpeaking(false);
     if (tenRemoteAudioRef.current) {
       try { tenRemoteAudioRef.current.pause(); } catch { /* ignore */ }
       try { tenRemoteAudioRef.current.srcObject = null; } catch { /* ignore */ }
@@ -2988,6 +3020,20 @@ function RealtimeChat() {
     }
     const client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
     tenClientRef.current = client;
+    // Enable volume indication + listen for `audio-volume` as a SECOND
+    // liveness signal (RTP-header based — works even where WebAudio
+    // metering can't, e.g. some headless browsers). We filter out our
+    // own uid; any other speaker in this 2-party channel is the AI.
+    try { client.enableAudioVolumeIndicator?.(); } catch { /* optional */ }
+    client.on("audio-volume", (volumes: Array<{ uid: number; level: number }>) => {
+      for (const v of volumes ?? []) {
+        if (v.uid === tokenData.uid) continue;
+        if ((v.level ?? 0) > 0 && !tenAudioSeenRef.current) {
+          tenAudioSeenRef.current = true;
+          log(`[ten] 📢 AI speaker detected via volume indication (uid=${v.uid}, level=${v.level}).`);
+        }
+      }
+    });
     log(`Joining Agora RTC channel ${tokenData.channel} (uid=${tokenData.uid})…`);
     try {
       await client.join(tokenData.appId, tokenData.channel, tokenData.token, tokenData.uid);
@@ -3012,6 +3058,10 @@ function RealtimeChat() {
     localStreamRef.current = new MediaStream([audioTrack.getMediaStreamTrack()]);
     await client.publish([audioTrack]);
     log("[ten] publishing local mic audio.");
+    // Debug handle — lets the browser console (and our headless E2E
+    // tests) inspect the live Agora session: client, local mic track,
+    // remote AI track (set in the user-published handler below).
+    (window as any).__tenDebug = { client, localTrack: audioTrack, remoteTrack: null };
 
     // 5. Listen for the AI's audio track. `user-published` fires when
     //    a remote user (the AI agent) publishes a track. We subscribe
@@ -3032,10 +3082,58 @@ function RealtimeChat() {
         }
         const stream = new MediaStream([remoteAudioTrack.getMediaStreamTrack()]);
         tenRemoteAudioRef.current.srcObject = stream;
+        if ((window as any).__tenDebug) (window as any).__tenDebug.remoteTrack = remoteAudioTrack;
         await tenRemoteAudioRef.current.play().catch(() => {
           /* autoplay may need a user gesture — the Connect click counts */
         });
         log(`[ten] remote audio track playing (uid=${user.uid}).`);
+        // ── Audio-liveness monitor ────────────────────────────────
+        // `remote audio track playing` only proves the agent's RTC
+        // publisher joined — the AI graph can still be dead (it then
+        // publishes digital silence forever: no greeting, no STT).
+        // Poll `getVolumeLevel()` (0..1, reads received samples) to
+        // detect the FIRST real audio + drive the "AI speaking…" pill,
+        // and warn after 25s of total silence — that's the signature
+        // of a graph that failed to start on theten.ai.
+        if (tenLevelPollRef.current) clearInterval(tenLevelPollRef.current);
+        tenAudioSeenRef.current = false;
+        tenLevelPeakRef.current = 0;
+        tenSpeakingRef.current = false;
+        const subscribedAt = Date.now();
+        let warnedNoAudio = false;
+        tenLevelPollRef.current = setInterval(() => {
+          try {
+            const level = Number(remoteAudioTrack.getVolumeLevel?.() ?? 0);
+            if (level > tenLevelPeakRef.current) tenLevelPeakRef.current = level;
+            if (level > 0.02) {
+              if (!tenAudioSeenRef.current) {
+                tenAudioSeenRef.current = true;
+                log(`[ten] 🎧 AI audio detected (level ${level.toFixed(2)}) — the agent is speaking.`);
+              }
+              if (!tenSpeakingRef.current) {
+                tenSpeakingRef.current = true;
+                setTenAgentSpeaking(true);
+              }
+            } else if (tenSpeakingRef.current) {
+              tenSpeakingRef.current = false;
+              setTenAgentSpeaking(false);
+            }
+            if (
+              !warnedNoAudio &&
+              !tenAudioSeenRef.current &&
+              Date.now() - subscribedAt > 25_000
+            ) {
+              warnedNoAudio = true;
+              log(
+                `[ten] ⚠️ no AI audio after 25s (peak level ${tenLevelPeakRef.current.toFixed(3)}). ` +
+                "The agent joined the channel but its AI graph appears to have failed on theten.ai — " +
+                "the greeting should have played by now. Wait ~30s and reconnect, or try the other graph.",
+              );
+            }
+          } catch {
+            /* track closed during teardown — interval is cleared there */
+          }
+        }, 400);
       } catch (err) {
         log(`[ten] failed to play remote audio: ${(err as Error).message}`);
       }
@@ -3065,6 +3163,16 @@ function RealtimeChat() {
           delta?: string;
         };
         const content = msg.text ?? msg.transcript ?? msg.delta ?? "";
+        // Latch + log the FIRST data-channel message — together with
+        // the audio meter this distinguishes "graph alive but audio
+        // metering unavailable" from "graph dead on the server".
+        if (!tenDataSeenRef.current) {
+          tenDataSeenRef.current = true;
+          log(
+            `[ten] 📩 first data-channel message (type=${msg.type ?? "?"}, role=${msg.role ?? "?"}): ` +
+            `${(content || "(empty)").slice(0, 80)}`,
+          );
+        }
         if (!content) return;
         if (msg.type === "transcript" || msg.role === "user") {
           // User mic transcript → upsert the "You:" line.
@@ -3106,15 +3214,20 @@ function RealtimeChat() {
     try {
       const lang = tenLanguageRef.current;
       const vtype = tenVoiceTypeRef.current;
-      // Non-native languages (fr, es, de, …) get the best results on
-      // the `va_openai_v2v` graph: its `v2v` node (openai_mllm_python —
-      // gpt-realtime + Whisper STT) accepts an explicit
-      // `language` override, while the Azure graph relies on auto-
-      // detection. Auto-switch to `va_openai_v2v` for non-native
+      // Non-native languages (fr, es, de, …) ride the `va_azure_v2v`
+      // graph: Azure auto-detects the spoken language, the Multilingual
+      // neural voices (fr-FR Remy / Vivienne, en-US Andrew / Ava…)
+      // natively speak ~29 locales each, and the prompt drives the
+      // response language. `va_openai_v2v` would accept an explicit
+      // `v2v.language` override — but it is currently BROKEN on the
+      // deployed theten.ai build (verified live 2026-02: even the bare
+      // demo-defaults payload joins the channel then publishes digital
+      // silence forever — peak audio level 0.000, no data-channel
+      // messages). Auto-switch to `va_azure_v2v` for non-native
       // languages; native ones (en-US, zh-CN, ja-JP, ko-KR) respect
       // the user's Graph dropdown choice.
       const native = NATIVE_LANGUAGES.has(lang);
-      const graph = native ? tenGraphRef.current : "va_openai_v2v";
+      const graph = native ? tenGraphRef.current : "va_azure_v2v";
       // Read greeting + prompt from the refs. Empty string = use the
       // theten.ai graph defaults. The /api/ten/start route converts
       // the dropdown `language` value into the per-graph
@@ -3660,7 +3773,17 @@ function RealtimeChat() {
         )}
 
         {/* Connect / disconnect + mic */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {provider === "ten" && connected && tenAgentSpeaking && (
+            <span
+              className="flex animate-pulse items-center gap-1.5 rounded-full border border-emerald-700/60 bg-emerald-950/60 px-3 py-1 text-xs font-medium text-emerald-300"
+              role="status"
+              aria-live="polite"
+            >
+              <Volume2 className="size-3.5" aria-hidden />
+              AI speaking…
+            </span>
+          )}
           {connected ? (
             <Button
               variant="destructive"
