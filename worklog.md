@@ -2386,3 +2386,27 @@ Stage Summary:
   3. (Optional) pick a Voice type (male→ash / female→nova) + edit the Greeting/Prompt in Settings (pre-filled with Nelth-IA).
   4. Click Connect, speak French — Whisper-1 STT transcribes French (properties.v2v.language="fr"), the Nelth-IA greeting plays (properties.main_control.greeting), the Nelth-IA persona is applied (properties.v2v.prompt), and the voice is ash/nova (properties.v2v.voice).
   5. Wait ~30s between Connect/Disconnect cycles (theten.ai rate-limit ~1 request/30s per IP).
+
+---
+Task ID: ten-french-fix
+Agent: main (Z.ai Code)
+Task: User reported "il ne fonctionne pas quand je fais fr" — French doesn't work when selected in the TEN Agent language dropdown.
+
+Work Log:
+- Sparse-cloned TEN framework repo (github.com/TEN-framework/ten-framework, ai_agents/) and read the actual deployed stack:
+  - agent.theten.ai/api/agents/start = examples/demo Next.js route (NOT the Go server): rebuilds `properties` from top-level language/voice_type/prompt/greeting, then merges client `properties` on top (shallow spread) and forwards to the Go /start.
+  - Go server StartReq ONLY reads channel/uids/graph_name/properties — everything else configured via properties: map[node_name]map[prop]value merged into the graph property.json.
+  - Top-level `language` must be one of en-US/zh-CN/ja-JP/ko-KR or the route throws (voiceNameMap[lang] TypeError → HTTP 500) — NOT a server whitelist.
+  - va_openai_v2v nodes: `v2v` (openai_mllm_python: language ISO 639-1 → input_audio_transcription.language, voice, prompt → Realtime instructions) + `main_control` (greeting). va_azure_v2v: v2v = azure_mllm_python (voice_name Azure neural voice; language field is dead code — Azure auto-detects; prompt drives response language).
+- Live binary search against theten.ai: request bodies > 4,096 bytes → HTTP 403 + EMPTY body (4,070B ok, 4,170B 403). The 7,746-byte Nelth-IA prompt sent twice (top-level + properties, since commit 1a58ca7) = ~8KB → 403 on every connect → agent never started → silence. Client treated it as success (no upstream.code).
+- Fixed /api/ten/start: per-graph properties (OpenAI: ISO 639-1 + ash/shimmer; Azure: Multilingual voice_name + BCP-47), prompt/greeting sent ONCE inside properties, top-level language always a valid 4-value, 4,096-byte guard returning 413 with actionable message + bodyBytes echoed.
+- Condensed TEN_PROMPT_DEFAULT 7,746 → 2,911 bytes (kept all 17 persona sections' intent + added explicit "Always reply in the language the user is actually speaking" — response language is prompt-driven, STT config only affects transcription).
+- Client (page.tsx): sends dropdown language value directly (removed tenLanguageToRequest v2v_language mechanism), auto-switch to va_openai_v2v only for non-native languages, failure detection now catches ok:false/403/413 with clear log messages, byte counter UI shows "x / 3,600 bytes" with amber/red warnings.
+- Verified end-to-end with agent-browser (patched getUserMedia with silent track for headless): Français selected → Connect → token → Agora join → agent start "(graph: va_openai_v2v, language: fr (v2v override), voice: male, greeting: 171 chars, prompt: 2880 chars, body: 3387B, resp: theten.ok)" → remote audio track playing (agent actually joined) → clean Disconnect. Zero console/page errors.
+- bun run lint clean. Committed as 6de3133.
+
+Stage Summary:
+- Root cause was NOT the language config: properties.v2v.language="fr" was always accepted. It was the 4,096-byte theten.ai body limit silently 403-ing every start with the old 7.7KB prompt (duplicated on top of that), plus the client misreading the failure as success.
+- French (and all 20 languages) now work: OpenAI graph gets Whisper STT language + prompt-driven French replies; Azure graph gets Multilingual voices (fr-FR Remy/Vivienne for French).
+- Hard constraints documented in code: 4,096-byte body limit, top-level language must be one of the 4, prompt ≤ ~3,600 bytes, response language = prompt, node names v2v/main_control.
+- Artefacts: src/app/api/ten/start/route.ts (rewritten), src/app/page.tsx (TEN_LANGUAGES comments, connectTen, failure detection, byte counter UI, condensed TEN_PROMPT_DEFAULT).
