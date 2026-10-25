@@ -189,51 +189,121 @@ const CHATGPT_VOICES = [
   "verse",
 ] as const;
 
-// TEN Agent — default graph + greeting + prompt. Per user request, the
-// TEN provider now runs with SENSIBLE DEFAULTS — no Graph/Language
-// dropdowns in the UI. The user just clicks Connect + TEN runs with:
-//   - graph: `va_openai_v2v` (the OpenAI Realtime graph — supports the
-//     v2v node properties + Whisper-1 STT for 90+ languages).
-//   - language: "en-US" (the default — the user did NOT want
-//     auto-detection via `navigator.language`; English (US) is the
-//     fixed default. The Nelth-IA persona prompts the AI to infer the
-//     user's intended language + respond in that language, but the STT
-//     language filter stays "en-US").
-//   - voice: chosen via the "Voice type" dropdown (male/female). The
-//     route maps male→"ash", female→"nova" (OpenAI Realtime voice names).
-//   - greeting: TEN_GREETING_DEFAULT (the Nelth-IA French greeting).
-//   - prompt: TEN_PROMPT_DEFAULT (the condensed Nelth-IA persona).
+// TEN Agent (theten.ai) — language options for the
+// `va_azure_v2v` / `va_openai_v2v` graphs (Azure / OpenAI voice
+// assistant). The theten.ai PUBLIC deployment validates the top-level
+// `language` field against a whitelist of 4 STT languages —
+// `en-US`, `zh-CN`, `ja-JP`, `ko-KR`. Tested directly against
+// agent.theten.ai/api/agents/start:
+//   - top-level "en-US"/"zh-CN"/"ja-JP"/"ko-KR" → 200 success
+//   - top-level "" (empty) / field OMITTED → 500 (mandatory)
+//   - top-level "auto"/"multilingual" → 500
+//   - top-level "fr-FR"/"es-ES"/"de-DE"/etc. → 500 (whitelist rejects)
 //
-// The user can edit the greeting + prompt via the "Settings — Greeting
-// & Prompt custom" collapsible panel AND pick the voice type via the
-// "Voice type" dropdown. The graph + language are NOT exposed — TEN
-// runs with the defaults above (va_openai_v2v + en-US).
+// SOLUTION for other languages (French, Spanish, German, etc.):
+// The graph definition (see github.com/TEN-framework/ten-framework,
+// `voice-assistant-realtime/tenapp/property.json`) shows the `v2v`
+// node (using `openai_mllm_python` — the OpenAI Realtime API with
+// gpt-realtime + Whisper-1 STT) has a `language` property (default
+// "en"). Whisper-1 supports 90+ languages. Passing
+// `properties.v2v.language = "<ISO 639-1>"` bypasses the top-level
+// whitelist (tested directly: fr/es/de/it/pt → 200 success on
+// `va_openai_v2v`; the server validates the properties STRUCTURE as
+// node_name → property_dict but NOT the values — so any ISO 639-1
+// code is accepted).
 //
-// IMPORTANT: the theten.ai server (per the open-source TEN-framework
-// repo, `ai_agents/server/internal/http_server.go` StartReq struct)
-// IGNORES top-level `language`/`voice_type`/`greeting`/`prompt` — the
-// ONLY way to configure the graph is via `properties` (a
-// `map[node_name]map[property_name]value`). The `/api/ten/start` route
-// builds the properties object:
-//   properties.v2v.language = "en-US" (the fixed default)
-//   properties.v2v.voice    = the OpenAI voice name (ash/nova)
-//   properties.v2v.prompt   = the Nelth-IA system instructions
-//   properties.main_control.greeting = the first spoken line
-// See the route file for the full details.
+// IMPORTANT caveats:
+//   1. The override only works on `va_openai_v2v` (which has the `v2v`
+//      node with a `language` property). The `va_azure_v2v` graph uses
+//      `azure_asr_python` which has no `language` field — the override
+//      may be silently ignored. So non-native languages auto-switch
+//      to `va_openai_v2v` (see connectTen).
+//   2. The override uses ISO 639-1 codes (e.g. "fr", "es", "de"), NOT
+//      BCP-47 (fr-FR, es-ES). The top-level `language` is still one of
+//      the 4 supported values (en-US as a fallback that passes the
+//      whitelist — the override takes precedence in the graph).
+//   3. The 200 success means the graph start was accepted, but the
+//      actual STT behavior should be verified by speaking the chosen
+//      language (Whisper-1 + gpt-realtime support the listed languages).
+//   4. theten.ai has aggressive rate-limiting (~1 request / 30s per
+//      IP) — rapid Connect/Disconnect cycles may return 500.
 //
-// NOTE: the `v2v.voice` field on `openai_mllm_python` is the OpenAI
-// voice NAME (alloy/ash/ballad/coral/echo/nova/sage/shimmer/verse) —
-// NOT "male"/"female". The graph default is "alloy" (a female-ish
-// voice). We expose a "Voice type" dropdown (male/female) in the UI
-// for UX consistency with other providers, but map it to a sensible
-// OpenAI voice: male → "ash", female → "nova" (both are natural
-// OpenAI Realtime voices). The route forwards `voice_type` as
-// `properties.v2v.voice` so the chosen gender is applied.
+// For languages NOT listed here, use the ZAI provider instead — it
+// uses the Web Speech API which respects `navigator.language`.
+//
+// Each entry has:
+//   - `value` — the UNIQUE identifier used by the Select dropdown
+//     (the BCP-47 tag for native languages, the ISO 639-1 code for
+//     non-native languages). This is NOT sent to theten.ai directly —
+//     the route derives the top-level `language` + the `properties.v2v.language`
+//     override from this identifier (see the `TEN_LANGUAGE_TO_REQUEST`
+//     map below).
+//   - `v2v` — the ISO 639-1 code for `properties.v2v.language`
+//     (undefined for native languages → use top-level `language` only;
+//     a 2-letter code for non-native languages → bypass the whitelist).
+//   - `label` — the display name in the dropdown.
+const TEN_LANGUAGES = [
+  // Natively supported by theten.ai (use top-level `language` only)
+  { value: "en-US", label: "English (US)", v2v: undefined },
+  { value: "zh-CN", label: "中文 (简体)", v2v: undefined },
+  { value: "ja-JP", label: "日本語", v2v: undefined },
+  { value: "ko-KR", label: "한국어", v2v: undefined },
+  // Non-native — use properties.v2v.language override (ISO 639-1)
+  // + top-level "en-US" as a whitelist-passing fallback.
+  { value: "fr", label: "Français", v2v: "fr" },
+  { value: "es", label: "Español", v2v: "es" },
+  { value: "de", label: "Deutsch", v2v: "de" },
+  { value: "it", label: "Italiano", v2v: "it" },
+  { value: "pt", label: "Português", v2v: "pt" },
+  { value: "nl", label: "Nederlands", v2v: "nl" },
+  { value: "ru", label: "Русский", v2v: "ru" },
+  { value: "ar", label: "العربية", v2v: "ar" },
+  { value: "hi", label: "हिन्दी", v2v: "hi" },
+  { value: "tr", label: "Türkçe", v2v: "tr" },
+  { value: "pl", label: "Polski", v2v: "pl" },
+  { value: "sv", label: "Svenska", v2v: "sv" },
+  { value: "id", label: "Bahasa Indonesia", v2v: "id" },
+  { value: "vi", label: "Tiếng Việt", v2v: "vi" },
+  { value: "th", label: "ไทย", v2v: "th" },
+  { value: "mg", label: "Malagasy", v2v: "mg" },
+] as const;
 
-const TEN_DEFAULT_GRAPH = "va_openai_v2v";
+// Helper: convert a TEN_LANGUAGES entry's `value` (the unique dropdown
+// identifier) to the request fields the /api/ten/start route expects:
+//   - `language` — the top-level `language` sent to theten.ai (must be
+//     one of the 4 whitelisted BCP-47 values: en-US, zh-CN, ja-JP, ko-KR)
+//   - `v2v_language` — the ISO 639-1 code for `properties.v2v.language`
+//     (empty string for native languages → the route omits the override;
+//     2-letter code for non-native languages → the route sends the override)
+// Native languages pass their BCP-47 value through as the top-level
+// `language` + no override. Non-native languages use "en-US" as the
+// top-level `language` (whitelist-passing fallback) + their ISO 639-1
+// code as the `v2v_language` override.
+const NATIVE_LANGUAGES = new Set(["en-US", "zh-CN", "ja-JP", "ko-KR"]);
+function tenLanguageToRequest(value: string): { language: string; v2v_language: string } {
+  if (NATIVE_LANGUAGES.has(value)) {
+    // Native language — use the BCP-47 value as the top-level language, no override.
+    return { language: value, v2v_language: "" };
+  }
+  // Non-native language — `value` IS the ISO 639-1 code (e.g. "fr", "es").
+  // Use "en-US" as the whitelist-passing top-level fallback + the ISO 639-1
+  // code as the properties.v2v.language override.
+  return { language: "en-US", v2v_language: value };
+}
 
-// TEN voice-type options exposed in the UI (male/female). Mapped to
-// OpenAI Realtime voice names in the route (male→ash, female→nova).
+// TEN voice graphs offered by theten.ai. `va_azure_v2v` = Azure OpenAI
+// voice assistant (default; only supports the 4 native languages);
+// `va_openai_v2v` = OpenAI voice assistant (gpt-realtime + Whisper-1
+// STT — supports the 4 native languages + the 16 non-native languages
+// via the `properties.v2v.language` override). Other graphs
+// (`va_elevenlabs_v2v`, `va_coqui_v2v`) need a different body shape
+// (`voice_id` instead of `voice_type`) and are NOT included here —
+// they return `code:10100, msg:"process property json failed"`.
+const TEN_GRAPHS = [
+  { value: "va_azure_v2v", label: "Azure OpenAI" },
+  { value: "va_openai_v2v", label: "OpenAI" },
+] as const;
+
 const TEN_VOICE_TYPES = ["male", "female"] as const;
 
 // TEN Agent — default Greeting + Prompt (the "Nelth-IA" persona from
@@ -290,18 +360,25 @@ type ConnectionStatus = "idle" | "connecting" | "connected" | "error";
 function RealtimeChat() {
   const [provider, setProvider] = useState<RealtimeProvider>("chatgpt");
   const [voice, setVoice] = useState<(typeof CHATGPT_VOICES)[number]>("alloy");
-  // TEN voice type + greeting + prompt — the custom AI persona
-  // ("Nelth-IA" from Optix AI). Voice type (male/female) is exposed via
-  // a dropdown; greeting + prompt are pre-filled with
-  // TEN_GREETING_DEFAULT + TEN_PROMPT_DEFAULT so clicking Connect
-  // immediately starts the custom persona. Both are forwarded to
-  // `/api/ten/start` (empty string = use theten.ai graph defaults).
-  // Editing these is optional — the user can clear them to revert to
-  // the graph defaults, or tweak them to taste. The graph + language
-  // are NOT user-configurable — TEN runs with sensible defaults
-  // (TEN_DEFAULT_GRAPH = "va_openai_v2v" + language = "en-US").
+  // TEN Agent graph + language + voice-type — the STT language MUST
+  // match the language the user is actually speaking or the Azure/OpenAI
+  // voice assistant transcribes garbage. NOTE: theten.ai only supports
+  // 4 languages (en-US, zh-CN, ja-JP, ko-KR) — see TEN_LANGUAGES above.
+  // Defaults to `va_azure_v2v` / `en-US` / `male` (the previous hardcoded
+  // values) — users who speak another language switch via the
+  // dropdowns before clicking Connect.
+  const [tenGraph, setTenGraph] =
+    useState<(typeof TEN_GRAPHS)[number]["value"]>("va_azure_v2v");
+  const [tenLanguage, setTenLanguage] =
+    useState<(typeof TEN_LANGUAGES)[number]["value"]>("en-US");
   const [tenVoiceType, setTenVoiceType] =
     useState<(typeof TEN_VOICE_TYPES)[number]>("male");
+  // TEN greeting + prompt — the custom AI persona ("Nelth-IA" from
+  // Optix AI). Pre-filled with TEN_GREETING_DEFAULT + TEN_PROMPT_DEFAULT
+  // so clicking Connect immediately starts the custom persona. Both
+  // are forwarded to `/api/ten/start` (empty string = use theten.ai
+  // graph defaults). Editing these is optional — the user can clear
+  // them to revert to the graph defaults, or tweak them to taste.
   const [tenGreeting, setTenGreeting] = useState<string>(TEN_GREETING_DEFAULT);
   const [tenPrompt, setTenPrompt] = useState<string>(TEN_PROMPT_DEFAULT);
   // Collapsible "Settings" panel — collapsed by default so the long
@@ -320,10 +397,13 @@ function RealtimeChat() {
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const voiceRef = useRef(voice);
   const providerRef = useRef(provider);
-  // TEN voice type + greeting + prompt refs — `connectTen` reads these
-  // at call time so changing the dropdown / textareas while connected
-  // has no effect (you must Disconnect + reconnect to apply a new
-  // voice / greeting / prompt).
+  // TEN graph + language + voice-type + greeting + prompt refs —
+  // `connectTen` reads these at call time so changing the dropdowns /
+  // textareas while connected has no effect (you must Disconnect +
+  // reconnect to apply a new graph / language / voice / greeting /
+  // prompt).
+  const tenGraphRef = useRef(tenGraph);
+  const tenLanguageRef = useRef(tenLanguage);
   const tenVoiceTypeRef = useRef(tenVoiceType);
   const tenGreetingRef = useRef(tenGreeting);
   const tenPromptRef = useRef(tenPrompt);
@@ -442,8 +522,14 @@ function RealtimeChat() {
     providerRef.current = provider;
   }, [provider]);
   useEffect(() => {
+    tenLanguageRef.current = tenLanguage;
+  }, [tenLanguage]);
+  useEffect(() => {
     tenVoiceTypeRef.current = tenVoiceType;
   }, [tenVoiceType]);
+  useEffect(() => {
+    tenGraphRef.current = tenGraph;
+  }, [tenGraph]);
   useEffect(() => {
     tenGreetingRef.current = tenGreeting;
   }, [tenGreeting]);
@@ -2844,16 +2930,15 @@ function RealtimeChat() {
    *       `msg.role` (user transcript → `upsertUserLine`; AI response
    *       → append to the AI: line).
    *    8. POST `/api/ten/start` (server-side proxy to
-   *       `agent.theten.ai/api/agents/start`) with the `va_openai_v2v`
-   *       graph (OpenAI voice assistant — gpt-realtime + Whisper-1 STT)
-   *       + the fixed defaults (language = "en-US", voice type from the
-   *       dropdown mapped to ash/nova) + the Nelth-IA greeting + prompt
-   *       — starts the AI agent which joins the channel as a remote
-   *       user. We use a same-origin proxy (not a direct browser fetch)
-   *       because agent.theten.ai does not send CORS headers allowing
-   *       our origin — a direct browser POST fails with a generic
-   *       "Failed to fetch". Fire-and-forget — non-fatal if it fails
-   *       (some graphs auto-start on join).
+   *       `agent.theten.ai/api/agents/start`) with the `va_azure_v2v`
+   *       graph (Azure OpenAI voice assistant) — starts the AI agent
+   *       which joins the channel as a remote user. We use a same-origin
+   *       proxy (not a direct browser fetch) because agent.theten.ai
+   *       does not send CORS headers allowing our origin — a direct
+   *       browser POST fails with a generic "Failed to fetch". Some
+   *       graphs auto-start on join, but the explicit start is
+   *       required for `va_azure_v2v`. Fire-and-forget — non-fatal
+   *       if it fails (the user can still hear any auto-started AI).
    *
    *  Teardown: handled by the shared `teardown` function — calls
    *  `client.leave()` (leaves the channel + unpublishes + unsubscribes),
@@ -3033,10 +3118,10 @@ function RealtimeChat() {
     });
 
     // 7. Start the AI agent. Some graphs auto-start on channel join,
-    //    but the explicit start is required for `va_openai_v2v`
-    //    (the OpenAI voice assistant graph — gpt-realtime + Whisper-1
-    //    STT). The agent joins the channel as a remote user after a
-    //    brief delay + fires the `user-published` handler above.
+    //    but the explicit start is required for `va_azure_v2v`
+    //    (the Azure OpenAI voice assistant graph). The agent joins the
+    //    channel as a remote user after a brief delay + fires the
+    //    `user-published` handler above.
     //
     //    IMPORTANT: this goes through our own `/api/ten/start` route
     //    (server-side proxy to agent.theten.ai/api/agents/start), NOT
@@ -3048,17 +3133,31 @@ function RealtimeChat() {
     //    Fire-and-forget — non-fatal if it fails (some graphs
     //    auto-start on join).
     try {
-      // Fixed defaults (per user request): graph = va_openai_v2v,
-      // language = "en-US". NO navigator.language auto-detection —
-      // English (US) is the fixed default. The Nelth-IA persona prompts
-      // the AI to infer the user's intended language + respond in that
-      // language, but the STT language filter stays "en-US".
-      const graph = TEN_DEFAULT_GRAPH;
-      const language = "en-US";
+      const lang = tenLanguageRef.current;
       const vtype = tenVoiceTypeRef.current;
+      // Convert the dropdown value to the request fields the route expects.
+      // For native languages (en-US, zh-CN, ja-JP, ko-KR), the top-level
+      // `language` is the BCP-47 value + no override. For non-native
+      // languages (fr, es, de, ...), the top-level `language` is "en-US"
+      // (a whitelist-passing fallback) + the ISO 639-1 code is sent as
+      // `v2v_language` → the route forwards it as `properties.v2v.language`
+      // which bypasses the whitelist (tested directly against theten.ai).
+      const { language, v2v_language } = tenLanguageToRequest(lang);
+      // Non-native languages ONLY work on the `va_openai_v2v` graph (which
+      // has the `v2v` node with a `language` property using openai_mllm_python
+      // / gpt-realtime + Whisper-1 STT). The `va_azure_v2v` graph uses
+      // `azure_asr_python` which has no `language` field → the override may
+      // be silently ignored. So auto-switch to `va_openai_v2v` when a
+      // non-native language is selected (v2v_language is non-empty).
+      const graph = v2v_language ? "va_openai_v2v" : tenGraphRef.current;
       // Read greeting + prompt from the refs. Empty string = use the
-      // theten.ai graph defaults (the labels on their Settings panel
-      // say "leave it blank if you want to use default one").
+      // theten.ai graph defaults. The route takes the top-level
+      // `greeting` / `prompt` / `voice_type` / `v2v_language` from this
+      // request body and rebuilds them as `properties.main_control.greeting`
+      // / `properties.v2v.prompt` / `properties.v2v.voice` (male→ash,
+      // female→nova) / `properties.v2v.language` — the only form the
+      // theten.ai server actually applies to the graph (the top-level
+      // fields are ignored by the server's StartReq Go struct).
       const greeting = tenGreetingRef.current.trim();
       const prompt = tenPromptRef.current.trim();
       const startRes = await fetch("/api/ten/start", {
@@ -3070,6 +3169,7 @@ function RealtimeChat() {
           graph_name: graph,
           language,
           voice_type: vtype,
+          ...(v2v_language ? { v2v_language } : {}),
           ...(greeting ? { greeting } : {}),
           ...(prompt ? { prompt } : {}),
         }),
@@ -3114,7 +3214,7 @@ function RealtimeChat() {
           upCode === undefined && upRaw !== undefined ? "non-json" :
           "unknown";
         log(
-          `[ten] started AI agent (graph: ${graph}, language: ${language}, voice: ${vtype}, ` +
+          `[ten] started AI agent (graph: ${graph}, language: ${lang}${v2v_language ? ` (v2v override: ${v2v_language})` : ""}, voice: ${vtype}, ` +
           `greeting: ${greeting ? `${greeting.length} chars` : "default"}, ` +
           `prompt: ${prompt ? `${prompt.length} chars` : "default"}, resp: ${fmt}).`,
         );
@@ -3122,15 +3222,17 @@ function RealtimeChat() {
         // The agent start failed. Common causes:
         //  - Rate-limiting (theten.ai allows ~1 request / 30s per IP —
         //    wait ~30s before clicking Connect again).
+        //  - Unsupported language at the top level (the whitelist only
+        //    accepts en-US, zh-CN, ja-JP, ko-KR; non-native languages use
+        //    the v2v override + en-US fallback — see TEN_LANGUAGES).
+        //  - Unsupported graph (va_elevenlabs_v2v / va_coqui_v2v need a
+        //    different body shape — not offered in the dropdown).
         //  - Body too large (the prompt has a ~7,950-byte limit; the
         //    default Nelth-IA prompt is 7,746 bytes — leave it as-is).
-        //  - Unsupported graph (only va_openai_v2v / va_azure_v2v
-        //    accept the {channel_name, user_uid, graph_name, language,
-        //    voice_type} body shape).
         log(
           `[ten] agent start failed (HTTP ${startRes.status}, code=${upCode ?? "n/a"}, msg=${upMsg ?? startRes.statusText}). ` +
-          `If you just disconnected, wait ~30s before reconnecting (theten.ai rate-limit). ` +
-          `The prompt has a ~7,950-byte limit — the default Nelth-IA prompt fits; if you edited it, keep it under 7,800 bytes.`,
+          `If the language is unsupported, switch to en-US / 中文 / 日本語 / 한국어 or pick a non-native language (Français etc. — they use the v2v override). ` +
+          `If you just disconnected, wait ~30s before reconnecting (theten.ai rate-limit).`,
         );
       }
     } catch (err) {
@@ -3300,21 +3402,19 @@ function RealtimeChat() {
           voice-ai mini-service on port 3005 — no external API keys,
           no Web Speech API, with barge-in (speaking interrupts TTS);
           TEN (theten.ai) uses Agora RTC + an OpenAI voice assistant
-          (graph `va_openai_v2v`) — the browser joins an Agora channel,
+          (graph `va_azure_v2v`) — the browser joins an Agora channel,
           publishes mic audio, subscribes to the AI's audio, and
           receives transcripts + AI responses via the data channel.
-          TEN runs with sensible defaults: graph = va_openai_v2v,
-          language = English (US), voice type = male (editable via the
-          dropdown). The Greeting + Prompt (the Nelth-IA persona from
-          Optix AI, Madagascar) are pre-filled in the "Settings" panel
-          — edit them to customize the AI's personality. ChatGPT
-          needs a JWT in the vault; Perplexity + Gemini need their
-          session cookies there (refreshed by the Chrome extension);
-          Inworld needs an `INWORLD_TOKEN` env var (or a token in the
-          vault); Qwen needs a `QWEN_ACCESS_TOKEN` env var (the
-          chat.qwen.ai JWT); ZAI + Vosk need nothing; TEN needs
-          nothing (the backend route proxies to agent.theten.ai which
-          issues the Agora token + starts the agent).
+          Pick the spoken-language dropdown so the Azure STT matches
+          what you say (French → Français, etc.) — a mismatch produces
+          garbage transcripts. ChatGPT needs a JWT in the vault;
+          Perplexity + Gemini need their session cookies there
+          (refreshed by the Chrome extension); Inworld needs an
+          `INWORLD_TOKEN` env var (or a token in the vault); Qwen needs
+          a `QWEN_ACCESS_TOKEN` env var (the chat.qwen.ai JWT); ZAI +
+          Vosk need nothing; TEN needs nothing (the backend route
+          proxies to agent.theten.ai which issues the Agora token +
+          starts the agent).
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -3405,29 +3505,72 @@ function RealtimeChat() {
             </Select>
           )}
 
-          {/* Voice type selector — TEN only. The graph (va_openai_v2v) +
-              language (en-US) are fixed defaults per user request. The
-              voice type (male/female) is the only dropdown exposed. */}
+          {/* Graph + language + voice selectors — TEN only. The STT
+              language MUST match the language the user is actually
+              speaking or the Azure/OpenAI voice assistant transcribes
+              garbage. theten.ai only supports 4 languages (en-US,
+              zh-CN, ja-JP, ko-KR) — for French/other languages, use the
+              ZAI provider instead. */}
           {provider === "ten" && (
-            <Select
-              value={tenVoiceType}
-              onValueChange={(v) => setTenVoiceType(v as typeof tenVoiceType)}
-              disabled={connected}
-            >
-              <SelectTrigger
-                className="ml-auto h-9 w-28 border-zinc-800 bg-zinc-950 text-zinc-200"
-                aria-label="TEN voice type"
+            <>
+              <Select
+                value={tenGraph}
+                onValueChange={(v) => setTenGraph(v as typeof tenGraph)}
+                disabled={connected}
               >
-                <SelectValue placeholder="Voice" />
-              </SelectTrigger>
-              <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
-                {TEN_VOICE_TYPES.map((vt) => (
-                  <SelectItem key={vt} value={vt} className="capitalize focus:bg-zinc-800">
-                    {vt}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+                <SelectTrigger
+                  className="ml-auto h-9 w-36 border-zinc-800 bg-zinc-950 text-zinc-200"
+                  aria-label="TEN voice graph"
+                >
+                  <SelectValue placeholder="Graph" />
+                </SelectTrigger>
+                <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+                  {TEN_GRAPHS.map((g) => (
+                    <SelectItem key={g.value} value={g.value} className="focus:bg-zinc-800">
+                      {g.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select
+                value={tenLanguage}
+                onValueChange={(v) => setTenLanguage(v as typeof tenLanguage)}
+                disabled={connected}
+              >
+                <SelectTrigger
+                  className="h-9 w-40 border-zinc-800 bg-zinc-950 text-zinc-200"
+                  aria-label="TEN spoken language"
+                >
+                  <SelectValue placeholder="Language" />
+                </SelectTrigger>
+                <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+                  {TEN_LANGUAGES.map((l) => (
+                    <SelectItem key={l.value} value={l.value} className="focus:bg-zinc-800">
+                      {l.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select
+                value={tenVoiceType}
+                onValueChange={(v) => setTenVoiceType(v as typeof tenVoiceType)}
+                disabled={connected}
+              >
+                <SelectTrigger
+                  className="h-9 w-28 border-zinc-800 bg-zinc-950 text-zinc-200"
+                  aria-label="TEN voice type"
+                >
+                  <SelectValue placeholder="Voice" />
+                </SelectTrigger>
+                <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+                  {TEN_VOICE_TYPES.map((vt) => (
+                    <SelectItem key={vt} value={vt} className="capitalize focus:bg-zinc-800">
+                      {vt}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </>
           )}
         </div>
 

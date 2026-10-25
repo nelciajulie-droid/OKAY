@@ -103,7 +103,7 @@ export async function POST(req: Request) {
   // `voice-assistant-realtime/tenapp/property.json` + tested against
   // theten.ai's `va_openai_v2v` graph):
   //   - node `v2v` (addon openai_mllm_python / azure_mllm_python):
-  //       language (BCP-47 like "en-US", or ISO 639-1 like "fr"),
+  //       language (ISO 639-1 like "fr", or BCP-47 "en-US"),
   //       voice (the OpenAI voice NAME, e.g. "ash", "nova"),
   //       prompt (the system instructions — `v2v.prompt` IS a real
   //         field in OpenAIRealtimeConfig, sent to the Realtime API
@@ -113,9 +113,14 @@ export async function POST(req: Request) {
   //       spoken line). NO prompt field on main_control.
   //
   // So we send:
-  //   properties.v2v.language = the STT language (default "en-US").
-  //   properties.v2v.voice    = the OpenAI voice name (male→ash, female→nova).
-  //   properties.v2v.prompt   = the system instructions (Nelth-IA persona).
+  //   properties.v2v.language = the STT language — the `v2v_language`
+  //     override (ISO 639-1, e.g. "fr") if provided, else the top-level
+  //     `language` (BCP-47, e.g. "en-US"/"zh-CN"/"ja-JP"/"ko-KR").
+  //     ALWAYS set — this both bypasses the top-level whitelist for
+  //     non-native languages AND overrides the graph's "en" default
+  //     for native zh-CN/ja-JP/ko-KR (the graph default is "en"!).
+  //   properties.v2v.voice = the OpenAI voice name (male→ash, female→nova).
+  //   properties.v2v.prompt = the system instructions (Nelth-IA persona).
   //   properties.main_control.greeting = the first spoken line.
   //
   // We ALSO still send the top-level `language` + `voice_type` for
@@ -124,14 +129,15 @@ export async function POST(req: Request) {
   // but theten.ai's deployment may differ). The `properties` override
   // takes precedence in the graph (the server MERGES it into the node's
   // default property dict, replacing existing values).
-  //
-  // Per user request, the defaults are FIXED: graph = va_openai_v2v,
-  // language = "en-US" (NO navigator.language auto-detection). The
-  // voice type (male/female) is the only user-facing choice; it's
-  // mapped to an OpenAI Realtime voice name (ash = male, nova = female).
   const graphName = (body.graph_name as string) || "va_openai_v2v";
   const topLanguage = (body.language as string) || "en-US";
   const voiceType = (body.voice_type as string) || "male";
+  const v2vLanguage = typeof body.v2v_language === "string" ? body.v2v_language.trim() : "";
+  // The v2v.language: use the v2v override if provided (non-native
+  // languages like "fr"), else fall back to the top-level language (for
+  // native languages like "en-US" / "zh-CN" / "ja-JP" / "ko-KR"). This
+  // ensures zh-CN/ja-JP/ko-KR also override the graph's "en" default.
+  const v2vLangFinal = v2vLanguage || topLanguage;
   const greeting = typeof body.greeting === "string" ? body.greeting.trim() : "";
   const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
 
@@ -154,19 +160,23 @@ export async function POST(req: Request) {
     // open-source build, but theten.ai's deployment may differ).
     language: topLanguage,
     voice_type: voiceType,
+    // Top-level greeting + prompt (backwards compat — the server's
+    // open-source build ignores them; the `properties` versions below
+    // are what actually get applied to the graph).
+    ...(greeting ? { greeting } : {}),
+    ...(prompt ? { prompt } : {}),
   };
 
-  // Build the `properties` override. Node names: `v2v` (the
-  // openai_mllm_python / azure_mllm_python node) + `main_control` (the
-  // main_python node with the greeting). Per the server source, the
-  // `properties` object must be `map[node_name]map[property_name]value`
-  // — flat keys are rejected with `code:"10000", msg:"params invalid"`.
+  // Build the `properties` override — this is what ACTUALLY configures
+  // the graph. Node names: `v2v` (the openai_mllm_python /
+  // azure_mllm_python node) + `main_control` (the main_python node
+  // with the greeting). Per the server source, the `properties` object
+  // must be `map[node_name]map[property_name]value` — flat keys are
+  // rejected with `code:"10000", msg:"params invalid"`.
   const properties: Record<string, Record<string, unknown>> = {};
-  // v2v node: language + voice + prompt. The `voice` field on
-  // openai_mllm_python is the OpenAI voice NAME (ash/nova/etc.) — NOT
-  // "male"/"female". We map the UI's male/female to ash/nova above.
+  // v2v node: language + voice + prompt.
   const v2vProps: Record<string, unknown> = {};
-  if (topLanguage) v2vProps.language = topLanguage;
+  if (v2vLangFinal) v2vProps.language = v2vLangFinal;
   v2vProps.voice = openaiVoice;
   if (prompt) v2vProps.prompt = prompt;
   properties.v2v = v2vProps;
